@@ -32,12 +32,31 @@ public sealed class SupabaseStorageServiceTests
         Assert.Equal("Bearer eyJlegacy-service-role-jwt", handler.Authorization);
     }
 
-    private static SupabaseStorageService CreateService(HttpMessageHandler handler, string key)
+    [Fact]
+    public async Task Upload_WithDataApiUrl_UsesSupabaseProjectBaseUrl()
+    {
+        var handler = new RecordingHandler();
+        var service = CreateService(
+            handler,
+            "sb_secret_test-key",
+            "https://example.supabase.co/rest/v1/");
+
+        await service.UploadAsync(CreateImage(), CancellationToken.None);
+
+        Assert.StartsWith(
+            "https://example.supabase.co/storage/v1/object/workstations/",
+            handler.RequestUri?.ToString());
+    }
+
+    private static SupabaseStorageService CreateService(
+        HttpMessageHandler handler,
+        string key,
+        string url = "https://example.supabase.co")
     {
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["Game:SupabaseUrl"] = "https://example.supabase.co",
+                ["Game:SupabaseUrl"] = url,
                 ["Game:SupabaseServiceRoleKey"] = key,
                 ["Game:SupabaseStorageBucket"] = "workstations"
             })
@@ -60,6 +79,7 @@ public sealed class SupabaseStorageServiceTests
     {
         public string? ApiKey { get; private set; }
         public string? Authorization { get; private set; }
+        public Uri? RequestUri { get; private set; }
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
@@ -69,6 +89,7 @@ public sealed class SupabaseStorageServiceTests
                 ? values.Single()
                 : null;
             Authorization = request.Headers.Authorization?.ToString();
+            RequestUri = request.RequestUri;
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
         }
     }

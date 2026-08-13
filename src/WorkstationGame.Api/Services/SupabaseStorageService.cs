@@ -6,7 +6,7 @@ namespace WorkstationGame.Api.Services;
 
 public sealed class SupabaseStorageService(HttpClient httpClient, IConfiguration configuration)
 {
-    private string? BaseUrl => configuration["Game:SupabaseUrl"]?.TrimEnd('/');
+    private string? BaseUrl => NormalizeProjectUrl(configuration["Game:SupabaseUrl"]);
     private string? ServiceKey => configuration["Game:SupabaseServiceRoleKey"]?.Trim();
     private string Bucket => configuration["Game:SupabaseStorageBucket"]?.Trim() ?? "workstations";
 
@@ -80,5 +80,14 @@ public sealed class SupabaseStorageService(HttpClient httpClient, IConfiguration
         {
             throw new InvalidOperationException("Supabase Storage is not configured on the backend.");
         }
+    }
+
+    private static string? NormalizeProjectUrl(string? value)
+    {
+        var url = value?.Trim().TrimEnd('/');
+        const string dataApiSuffix = "/rest/v1";
+        return url?.EndsWith(dataApiSuffix, StringComparison.OrdinalIgnoreCase) == true
+            ? url[..^dataApiSuffix.Length]
+            : url;
     }
 }
