@@ -48,6 +48,22 @@ public sealed class SupabaseStorageServiceTests
             handler.RequestUri?.ToString());
     }
 
+    [Fact]
+    public async Task CreateSignedUrl_WithStorageRelativePath_IncludesStorageApiPrefix()
+    {
+        var handler = new RecordingHandler
+        {
+            ResponseContent = "{\"signedURL\":\"/object/sign/workstations/games/desk.jpg?token=test\"}"
+        };
+        var service = CreateService(handler, "sb_secret_test-key");
+
+        var signedUrl = await service.CreateSignedUrlAsync("games/desk.jpg", CancellationToken.None);
+
+        Assert.Equal(
+            "https://example.supabase.co/storage/v1/object/sign/workstations/games/desk.jpg?token=test",
+            signedUrl);
+    }
+
     private static SupabaseStorageService CreateService(
         HttpMessageHandler handler,
         string key,
@@ -77,6 +93,7 @@ public sealed class SupabaseStorageServiceTests
 
     private sealed class RecordingHandler : HttpMessageHandler
     {
+        public string ResponseContent { get; init; } = "";
         public string? ApiKey { get; private set; }
         public string? Authorization { get; private set; }
         public Uri? RequestUri { get; private set; }
@@ -90,7 +107,10 @@ public sealed class SupabaseStorageServiceTests
                 : null;
             Authorization = request.Headers.Authorization?.ToString();
             RequestUri = request.RequestUri;
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ResponseContent)
+            });
         }
     }
 }

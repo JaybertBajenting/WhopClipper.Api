@@ -52,9 +52,15 @@ public sealed class SupabaseStorageService(HttpClient httpClient, IConfiguration
         using var json = JsonDocument.Parse(body);
         var signedUrl = json.RootElement.GetProperty("signedURL").GetString()
                         ?? throw new InvalidOperationException("Supabase returned an empty signed URL.");
-        return signedUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-            ? signedUrl
-            : $"{BaseUrl}{signedUrl}";
+        if (signedUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            return signedUrl;
+        }
+
+        var relativePath = signedUrl.StartsWith('/') ? signedUrl : $"/{signedUrl}";
+        return relativePath.StartsWith("/storage/v1/", StringComparison.OrdinalIgnoreCase)
+            ? $"{BaseUrl}{relativePath}"
+            : $"{BaseUrl}/storage/v1{relativePath}";
     }
 
     private HttpRequestMessage CreateRequest(HttpMethod method, string path)
