@@ -80,6 +80,27 @@ The host clicks **Start Game** once. The backend opens each round for its config
 
 The host can pause/resume, reveal or advance early with **Skip**, or end the game. Pausing preserves the exact remaining answer or reveal time. Keep the deployment at one backend instance, as described above.
 
+| Phase | Server behavior | Next transition |
+| --- | --- | --- |
+| Lobby | Accepts players and allows round editing | Host clicks **Start Game** |
+| Answer window | Shows the workstation and accepts one answer per player | Configured round timer expires |
+| Reveal | Exposes the owner, fun fact, awarded points, and leaderboard | 8 seconds expire |
+| Finished | Stops accepting answers and exposes the final leaderboard | None |
+
+The optional host-control endpoints are:
+
+| Method and path | Effect |
+| --- | --- |
+| `POST /api/host/games/{gameId}/start` | Starts round one and the automatic sequence |
+| `POST /api/host/games/{gameId}/pause` | Freezes the active answer or reveal countdown |
+| `POST /api/host/games/{gameId}/resume` | Continues with the preserved remaining time |
+| `POST /api/host/games/{gameId}/skip` | Reveals an open round now, or advances a reveal now |
+| `POST /api/host/games/{gameId}/end` | Ends immediately on the final leaderboard |
+
+All these endpoints require `X-Host-Key`. Normal participants never call them.
+
+The included `AutomateGameFlow` migration adds pause state and reveal duration to existing databases. It is applied automatically at backend startup. Existing games receive the default 8-second reveal duration.
+
 ## Scoring
 
 | Correct-answer rank | Points |
