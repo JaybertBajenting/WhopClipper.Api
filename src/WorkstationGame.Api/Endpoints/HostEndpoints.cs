@@ -21,6 +21,7 @@ public static class HostEndpoints
         host.MapGet("/games", GetGamesAsync);
         host.MapPost("/games", CreateGameAsync);
         host.MapGet("/games/{gameId:guid}", GetGameAsync);
+        host.MapPost("/games/{gameId:guid}/duplicate", DuplicateGameAsync);
         host.MapPost("/games/{gameId:guid}/rounds", CreateRoundAsync);
         host.MapDelete("/games/{gameId:guid}/rounds/{roundId:guid}", DeleteRoundAsync);
         host.MapPost("/games/{gameId:guid}/start", StartGameAsync);
@@ -121,6 +122,45 @@ public static class HostEndpoints
                 answerCount = x.Answers.Count,
                 correctCount = x.Answers.Count(a => a.IsCorrect)
             })
+        });
+    }
+
+    private static async Task<IResult> DuplicateGameAsync(
+        Guid gameId,
+        DuplicateGameRequest request,
+        GameDbContext database,
+        CancellationToken cancellationToken)
+    {
+        var source = await database.Games.AsNoTracking()
+            .Include(x => x.Rounds).ThenInclude(x => x.Options)
+            .SingleOrDefaultAsync(x => x.Id == gameId, cancellationToken);
+        if (source is null)
+        {
+            return Results.NotFound(new { message = "Game not found." });
+        }
+
+        var title = string.IsNullOrWhiteSpace(request.Title) ? source.Title : request.Title.Trim();
+        if (title.Length > 120)
+        {
+            return Results.BadRequest(new { message = "Enter a title between 1 and 120 characters." });
+        }
+
+        string code;
+        do
+        {
+            code = CreateCode();
+        } while (await database.Games.AnyAsync(x => x.Code == code, cancellationToken));
+
+        var duplicate = GameCloneFactory.Clone(source, code, title);
+        database.Games.Add(duplicate);
+        await database.SaveChangesAsync(cancellationToken);
+
+        return Results.Created($"/api/host/games/{duplicate.Id}", new
+        {
+            duplicate.Id,
+            duplicate.Code,
+            duplicate.Title,
+            roundCount = duplicate.Rounds.Count
         });
     }
 

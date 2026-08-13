@@ -1,6 +1,7 @@
 namespace WorkstationGame.Api.Contracts;
 
 public sealed record CreateGameRequest(string Title);
+public sealed record DuplicateGameRequest(string? Title);
 public sealed record JoinGameRequest(string DisplayName);
 public sealed record SubmitAnswerRequest(Guid PlayerId, string PlayerToken, Guid RoundId, string Guess);
 public sealed record CreateRoundRequest(
@@ -10,4 +11,3 @@ public sealed record CreateRoundRequest(
     string? ImagePath,
     string? ImageUrl,
     int DurationSeconds = 30);
-
