@@ -28,7 +28,7 @@ public sealed class AnswerService(GameDbContext database)
             }
 
             var now = DateTimeOffset.UtcNow;
-            if (round.Status != RoundStatus.Open || round.OpenedAt is null ||
+            if (game.Status != GameStatus.Live || round.Status != RoundStatus.Open || round.OpenedAt is null ||
                 now > round.OpenedAt.Value.AddSeconds(round.DurationSeconds))
             {
                 return (null, "This round is not accepting answers.");
@@ -71,4 +71,3 @@ public sealed class AnswerService(GameDbContext database)
         }
     }
 }
-

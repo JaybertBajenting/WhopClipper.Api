@@ -12,6 +12,8 @@ var connectionString = ConnectionStringResolver.Resolve(builder.Configuration);
 builder.Services.AddDbContext<GameDbContext>(options =>
     options.UseNpgsql(connectionString, postgres => postgres.EnableRetryOnFailure(3)));
 builder.Services.AddScoped<AnswerService>();
+builder.Services.AddScoped<GameLifecycleService>();
+builder.Services.AddHostedService<GameAutomationWorker>();
 builder.Services.AddSingleton<GameNotifier>();
 builder.Services.AddHttpClient<SupabaseStorageService>(client => client.Timeout = TimeSpan.FromSeconds(30));
 builder.Services.AddSignalR();
@@ -40,4 +42,3 @@ app.MapHostEndpoints();
 app.Run();
 
 public partial class Program;
-

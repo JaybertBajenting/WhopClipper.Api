@@ -4,6 +4,7 @@ public enum GameStatus
 {
     Lobby,
     Live,
+    Paused,
     Finished
 }
 
@@ -20,6 +21,8 @@ public sealed class GameSession
     public required string Code { get; set; }
     public required string Title { get; set; }
     public GameStatus Status { get; set; } = GameStatus.Lobby;
+    public int RevealDurationSeconds { get; set; } = 8;
+    public DateTimeOffset? PausedAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public List<Player> Players { get; set; } = [];
     public List<GameRound> Rounds { get; set; } = [];
@@ -78,4 +81,3 @@ public sealed class PlayerAnswer
     public GameRound GameRound { get; set; } = null!;
     public Player Player { get; set; } = null!;
 }
-

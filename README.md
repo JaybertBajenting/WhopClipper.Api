@@ -1,10 +1,10 @@
 # Desk Detective API
 
-ASP.NET Core 10 backend for the workstation guessing game. It owns player identity, round timing, answer validation, speed-based scoring, host controls, Supabase PostgreSQL access, private Supabase Storage image URLs, and SignalR update notifications.
+ASP.NET Core 10 backend for the workstation guessing game. It owns player identity, automatic round sequencing, answer validation, speed-based scoring, host controls, Supabase PostgreSQL access, private Supabase Storage image URLs, and SignalR update notifications.
 
 ## What the API protects
 
-- Correct answers are never sent before the host reveals a round.
+- Correct answers are never sent before the timed reveal phase.
 - Scores and timestamps are calculated by the server.
 - Players receive a random private token when they join; only its SHA-256 hash is stored.
 - Host endpoints require the `X-Host-Key` header.
@@ -74,6 +74,12 @@ Generate a host key with a password manager or another cryptographically secure 
 
 SignalR uses WebSockets when available and falls back automatically. App Platform handles HTTPS; no separate Nginx package or configuration is needed.
 
+## Automatic game flow
+
+The host clicks **Start Game** once. The backend opens each round for its configured answer duration, reveals the owner for 8 seconds, advances to the next round, and finishes on the final leaderboard. This lifecycle runs in a background service and uses database timestamps, so refreshing or closing the host page does not interrupt it.
+
+The host can pause/resume, reveal or advance early with **Skip**, or end the game. Pausing preserves the exact remaining answer or reveal time. Keep the deployment at one backend instance, as described above.
+
 ## Scoring
 
 | Correct-answer rank | Points |
@@ -91,4 +97,3 @@ Only one answer per player per round is accepted. The API uses its own receive t
 ```powershell
 dotnet test
 ```
-

@@ -128,12 +128,21 @@ public static class GameEndpoints
             .OrderByDescending(x => x.Position)
             .FirstOrDefault();
         var now = DateTimeOffset.UtcNow;
-        var isAcceptingAnswers = round?.Status == RoundStatus.Open && round.OpenedAt.HasValue &&
+        var clock = game.Status == GameStatus.Paused && game.PausedAt.HasValue ? game.PausedAt.Value : now;
+        var isAcceptingAnswers = game.Status == GameStatus.Live && round?.Status == RoundStatus.Open && round.OpenedAt.HasValue &&
                                  now <= round.OpenedAt.Value.AddSeconds(round.DurationSeconds);
         var ownAnswer = player is null || round is null
             ? null
             : round.Answers.SingleOrDefault(x => x.PlayerId == player.Id);
         var showAnswer = round?.Status == RoundStatus.Revealed || game.Status == GameStatus.Finished;
+        var secondsRemaining = round switch
+        {
+            { Status: RoundStatus.Open, OpenedAt: not null } =>
+                Math.Max(0, (int)Math.Ceiling((round.OpenedAt.Value.AddSeconds(round.DurationSeconds) - clock).TotalSeconds)),
+            { Status: RoundStatus.Revealed, RevealedAt: not null } when game.Status != GameStatus.Finished =>
+                Math.Max(0, (int)Math.Ceiling((round.RevealedAt.Value.AddSeconds(game.RevealDurationSeconds) - clock).TotalSeconds)),
+            _ => 0
+        };
 
         var leaderboard = game.Players
             .OrderByDescending(x => x.TotalScore)
@@ -156,6 +165,8 @@ public static class GameEndpoints
                 game.Code,
                 game.Title,
                 status = game.Status.ToString(),
+                game.RevealDurationSeconds,
+                game.PausedAt,
                 playerCount = game.Players.Count,
                 roundCount = game.Rounds.Count
             },
@@ -167,6 +178,8 @@ public static class GameEndpoints
                 status = round.Status.ToString(),
                 round.DurationSeconds,
                 round.OpenedAt,
+                round.RevealedAt,
+                secondsRemaining,
                 isAcceptingAnswers,
                 imageUrl = $"/api/games/{game.Code}/rounds/{round.Id}/image",
                 options = round.Options.OrderBy(x => x.Position).Select(x => x.Label),
@@ -289,4 +302,3 @@ public static class GameEndpoints
 
     private static string NormalizeCode(string code) => code.Trim().ToUpperInvariant();
 }
-

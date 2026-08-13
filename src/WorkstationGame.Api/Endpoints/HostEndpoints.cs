@@ -23,9 +23,11 @@ public static class HostEndpoints
         host.MapGet("/games/{gameId:guid}", GetGameAsync);
         host.MapPost("/games/{gameId:guid}/rounds", CreateRoundAsync);
         host.MapDelete("/games/{gameId:guid}/rounds/{roundId:guid}", DeleteRoundAsync);
-        host.MapPost("/games/{gameId:guid}/rounds/{roundId:guid}/open", OpenRoundAsync);
-        host.MapPost("/games/{gameId:guid}/rounds/{roundId:guid}/reveal", RevealRoundAsync);
-        host.MapPost("/games/{gameId:guid}/finish", FinishGameAsync);
+        host.MapPost("/games/{gameId:guid}/start", StartGameAsync);
+        host.MapPost("/games/{gameId:guid}/pause", PauseGameAsync);
+        host.MapPost("/games/{gameId:guid}/resume", ResumeGameAsync);
+        host.MapPost("/games/{gameId:guid}/skip", SkipPhaseAsync);
+        host.MapPost("/games/{gameId:guid}/end", EndGameAsync);
         host.MapPost("/storage/images", UploadImageAsync).DisableAntiforgery();
         return app;
     }
@@ -92,6 +94,8 @@ public static class HostEndpoints
             game.Code,
             game.Title,
             status = game.Status.ToString(),
+            game.RevealDurationSeconds,
+            game.PausedAt,
             game.CreatedAt,
             players = game.Players.OrderByDescending(x => x.TotalScore).ThenBy(x => x.JoinedAt).Select((x, index) => new
             {
@@ -132,9 +136,9 @@ public static class HostEndpoints
         {
             return Results.NotFound(new { message = "Game not found." });
         }
-        if (game.Status == GameStatus.Finished)
+        if (game.Status != GameStatus.Lobby)
         {
-            return Results.Conflict(new { message = "A finished game cannot be edited." });
+            return Results.Conflict(new { message = "Rounds can only be edited before the game starts." });
         }
 
         var correctAnswer = request.CorrectAnswer?.Trim();
@@ -191,9 +195,9 @@ public static class HostEndpoints
         {
             return Results.NotFound();
         }
-        if (round.Status != RoundStatus.Pending)
+        if (round.GameSession.Status != GameStatus.Lobby || round.Status != RoundStatus.Pending)
         {
-            return Results.Conflict(new { message = "Only pending rounds can be deleted." });
+            return Results.Conflict(new { message = "Rounds can only be deleted before the game starts." });
         }
 
         var code = round.GameSession.Code;
@@ -201,89 +205,6 @@ public static class HostEndpoints
         await database.SaveChangesAsync(cancellationToken);
         await notifier.NotifyAsync(code, cancellationToken);
         return Results.NoContent();
-    }
-
-    private static async Task<IResult> OpenRoundAsync(
-        Guid gameId,
-        Guid roundId,
-        GameDbContext database,
-        GameNotifier notifier,
-        CancellationToken cancellationToken)
-    {
-        var game = await database.Games.Include(x => x.Rounds).SingleOrDefaultAsync(x => x.Id == gameId, cancellationToken);
-        var round = game?.Rounds.SingleOrDefault(x => x.Id == roundId);
-        if (game is null || round is null)
-        {
-            return Results.NotFound(new { message = "Game or round not found." });
-        }
-        if (game.Status == GameStatus.Finished || round.Status != RoundStatus.Pending)
-        {
-            return Results.Conflict(new { message = "This round cannot be opened." });
-        }
-        if (game.Rounds.Any(x => x.Status == RoundStatus.Open))
-        {
-            return Results.Conflict(new { message = "Reveal the current round before opening another." });
-        }
-        var previousPending = game.Rounds.Any(x => x.Position < round.Position && x.Status != RoundStatus.Revealed);
-        if (previousPending)
-        {
-            return Results.Conflict(new { message = "Rounds must be played in order." });
-        }
-
-        game.Status = GameStatus.Live;
-        round.Status = RoundStatus.Open;
-        round.OpenedAt = DateTimeOffset.UtcNow;
-        await database.SaveChangesAsync(cancellationToken);
-        await notifier.NotifyAsync(game.Code, cancellationToken);
-        return Results.Ok(new { openedAt = round.OpenedAt, round.DurationSeconds });
-    }
-
-    private static async Task<IResult> RevealRoundAsync(
-        Guid gameId,
-        Guid roundId,
-        GameDbContext database,
-        GameNotifier notifier,
-        CancellationToken cancellationToken)
-    {
-        var round = await database.Rounds.Include(x => x.GameSession).SingleOrDefaultAsync(
-            x => x.Id == roundId && x.GameSessionId == gameId,
-            cancellationToken);
-        if (round is null)
-        {
-            return Results.NotFound();
-        }
-        if (round.Status != RoundStatus.Open)
-        {
-            return Results.Conflict(new { message = "Only an open round can be revealed." });
-        }
-
-        round.Status = RoundStatus.Revealed;
-        round.RevealedAt = DateTimeOffset.UtcNow;
-        await database.SaveChangesAsync(cancellationToken);
-        await notifier.NotifyAsync(round.GameSession.Code, cancellationToken);
-        return Results.Ok(new { round.CorrectAnswer, round.FunFact });
-    }
-
-    private static async Task<IResult> FinishGameAsync(
-        Guid gameId,
-        GameDbContext database,
-        GameNotifier notifier,
-        CancellationToken cancellationToken)
-    {
-        var game = await database.Games.Include(x => x.Rounds).SingleOrDefaultAsync(x => x.Id == gameId, cancellationToken);
-        if (game is null)
-        {
-            return Results.NotFound();
-        }
-        if (game.Rounds.Any(x => x.Status == RoundStatus.Open))
-        {
-            return Results.Conflict(new { message = "Reveal the current round before finishing the game." });
-        }
-
-        game.Status = GameStatus.Finished;
-        await database.SaveChangesAsync(cancellationToken);
-        await notifier.NotifyAsync(game.Code, cancellationToken);
-        return Results.Ok(new { status = game.Status.ToString() });
     }
 
     private static async Task<IResult> UploadImageAsync(
@@ -306,6 +227,39 @@ public static class HostEndpoints
         }
     }
 
+    private static async Task<IResult> StartGameAsync(
+        Guid gameId,
+        GameLifecycleService lifecycle,
+        CancellationToken cancellationToken) =>
+        ToResult(await lifecycle.StartAsync(gameId, cancellationToken));
+
+    private static async Task<IResult> PauseGameAsync(
+        Guid gameId,
+        GameLifecycleService lifecycle,
+        CancellationToken cancellationToken) =>
+        ToResult(await lifecycle.PauseAsync(gameId, cancellationToken));
+
+    private static async Task<IResult> ResumeGameAsync(
+        Guid gameId,
+        GameLifecycleService lifecycle,
+        CancellationToken cancellationToken) =>
+        ToResult(await lifecycle.ResumeAsync(gameId, cancellationToken));
+
+    private static async Task<IResult> SkipPhaseAsync(
+        Guid gameId,
+        GameLifecycleService lifecycle,
+        CancellationToken cancellationToken) =>
+        ToResult(await lifecycle.SkipAsync(gameId, cancellationToken));
+
+    private static async Task<IResult> EndGameAsync(
+        Guid gameId,
+        GameLifecycleService lifecycle,
+        CancellationToken cancellationToken) =>
+        ToResult(await lifecycle.EndAsync(gameId, cancellationToken));
+
+    private static IResult ToResult((bool Success, string? Error) result) =>
+        result.Success ? Results.Ok(new { success = true }) : Results.Conflict(new { message = result.Error });
+
     private static string CreateCode()
     {
         const string alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -314,4 +268,3 @@ public static class HostEndpoints
         return new string(bytes.ToArray().Select(x => alphabet[x % alphabet.Length]).ToArray());
     }
 }
-
