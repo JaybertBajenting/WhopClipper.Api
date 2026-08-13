@@ -7,8 +7,8 @@ namespace WorkstationGame.Api.Services;
 public sealed class SupabaseStorageService(HttpClient httpClient, IConfiguration configuration)
 {
     private string? BaseUrl => configuration["Game:SupabaseUrl"]?.TrimEnd('/');
-    private string? ServiceKey => configuration["Game:SupabaseServiceRoleKey"];
-    private string Bucket => configuration["Game:SupabaseStorageBucket"] ?? "workstations";
+    private string? ServiceKey => configuration["Game:SupabaseServiceRoleKey"]?.Trim();
+    private string Bucket => configuration["Game:SupabaseStorageBucket"]?.Trim() ?? "workstations";
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(BaseUrl) && !string.IsNullOrWhiteSpace(ServiceKey);
 
@@ -60,8 +60,17 @@ public sealed class SupabaseStorageService(HttpClient httpClient, IConfiguration
     private HttpRequestMessage CreateRequest(HttpMethod method, string path)
     {
         var request = new HttpRequestMessage(method, $"{BaseUrl}{path}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ServiceKey);
         request.Headers.TryAddWithoutValidation("apikey", ServiceKey);
+
+        // Supabase's current sb_secret_* keys are opaque API keys, not JWTs, and
+        // must not be sent as Bearer tokens. Legacy service_role JWTs still need
+        // Authorization in addition to the apikey header.
+        if (!ServiceKey!.StartsWith("sb_secret_", StringComparison.OrdinalIgnoreCase) &&
+            !ServiceKey.StartsWith("sb_publishable_", StringComparison.OrdinalIgnoreCase))
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ServiceKey);
+        }
+
         return request;
     }
 
@@ -73,4 +82,3 @@ public sealed class SupabaseStorageService(HttpClient httpClient, IConfiguration
         }
     }
 }
-
