@@ -121,7 +121,7 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
 
 public sealed class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
-    SubjectTracker subjectTracker, ILogger<JobExecutionService> logger)
+    SubjectTracker subjectTracker, HookCardRenderer hookCards, ILogger<JobExecutionService> logger)
 {
     public async Task ExecuteAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -569,8 +569,12 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
             var overlay = overlays[index];
             var textPath = Path.Combine(intermediate, $"overlay-{index:00}.txt");
             await File.WriteAllTextAsync(textPath, overlay.Text, cancellationToken);
+            string? cardPath = null;
+            if (overlay.Style.Equals("Card", StringComparison.OrdinalIgnoreCase))
+                cardPath = await hookCards.RenderAsync(overlay.Text, textPath,
+                    Path.Combine(intermediate, $"overlay-{index:00}.png"), plan.Width, cancellationToken);
             overlayInputs.Add(new(textPath, overlay.StartSeconds, overlay.EndSeconds, overlay.Position,
-                overlay.FontSize, overlay.Color));
+                overlay.FontSize, overlay.Color, cardPath, overlay.YFraction));
         }
 
         FfmpegSubjectTrack? subjectTrack = null;

@@ -231,6 +231,47 @@ public sealed class ProcessContractTests
     /// they were drawn on top of each other on every campaign that had a logo.
     /// </summary>
     [Fact]
+    public void HookCardsAreCompositedAsImagesUnderTheBrandingLogo()
+    {
+        var root = Path.GetTempPath();
+        // A composited clip carries the facecam across the top, so the hook has to be pinned
+        // below it by fraction. Drawn at the top it lands on the streamer's face.
+        var card = new FfmpegOverlayInput(Path.Combine(root, "hook.txt"), 0, 3.2, "Top", 48, "white",
+            CardImagePath: Path.Combine(root, "hook.png"), YFraction: 0.3156);
+        var logo = new FfmpegLogoOverlay(Path.Combine(root, "logo.png"), "Bottom", .45, .14, 1, null);
+
+        var args = FfmpegArgumentBuilder.Build(new FfmpegRenderSpec(
+            Path.Combine(root, "source.mp4"), Path.Combine(root, "output.mp4"), 0, 14, 1080, 1920, 25, 20, true,
+            "CenterCrop", null, null, null, .15, -12, [], [card], Logo: logo));
+        var graph = args[args.ToList().IndexOf("-filter_complex") + 1];
+
+        // Composited from the PNG, not drawn: drawtext cannot round a box's corners.
+        Assert.DoesNotContain("drawtext", graph);
+        Assert.Contains(Path.Combine(root, "hook.png"), args);
+        Assert.Contains("overlay=(W-w)/2:H*0.3156", graph);
+        Assert.Contains("enable='between(t,0,3.2)'", graph);
+        // Branding still goes on last, over the card.
+        Assert.True(graph.IndexOf("[vlogo]", StringComparison.Ordinal) >
+                    graph.IndexOf("[card0]", StringComparison.Ordinal));
+        Assert.EndsWith("format=yuv420p,setsar=1[vout]", graph.Split(';').First(x => x.Contains("[vout]")));
+    }
+
+    [Fact]
+    public void OutlineOverlaysAreStillDrawnAsTextWhenNoCardIsSupplied()
+    {
+        var root = Path.GetTempPath();
+        var overlay = new FfmpegOverlayInput(Path.Combine(root, "hook.txt"), 0, 3, "Top", 48, "white");
+
+        var args = FfmpegArgumentBuilder.Build(new FfmpegRenderSpec(
+            Path.Combine(root, "source.mp4"), Path.Combine(root, "output.mp4"), 0, 14, 1080, 1920, 25, 20, true,
+            "CenterCrop", null, null, null, .15, -12, [], [overlay]));
+        var graph = args[args.ToList().IndexOf("-filter_complex") + 1];
+
+        Assert.Contains("drawtext", graph);
+        Assert.Contains("y=h*0.12-text_h/2", graph);
+    }
+
+    [Fact]
     public void BottomTextIsLiftedClearOfTheBrandingLogo()
     {
         var root = Path.GetTempPath();

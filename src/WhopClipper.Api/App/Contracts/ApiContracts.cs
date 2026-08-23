@@ -73,7 +73,14 @@ public sealed record SourceAssetDto(Guid Id, string Url, string? Title, string? 
 public sealed record StartAiAnalysisRequest(Guid SourceAssetId, AiMode? Mode = null, PlatformKind Platform = PlatformKind.TikTok,
     string? Transcript = null);
 public sealed record SoundEffectPlacementDto(Guid AssetId, double AtSeconds, double GainDb = -6);
-public sealed record OverlayDto(string Text, double StartSeconds, double EndSeconds, string Position = "Top", int FontSize = 48, string Color = "white");
+/// <param name="Style">"Outline" for stroked text over the picture, or "Card" for a white
+/// rounded caption card with dark text.</param>
+/// <param name="YFraction">Places the overlay's top edge at this fraction of frame height,
+/// overriding <paramref name="Position"/>. Needed when the safe area is not a named edge - a
+/// composited clip with a facecam across the top has to put the hook below it, or it covers
+/// the streamer's face.</param>
+public sealed record OverlayDto(string Text, double StartSeconds, double EndSeconds, string Position = "Top", int FontSize = 48, string Color = "white",
+    string Style = "Outline", double? YFraction = null);
 /// <summary>Full-frame colour wash on a reaction beat; reference edits run 0.4-0.7s.</summary>
 public sealed record ColorFlashDto(double AtSeconds, double DurationSeconds = 0.5, double Intensity = 0.45, string Color = "Green");
 /// <summary>Punch-in on a beat; reference edits run 1.1x-2.3x over 0.3-1.0s.</summary>

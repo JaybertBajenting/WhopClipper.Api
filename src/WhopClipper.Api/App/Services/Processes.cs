@@ -474,6 +474,17 @@ public static partial class FfmpegArgumentBuilder
             soundEffectInputs.Add((nextInput++, effect));
             args.AddRange(["-i", effect.Path]);
         }
+        // Card overlays arrive as pre-rendered transparent PNGs and are composited below, so
+        // they need their own inputs alongside the logo.
+        var cardInputs = new List<(int Input, FfmpegOverlayInput Overlay)>();
+        foreach (var overlay in spec.Overlays)
+        {
+            if (string.IsNullOrWhiteSpace(overlay.CardImagePath)) continue;
+            if (overlay.YFraction is < 0 or > 1) throw new ArgumentOutOfRangeException(nameof(spec.Overlays));
+            cardInputs.Add((nextInput++, overlay));
+            args.AddRange(["-i", overlay.CardImagePath!]);
+        }
+
         int? logoInput = null;
         if (spec.Logo is { } logo)
         {
@@ -569,6 +580,8 @@ public static partial class FfmpegArgumentBuilder
                 overlay.StartSeconds < 0 || overlay.EndSeconds > duration || overlay.FontSize is < 12 or > 200 ||
                 !IsSafeColor(overlay.Color))
                 throw new ArgumentException("Invalid overlay settings.", nameof(spec.Overlays));
+            // Cards are composited from an image further down rather than drawn here.
+            if (!string.IsNullOrWhiteSpace(overlay.CardImagePath)) continue;
             var y = overlay.Position.ToLowerInvariant() switch
             {
                 "top" => "h*0.12-text_h/2",
@@ -586,8 +599,35 @@ public static partial class FfmpegArgumentBuilder
         // window leaves a fractional SAR behind, which players honour as a slight stretch.
         const string deliveryFormat = "format=yuv420p,setsar=1";
         var graph = new List<string>();
-        if (logoInput is null)
+        // The picture is built once, then each card is laid over it in turn, then the logo, then
+        // the delivery format closes the chain. Chaining rather than special-casing keeps the
+        // one rule that matters: branding goes on last.
+        var stage = "vbase";
+        if (cardInputs.Count > 0 || logoInput is not null)
+            graph.Add($"[0:v]{string.Join(',', videoFilters)}[vbase]");
+
+        for (var index = 0; index < cardInputs.Count; index++)
+        {
+            var (input, overlay) = cardInputs[index];
+            var y = overlay.YFraction is { } fraction
+                ? $"H*{fraction.ToString("0.####", invariant)}"
+                : overlay.Position.ToLowerInvariant() switch
+                {
+                    "top" => "H*0.06",
+                    "center" => "(H-h)/2",
+                    _ => $"H-h-H*0.10"
+                };
+            var next = $"vcard{index}";
+            graph.Add($"[{input}:v]format=rgba[card{index}]");
+            graph.Add($"[{stage}][card{index}]overlay=(W-w)/2:{y}:format=auto:" +
+                      $"enable='between(t,{overlay.StartSeconds.ToString("0.###", invariant)},{overlay.EndSeconds.ToString("0.###", invariant)})'[{next}]");
+            stage = next;
+        }
+
+        if (cardInputs.Count == 0 && logoInput is null)
             graph.Add($"[0:v]{string.Join(',', videoFilters)},{deliveryFormat}[vout]");
+        else if (logoInput is null)
+            graph.Add($"[{stage}]{deliveryFormat}[vout]");
         else
         {
             // Branding goes on last so it sits over the hook and the captions - the brief allows
@@ -606,9 +646,8 @@ public static partial class FfmpegArgumentBuilder
                 "center" => "(H-h)/2",
                 _ => $"H-h-H*{margin}"
             };
-            graph.Add($"[0:v]{string.Join(',', videoFilters)}[vbase]");
             graph.Add($"[{logoInput.Value}:v]{string.Join(',', logoFilters)}[vlogo]");
-            graph.Add($"[vbase][vlogo]overlay=(W-w)/2:{y}:format=auto,{deliveryFormat}[vout]");
+            graph.Add($"[{stage}][vlogo]overlay=(W-w)/2:{y}:format=auto,{deliveryFormat}[vout]");
         }
         var voiceFilters = $"atrim=0:{durationText},asetpts=PTS-STARTPTS";
         graph.Add(musicInput.HasValue
@@ -786,8 +825,11 @@ public sealed record FfmpegColorFlash(double AtSeconds, double DurationSeconds, 
 public sealed record FfmpegZoomPunch(double AtSeconds, double DurationSeconds, double Scale = 1.25);
 
 public sealed record FfmpegSoundEffectInput(string Path, double AtSeconds, double GainDb);
+/// <param name="CardImagePath">When set, the hook is composited from this transparent PNG
+/// instead of being drawn with drawtext, which cannot round a box's corners.</param>
+/// <param name="YFraction">Top edge as a fraction of frame height, overriding Position.</param>
 public sealed record FfmpegOverlayInput(string TextFilePath, double StartSeconds, double EndSeconds,
-    string Position, int FontSize, string Color);
+    string Position, int FontSize, string Color, string? CardImagePath = null, double? YFraction = null);
 public sealed record FfmpegRenderSpec(string SourcePath, string OutputPath, double StartSeconds, double EndSeconds,
     int Width, int Height, int FramesPerSecond, int Crf, bool NormalizeAudio, string Framing,
     string? SubtitlePath, string? SubtitleStyle, string? MusicPath, double MusicVolume, double MusicDuckingDb,

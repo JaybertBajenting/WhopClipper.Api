@@ -41,6 +41,7 @@ builder.Services.AddSingleton<IRequirementExtractor, HeuristicRequirementExtract
 builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
 builder.Services.AddSingleton<ReferenceStyleAnalyzer>();
 builder.Services.AddSingleton<SubjectTracker>();
+builder.Services.AddSingleton<HookCardRenderer>();
 builder.Services.AddSingleton<BriefLinkDetector>();
 builder.Services.AddScoped<CampaignDocumentService>();
 builder.Services.AddScoped<CampaignBrandingService>();

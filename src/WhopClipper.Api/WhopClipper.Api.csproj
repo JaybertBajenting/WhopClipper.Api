@@ -16,6 +16,7 @@
   <ItemGroup>
     <None Include="App\Services\transcribe.py" CopyToOutputDirectory="PreserveNewest" />
     <None Include="App\Services\framing.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="App\Services\hookcard.py" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
