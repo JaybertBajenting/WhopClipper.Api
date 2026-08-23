@@ -2,4 +2,3 @@
   <Project Path="src/WorkstationGame.Api/WorkstationGame.Api.csproj" />
   <Project Path="tests/WorkstationGame.Api.Tests/WorkstationGame.Api.Tests.csproj" />
 </Solution>
-
