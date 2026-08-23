@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <InternalsVisibleTo Include="WorkstationGame.Api.Tests" />
+    <InternalsVisibleTo Include="WhopClipper.Api.Tests" />
   </ItemGroup>
 
   <ItemGroup>

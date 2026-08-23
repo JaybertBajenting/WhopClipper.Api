@@ -56,9 +56,9 @@ From `BackendGame`:
 
 ```powershell
 dotnet tool restore --configfile NuGet.Config
-dotnet restore WorkstationGuessingGame.slnx --configfile NuGet.Config
-dotnet tool run dotnet-ef database update --project src/WorkstationGame.Api
-dotnet run --project src/WorkstationGame.Api
+dotnet restore WhopClipper.slnx --configfile NuGet.Config
+dotnet tool run dotnet-ef database update --project src/WhopClipper.Api
+dotnet run --project src/WhopClipper.Api
 ```
 
 Open:
@@ -72,7 +72,7 @@ The solution filename is retained for compatibility with the original scaffold. 
 
 ## React SPA and desktop publish
 
-For the packaged desktop build, compile `FrontendGame` and copy the **contents** of `FrontendGame/dist` to `src/WorkstationGame.Api/wwwroot` before `dotnet publish`. The Web SDK includes `wwwroot` automatically. The WPF launcher can set a free loopback URL through `ASPNETCORE_URLS`, launch `WhopClipper.Api.exe` hidden, poll `/health`, and navigate its WebView to the same origin.
+For the packaged desktop build, compile `FrontendGame` and copy the **contents** of `FrontendGame/dist` to `src/WhopClipper.Api/wwwroot` before `dotnet publish`. The Web SDK includes `wwwroot` automatically. The WPF launcher can set a free loopback URL through `ASPNETCORE_URLS`, launch `WhopClipper.Api.exe` hidden, poll `/health`, and navigate its WebView to the same origin.
 
 Development can continue to run Vite at `http://localhost:5173`; CORS allows that origin by default.
 
@@ -98,8 +98,8 @@ Enums are serialized as strings. Job states are `Queued`, `Running`, `Completed`
 ## Verification
 
 ```powershell
-dotnet build WorkstationGuessingGame.slnx -c Release
-dotnet test WorkstationGuessingGame.slnx -c Release
+dotnet build WhopClipper.slnx -c Release
+dotnet test WhopClipper.slnx -c Release
 ```
 
 The test suite covers requirement extraction, defaults/review flags, workspace traversal defense, filename sanitization,

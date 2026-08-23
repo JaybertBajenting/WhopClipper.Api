@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/WhopClipper.Api/WhopClipper.Api.csproj" />
+  <Project Path="tests/WhopClipper.Api.Tests/WhopClipper.Api.Tests.csproj" />
+</Solution>

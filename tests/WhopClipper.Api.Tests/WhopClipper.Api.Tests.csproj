@@ -23,6 +23,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/WorkstationGame.Api/WorkstationGame.Api.csproj" />
+    <ProjectReference Include="../../src/WhopClipper.Api/WhopClipper.Api.csproj" />
   </ItemGroup>
 </Project>
