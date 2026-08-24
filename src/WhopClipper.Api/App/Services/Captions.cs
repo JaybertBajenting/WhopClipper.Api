@@ -38,6 +38,9 @@ public static class CaptionBuilder
     /// <summary>Advances the last word to the clip end so the caption never blinks out early.</summary>
     private const double TailPaddingSeconds = 0.35;
     private const double MinimumWordSeconds = 0.12;
+    /// <summary>How much of a word may already have been spoken before the clip starts and still
+    /// be captioned. Beyond this the viewer only hears its tail, so showing it reads as early.</summary>
+    private const double LeadingWordGraceSeconds = 0.15;
 
     public static WordTranscript? ReadTranscript(string json)
     {
@@ -56,6 +59,11 @@ public static class CaptionBuilder
         var clipLength = Math.Max(0, endSeconds - startSeconds);
         var inRange = words
             .Where(x => x.End > startSeconds && x.Start < endSeconds)
+            // A word already under way when the clip opens gets clamped to time 0 below, which
+            // puts its caption on the first frame although most of it was spoken before the cut.
+            // The viewer hears the tail and sees the next word arrive too early, so the caption
+            // reads as running ahead of the audio. Drop it unless the clip caught almost all of it.
+            .Where(x => x.Start >= startSeconds - LeadingWordGraceSeconds)
             .OrderBy(x => x.Start)
             .Select(x => new TranscriptWord(
                 Math.Max(0, x.Start - startSeconds),

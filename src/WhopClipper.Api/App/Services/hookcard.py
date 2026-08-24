@@ -18,11 +18,13 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Arial regular, to match the reference cards. Not a bold face: the reference reads as regular
+# weight, and bolding it changes the look more than any other single choice here.
 FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\segoeuib.ttf",
-    r"C:\Windows\Fonts\arialbd.ttf",
-    r"C:\Windows\Fonts\calibrib.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\calibri.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
 TEXT_COLOR = (17, 17, 17, 255)
 CARD_COLOR = (255, 255, 255, 255)

@@ -46,6 +46,28 @@ public sealed class CaptionBuilderTests
     }
 
     /// <summary>
+    /// A word already under way when the clip opens would otherwise be clamped to time 0 and
+    /// captioned from the first frame, although the viewer only hears its tail. That is what
+    /// makes captions look like they run ahead of the speech.
+    /// </summary>
+    [Fact]
+    public void DropsAWordThatWasAlreadyBeingSpokenWhenTheClipOpened()
+    {
+        TranscriptWord[] words =
+        [
+            new(9.0, 10.4, "HALFSPOKEN"),   // started 1s before the cut at 10.0
+            new(10.45, 10.9, "CAUGHT"),     // starts just 0.05s early, close enough to keep
+            new(11.2, 11.8, "CLEAN"),
+        ];
+
+        var ass = CaptionBuilder.BuildAss(words, 10.5, 14.0);
+
+        Assert.DoesNotContain("HALFSPOKEN", ass);
+        Assert.Contains("CAUGHT", ass);
+        Assert.Contains("CLEAN", ass);
+    }
+
+    /// <summary>
     /// Two events that overlap in time are both drawn, stacked, which reads as a doubled
     /// caption. Whisper regularly times consecutive words closer together than the minimum
     /// on-screen duration, so the minimum must never push an event past its successor.
