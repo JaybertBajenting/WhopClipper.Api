@@ -1,9 +1,42 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using WhopClipper.Api.App.Contracts;
 using WhopClipper.Api.App.Data;
 using WhopClipper.Api.App.Domain;
+using WhopClipper.Api.App.Services;
 
 namespace WhopClipper.Api.Tests;
+
+public sealed class SourcePipelinePayloadTests
+{
+    /// <summary>
+    /// The pipeline is queued once per source and deletes each VOD as soon as its clips exist,
+    /// so a clip bank can be worked through without ever holding two multi-gigabyte sources.
+    /// The default has to stay "delete", or the disk fills on the third video.
+    /// </summary>
+    [Fact]
+    public void DeletesTheSourceByDefaultSoAClipBankFitsOnDisk()
+    {
+        var payload = new SourcePipelineJobPayload(Guid.NewGuid());
+
+        Assert.True(payload.DeleteSourceWhenDone);
+        Assert.Equal(PlatformKind.TikTok, payload.Platform);
+        Assert.Equal("SmartCrop", payload.Framing);
+        Assert.Null(payload.HookYFraction);
+    }
+
+    [Fact]
+    public void RoundTripsThroughJsonSoAQueuedPipelineSurvivesARestart()
+    {
+        var original = new SourcePipelineJobPayload(Guid.NewGuid(), PlatformKind.YouTubeShorts,
+            MaxClips: 5, DeleteSourceWhenDone: false, Framing: "CenterCrop", HookYFraction: 0.412);
+
+        var restored = JsonSerializer.Deserialize<SourcePipelineJobPayload>(
+            JsonSerializer.Serialize(original, JsonDefaults.Serializer), JsonDefaults.Serializer);
+
+        Assert.Equal(original, restored);
+    }
+}
 
 public sealed class CampaignPersistenceTests
 {

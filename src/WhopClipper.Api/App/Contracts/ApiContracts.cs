@@ -67,6 +67,12 @@ public sealed record RenderedClipDto(string RelativePath, string FileName, strin
 public sealed record AddSourceRequest(string Url);
 public sealed record InspectSourceRequest(string Url);
 public sealed record StartDownloadRequest(Guid SourceAssetId, string? Quality = null, bool Refresh = false);
+/// <summary>Queues the whole download-to-clips pipeline for each video, one at a time.</summary>
+/// <param name="Urls">Videos not already registered are added to the campaign first.</param>
+public sealed record StartSourcePipelineRequest(IReadOnlyList<Guid>? SourceAssetIds = null,
+    IReadOnlyList<string>? Urls = null, PlatformKind Platform = PlatformKind.TikTok, int MaxClips = 8,
+    bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude, string? Quality = null,
+    string? Framing = null, double? HookYFraction = null);
 public sealed record SourceAssetDto(Guid Id, string Url, string? Title, string? Uploader, double? DurationSeconds,
     string? ThumbnailUrl, string? LocalRelativePath, string? SubtitleRelativePath, string Status,
     DateTimeOffset CreatedAt, DateTimeOffset? DownloadedAt, bool IsLocalFile, bool HasWordTranscript);

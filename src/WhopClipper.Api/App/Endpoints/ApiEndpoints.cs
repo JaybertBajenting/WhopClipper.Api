@@ -23,6 +23,7 @@ public static class ApiEndpoints
         MapEditPlans(api);
         MapMediaLibrary(api);
         MapSettings(api);
+        PublishingEndpoints.Map(api);
         return app;
     }
 
@@ -260,6 +261,47 @@ public static class ApiEndpoints
             Directory.CreateDirectory(folder);
             return Results.Ok(new { folder });
         });
+
+        // Hand over a list of videos and walk away: each is downloaded, transcribed, cut into
+        // clips and then deleted, one at a time, leaving only the clips behind. Queued rather
+        // than run here, because a single three-hour VOD is an hour of work on its own.
+        campaigns.MapPost("/{id:guid}/pipelines", async (Guid id, StartSourcePipelineRequest request,
+            AppDbContext db, JobCoordinator coordinator, CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            var urls = (request.Urls ?? []).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            if (request.SourceAssetIds is { Count: 0 } && urls.Count == 0)
+                return Results.BadRequest(new { error = "Give at least one source id or URL." });
+
+            var sourceIds = new List<Guid>(request.SourceAssetIds ?? []);
+            foreach (var url in urls)
+            {
+                var existing = await db.SourceAssets.SingleOrDefaultAsync(x => x.CampaignId == id && x.Url == url, ct);
+                if (existing is null)
+                {
+                    existing = new SourceAsset { CampaignId = id, Url = url };
+                    db.SourceAssets.Add(existing);
+                    await db.SaveChangesAsync(ct);
+                }
+                if (!sourceIds.Contains(existing.Id)) sourceIds.Add(existing.Id);
+            }
+
+            var known = await db.SourceAssets.Where(x => x.CampaignId == id && sourceIds.Contains(x.Id))
+                .Select(x => x.Id).ToListAsync(ct);
+            var missing = sourceIds.Except(known).ToList();
+            if (missing.Count > 0) return Results.BadRequest(new { error = "Unknown sources.", sourceAssetIds = missing });
+
+            var queued = new List<JobDto>();
+            foreach (var sourceId in sourceIds)
+            {
+                var job = await coordinator.CreateAsync(id, JobKind.SourcePipeline,
+                    new SourcePipelineJobPayload(sourceId, request.Platform, request.MaxClips,
+                        request.DeleteSourceWhenDone, request.Mode, request.Quality,
+                        request.Framing ?? "SmartCrop", request.HookYFraction), ct);
+                queued.Add(job.ToDto());
+            }
+            return Results.Accepted($"/api/jobs", queued);
+        }).WithTags("Sources");
 
         campaigns.MapPost("/{id:guid}/sources/scan-local", async (Guid id, AppDbContext db, WorkspaceService workspace,
             LocalSourceScanner scanner, CancellationToken ct) =>

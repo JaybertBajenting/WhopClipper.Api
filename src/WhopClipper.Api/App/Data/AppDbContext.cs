@@ -20,6 +20,9 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<MediaLibraryLocation> MediaLibraryLocations => Set<MediaLibraryLocation>();
     public DbSet<MediaLibraryAsset> MediaLibraryAssets => Set<MediaLibraryAsset>();
     public DbSet<ApplicationSetting> ApplicationSettings => Set<ApplicationSetting>();
+    public DbSet<PlatformAccountKit> PlatformAccountKits => Set<PlatformAccountKit>();
+    public DbSet<PlatformConnection> PlatformConnections => Set<PlatformConnection>();
+    public DbSet<PublishJob> PublishJobs => Set<PublishJob>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -51,6 +54,26 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
         modelBuilder.Entity<MediaLibraryAsset>().Property(x => x.Kind).HasConversion<string>();
         modelBuilder.Entity<MediaLibraryAsset>().HasIndex(x => new { x.LocationId, x.FullPath }).IsUnique();
         modelBuilder.Entity<ApplicationSetting>().HasKey(x => x.Key);
+        modelBuilder.Entity<PlatformAccountKit>().Property(x => x.Platform).HasConversion<string>();
+        modelBuilder.Entity<PlatformAccountKit>().HasIndex(x => new { x.CampaignId, x.Platform }).IsUnique();
+        modelBuilder.Entity<Campaign>().HasMany(x => x.PlatformAccountKits).WithOne(x => x.Campaign)
+            .HasForeignKey(x => x.CampaignId).OnDelete(DeleteBehavior.Cascade);
+        modelBuilder.Entity<PlatformConnection>().Property(x => x.Platform).HasConversion<string>();
+        modelBuilder.Entity<PlatformConnection>().Property(x => x.CredentialReference).HasMaxLength(256);
+        modelBuilder.Entity<PlatformConnection>().Property(x => x.AccountIdentifier).HasMaxLength(500);
+        modelBuilder.Entity<PlatformConnection>().HasIndex(x => x.Platform).IsUnique();
+        modelBuilder.Entity<PublishJob>().Property(x => x.Platform).HasConversion<string>();
+        modelBuilder.Entity<PublishJob>().Property(x => x.Status).HasConversion<string>();
+        modelBuilder.Entity<PublishJob>().Property(x => x.IdempotencyKey).HasMaxLength(200);
+        modelBuilder.Entity<PublishJob>().Property(x => x.FinalPublishIdempotencyKey).HasMaxLength(200);
+        modelBuilder.Entity<PublishJob>().Property(x => x.RequestHash).HasMaxLength(64);
+        modelBuilder.Entity<PublishJob>().Property(x => x.FileSha256).HasMaxLength(64);
+        modelBuilder.Entity<PublishJob>().Property(x => x.AccountIdentifier).HasMaxLength(500);
+        modelBuilder.Entity<PublishJob>().HasIndex(x => x.IdempotencyKey).IsUnique();
+        modelBuilder.Entity<PublishJob>().HasIndex(x => x.FinalPublishIdempotencyKey).IsUnique();
+        modelBuilder.Entity<PublishJob>().HasIndex(x => new { x.Status, x.CreatedAt });
+        modelBuilder.Entity<Campaign>().HasMany(x => x.PublishJobs).WithOne(x => x.Campaign)
+            .HasForeignKey(x => x.CampaignId).OnDelete(DeleteBehavior.Cascade);
 
         // Npgsql refuses to write a DateTimeOffset with a non-zero offset into
         // `timestamp with time zone`. A deadline entered in the UI arrives with the

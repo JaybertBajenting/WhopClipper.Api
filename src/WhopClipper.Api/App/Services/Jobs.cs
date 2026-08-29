@@ -17,6 +17,13 @@ public sealed record RenderJobPayload(Guid EditPlanId);
 public sealed record ReferenceJobPayload(Guid ReferenceVideoId, bool Refresh = false);
 public sealed record TranscribeJobPayload(Guid SourceAssetId, bool Refresh = false);
 public sealed record ValidateJobPayload(string OutputRelativePath, double ExpectedMinDuration, double ExpectedMaxDuration, int Width, int Height);
+/// <param name="DeleteSourceWhenDone">Removes the downloaded VOD once its clips exist, so a
+/// long clip bank can be worked through without holding every source on disk at once.</param>
+/// <param name="HookYFraction">Where the hook card sits. Streams published as a vertical split
+/// carry a facecam across the top, and a hook anchored there covers the streamer's face.</param>
+public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind Platform = PlatformKind.TikTok,
+    int MaxClips = 8, bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude,
+    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = null);
 
 public sealed class JobQueue
 {
@@ -142,6 +149,7 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
                 case JobKind.Validate: await ValidateAsync(job, cancellationToken); break;
                 case JobKind.ReferenceAnalysis: await AnalyzeReferenceAsync(job, cancellationToken); break;
                 case JobKind.Transcribe: await TranscribeAsync(job, cancellationToken); break;
+                case JobKind.SourcePipeline: await RunSourcePipelineAsync(job, cancellationToken); break;
                 default: throw new InvalidOperationException($"Unsupported job kind {job.Kind}.");
             }
             job.Status = JobStatus.Completed;
@@ -164,6 +172,112 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         }
         job.CompletedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Takes one source all the way from a URL to finished clips: download, transcribe, pick
+    /// highlights, render each one, then delete the downloaded video.
+    ///
+    /// Queue one of these per source and a whole clip bank can be worked through unattended,
+    /// which is the point - a three-hour VOD is several gigabytes, and holding more than one at
+    /// a time is what keeps filling the disk. The source is removed as soon as its clips exist,
+    /// so peak usage is one VOD rather than all of them.
+    ///
+    /// The stages are the existing job handlers, driven in turn by swapping this job's payload,
+    /// so a pipeline run behaves exactly like running the four jobs by hand.
+    /// </summary>
+    private async Task RunSourcePipelineAsync(JobRecord job, CancellationToken cancellationToken)
+    {
+        var payload = Deserialize<SourcePipelineJobPayload>(job.PayloadJson);
+        var campaignId = job.CampaignId
+            ?? throw new InvalidOperationException("A source pipeline must belong to a campaign.");
+        var source = await db.SourceAssets.SingleAsync(x => x.Id == payload.SourceAssetId, cancellationToken);
+        var stages = new List<object>();
+
+        async Task StageAsync(string name, double progress, object stagePayload, Func<Task> run)
+        {
+            job.PayloadJson = JsonSerializer.Serialize(stagePayload, JsonDefaults.Serializer);
+            job.ResultJson = null;
+            await run();
+            stages.Add(new { stage = name, result = JsonDefaults.ParseElement(job.ResultJson) });
+            job.Progress = progress;
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
+        await StageAsync("download", .15, new SourceJobPayload(payload.SourceAssetId, false, payload.Quality),
+            () => DownloadAsync(job, cancellationToken));
+        await StageAsync("transcribe", .30, new TranscribeJobPayload(payload.SourceAssetId),
+            () => TranscribeAsync(job, cancellationToken));
+
+        var run = new AiAnalysisRun
+        {
+            CampaignId = campaignId, SourceAssetId = payload.SourceAssetId,
+            JobId = job.Id, Mode = payload.Mode
+        };
+        db.AiAnalysisRuns.Add(run);
+        await db.SaveChangesAsync(cancellationToken);
+        await StageAsync("analysis", .45,
+            new AiJobPayload(run.Id, payload.SourceAssetId, payload.Mode, payload.Platform, null),
+            () => AnalyzeAsync(job, cancellationToken));
+
+        var profile = await db.PlatformProfiles
+            .SingleOrDefaultAsync(x => x.CampaignId == campaignId && x.Platform == payload.Platform, cancellationToken);
+        var highlights = await db.HighlightCandidates.Where(x => x.AiAnalysisRunId == run.Id)
+            .OrderBy(x => x.Rank).Take(Math.Clamp(payload.MaxClips, 1, 25)).ToListAsync(cancellationToken);
+        if (highlights.Count == 0) throw new InvalidOperationException("Highlight selection returned nothing for this source.");
+
+        var rendered = new List<string>();
+        for (var index = 0; index < highlights.Count; index++)
+        {
+            var highlight = highlights[index];
+            var plan = new EditPlan
+            {
+                CampaignId = campaignId, SourceAssetId = payload.SourceAssetId,
+                Platform = payload.Platform,
+                StartSeconds = highlight.StartSeconds, EndSeconds = highlight.EndSeconds,
+                Width = profile?.Width ?? 1080, Height = profile?.Height ?? 1920,
+                FramesPerSecond = 25, Crf = 20, NormalizeAudio = true,
+                BurnSubtitles = profile?.BurnSubtitles ?? true,
+                MusicVolume = 0, OutputFileName = WorkspaceService.SafeFileName(
+                    string.IsNullOrWhiteSpace(highlight.Hook) ? $"clip-{index + 1:00}" : highlight.Hook, $"clip-{index + 1:00}") + ".mp4",
+                IsApproved = true,
+                ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(
+                    payload.Framing, profile?.CallToAction, "Bold White Centered Captions", -12, [],
+                    string.IsNullOrWhiteSpace(highlight.Hook)
+                        ? []
+                        : [new OverlayDto(highlight.Hook, 0,
+                            Math.Max(1, highlight.EndSeconds - highlight.StartSeconds - 0.04),
+                            "Top", 48, "#FFFFFF", "Card", payload.HookYFraction)]),
+                    JsonDefaults.Serializer)
+            };
+            db.EditPlans.Add(plan);
+            await db.SaveChangesAsync(cancellationToken);
+            await StageAsync($"render {index + 1}/{highlights.Count}",
+                .45 + .5 * (index + 1) / highlights.Count, new RenderJobPayload(plan.Id),
+                () => RenderAsync(job, cancellationToken));
+            rendered.Add(plan.OutputFileName);
+        }
+
+        var deleted = false;
+        if (payload.DeleteSourceWhenDone && !string.IsNullOrWhiteSpace(source.LocalRelativePath))
+        {
+            // The clips are the deliverable; the VOD is a several-gigabyte intermediate. The
+            // transcript stays, so the source can be reconsidered later without transcribing again.
+            var media = workspace.ResolveRelative(source.LocalRelativePath);
+            if (File.Exists(media))
+            {
+                File.Delete(media);
+                deleted = true;
+            }
+            source.LocalRelativePath = null;
+            source.DownloadedAt = null;
+        }
+
+        job.PayloadJson = JsonSerializer.Serialize(payload, JsonDefaults.Serializer);
+        job.ResultJson = JsonSerializer.Serialize(new
+        {
+            sourceAssetId = payload.SourceAssetId, clips = rendered, sourceDeleted = deleted, stages
+        }, JsonDefaults.Serializer);
     }
 
     private async Task InspectAsync(JobRecord job, CancellationToken cancellationToken)

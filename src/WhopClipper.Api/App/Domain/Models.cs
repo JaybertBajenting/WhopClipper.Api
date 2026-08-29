@@ -3,12 +3,27 @@ namespace WhopClipper.Api.App.Domain;
 public enum CampaignStatus { Draft, Ready, Processing, NeedsReview, Completed, Archived }
 public enum PlatformKind { TikTok, InstagramReels, YouTubeShorts, X }
 public enum JobStatus { Queued, Running, Completed, Failed, Cancelled }
-public enum JobKind { InspectSource, Download, AiAnalysis, Render, Validate, ReferenceAnalysis, Transcribe }
+public enum JobKind { InspectSource, Download, AiAnalysis, Render, Validate, ReferenceAnalysis, Transcribe, SourcePipeline }
 public enum AiMode { Claude, Codex, Auto, Compare }
 public enum MediaAssetKind { Music, SoundEffect }
 public enum CampaignDocumentKind { Pdf, Word, Text, Markdown }
 public enum DocumentExtractionStatus { Pending, Extracted, Failed }
 public enum ReferenceVideoStatus { Pending, Analyzing, Analyzed, Failed }
+public enum PublishingConnectionMode { Api, Manual }
+public enum PublishingConnectionStatus { NotConfigured, Configured, NeedsAttention }
+public enum PublishStatus
+{
+    Queued,
+    Validating,
+    Uploading,
+    Processing,
+    AwaitingFinalConfirmation,
+    Published,
+    RequiresManualAction,
+    NeedsAttention,
+    Failed,
+    Cancelled
+}
 
 public sealed class Campaign
 {
@@ -35,6 +50,8 @@ public sealed class Campaign
     public ICollection<SourceAsset> Sources { get; set; } = [];
     public ICollection<CampaignDocument> Documents { get; set; } = [];
     public ICollection<ReferenceVideo> ReferenceVideos { get; set; } = [];
+    public ICollection<PlatformAccountKit> PlatformAccountKits { get; set; } = [];
+    public ICollection<PublishJob> PublishJobs { get; set; } = [];
 }
 
 /// <summary>An uploaded PDF/Word/text brief kept in the campaign workspace and folded into requirement extraction.</summary>
@@ -260,4 +277,66 @@ public sealed class ApplicationSetting
     public string Key { get; set; } = string.Empty;
     public string Value { get; set; } = string.Empty;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Copy-ready, non-secret account/profile data. Passwords, OTPs and recovery codes are never accepted.</summary>
+public sealed class PlatformAccountKit
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid CampaignId { get; set; }
+    public Campaign Campaign { get; set; } = null!;
+    public PlatformKind Platform { get; set; }
+    public string FieldsJson { get; set; } = "{}";
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Non-secret OAuth metadata. Secret material lives in the current user's separate local vault.</summary>
+public sealed class PlatformConnection
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public PlatformKind Platform { get; set; }
+    public string CredentialReference { get; set; } = string.Empty;
+    public string ConfiguredFieldsJson { get; set; } = "[]";
+    public string SecretFlagsJson { get; set; } = "{}";
+    public string GrantedScopesJson { get; set; } = "[]";
+    public string? AccountIdentifier { get; set; }
+    public DateTimeOffset? TokenExpiresAt { get; set; }
+    public DateTimeOffset? LastValidatedAt { get; set; }
+    public string? LastError { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>A durable, one-shot publishing attempt. Completed attempts are never automatically retried.</summary>
+public sealed class PublishJob
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid CampaignId { get; set; }
+    public Campaign Campaign { get; set; } = null!;
+    public PlatformKind Platform { get; set; }
+    public PublishStatus Status { get; set; } = PublishStatus.Queued;
+    public double Progress { get; set; }
+    public string OutputRelativePath { get; set; } = string.Empty;
+    public string FileName { get; set; } = string.Empty;
+    public string Title { get; set; } = string.Empty;
+    public string Caption { get; set; } = string.Empty;
+    public string Privacy { get; set; } = "private";
+    public bool ShareToFeed { get; set; } = true;
+    public bool DryRun { get; set; }
+    public string IdempotencyKey { get; set; } = string.Empty;
+    public string RequestHash { get; set; } = string.Empty;
+    public string FileSha256 { get; set; } = string.Empty;
+    public long FileSizeBytes { get; set; }
+    public string? AccountIdentifier { get; set; }
+    public string? RemoteContainerId { get; set; }
+    public string? FinalPublishIdempotencyKey { get; set; }
+    public DateTimeOffset? FinalPublishConfirmedAt { get; set; }
+    public string? ExternalId { get; set; }
+    public string? ExternalUrl { get; set; }
+    public string? Error { get; set; }
+    public string? ResultJson { get; set; }
+    public string? ManualPackageRelativePath { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? PublishedAt { get; set; }
 }

@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using FluentValidation;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 using WhopClipper.Api.App.Contracts;
@@ -19,6 +20,14 @@ builder.Host.UseSerilog((context, services, configuration) => configuration
     .WriteTo.File(Path.Combine(AppContext.BaseDirectory, "logs", "whop-clipper-.log"), rollingInterval: RollingInterval.Day));
 
 builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("WhopClipper"));
+builder.Services.Configure<PublishingApiOptions>(builder.Configuration.GetSection("PublishingApis"));
+var protectionKeyRoot = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WhopClipper", "keys");
+Directory.CreateDirectory(protectionKeyRoot);
+var dataProtection = builder.Services.AddDataProtection()
+    .SetApplicationName("WhopClipper")
+    .PersistKeysToFileSystem(new DirectoryInfo(protectionKeyRoot));
+if (OperatingSystem.IsWindows()) dataProtection.ProtectKeysWithDpapi(protectToLocalMachine: false);
 var connectionString = builder.Configuration.GetConnectionString("Postgres")
     ?? throw new InvalidOperationException("ConnectionStrings:Postgres is required.");
 builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connectionString,
@@ -53,10 +62,30 @@ builder.Services.AddScoped<MediaLibraryService>();
 builder.Services.AddScoped<DependencyService>();
 builder.Services.AddSingleton<DatabaseInitializationState>();
 builder.Services.AddScoped<DatabaseReadinessService>();
+builder.Services.AddSingleton<LocalPublishingRequestGuard>();
+builder.Services.AddSingleton<YouTubeOAuthStateStore>();
+builder.Services.AddSingleton<IPublishingCredentialVault, PublishingCredentialVault>();
+builder.Services.AddScoped<PlatformAccountKitService>();
+builder.Services.AddScoped<PlatformConnectionService>();
+builder.Services.AddScoped<PublishingMediaValidator>();
+builder.Services.AddScoped<PublishJobService>();
+builder.Services.AddScoped<YouTubePublisher>();
+builder.Services.AddScoped<InstagramPublisher>();
+builder.Services.AddScoped<IPlatformPublisher>(services => services.GetRequiredService<YouTubePublisher>());
+builder.Services.AddScoped<IPlatformConnectionVerifier>(services => services.GetRequiredService<YouTubePublisher>());
+builder.Services.AddScoped<IPlatformConnectionVerifier>(services => services.GetRequiredService<InstagramPublisher>());
+builder.Services.AddScoped<YouTubeOAuthService>();
+builder.Services.AddHttpClient("PublishingExternal", client => client.Timeout = Timeout.InfiniteTimeSpan)
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false,
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+    });
 builder.Services.AddSingleton<IAiMediaProvider, ClaudeCliProvider>();
 builder.Services.AddSingleton<IAiMediaProvider, CodexCliProvider>();
 builder.Services.AddHostedService<DatabaseInitializer>();
 builder.Services.AddHostedService<MediaJobWorker>();
+builder.Services.AddHostedService<PublishingWorker>();
 
 var allowedOrigins = builder.Configuration.GetSection("WhopClipper:AllowedOrigins").Get<string[]>() ?? ["http://localhost:5173"];
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod()));
@@ -67,8 +96,11 @@ app.UseSerilogRequestLogging();
 app.UseCors();
 app.UseDefaultFiles();
 app.UseStaticFiles();
-app.UseSwagger();
-app.UseSwaggerUI();
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 
 app.MapGet("/api/info", () => Results.Ok(new { name = "Whop Clipping Assistant API", status = "ready", version = "0.1.0" }));
 app.MapHealthChecks("/health");

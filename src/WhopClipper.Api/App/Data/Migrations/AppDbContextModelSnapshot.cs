@@ -515,6 +515,88 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.ToTable("MediaLibraryLocations", "clipper");
                 });
 
+            modelBuilder.Entity("WhopClipper.Api.App.Domain.PlatformAccountKit", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("CampaignId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("FieldsJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Platform")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CampaignId", "Platform")
+                        .IsUnique();
+
+                    b.ToTable("PlatformAccountKits", "clipper");
+                });
+
+            modelBuilder.Entity("WhopClipper.Api.App.Domain.PlatformConnection", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("AccountIdentifier")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<string>("ConfiguredFieldsJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("CredentialReference")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("GrantedScopesJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("LastError")
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset?>("LastValidatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Platform")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("SecretFlagsJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset?>("TokenExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Platform")
+                        .IsUnique();
+
+                    b.ToTable("PlatformConnections", "clipper");
+                });
+
             modelBuilder.Entity("WhopClipper.Api.App.Domain.PlatformProfile", b =>
                 {
                     b.Property<Guid>("Id")
@@ -591,6 +673,123 @@ namespace WhopClipper.Api.App.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("PlatformProfiles", "clipper");
+                });
+
+            modelBuilder.Entity("WhopClipper.Api.App.Domain.PublishJob", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("AccountIdentifier")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<Guid>("CampaignId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Caption")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("DryRun")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Error")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ExternalId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ExternalUrl")
+                        .HasColumnType("text");
+
+                    b.Property<string>("FileName")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("FileSha256")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long>("FileSizeBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTimeOffset?>("FinalPublishConfirmedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("FinalPublishIdempotencyKey")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("IdempotencyKey")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("ManualPackageRelativePath")
+                        .HasColumnType("text");
+
+                    b.Property<string>("OutputRelativePath")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Platform")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Privacy")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<double>("Progress")
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTimeOffset?>("PublishedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("RemoteContainerId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("RequestHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("ResultJson")
+                        .HasColumnType("text");
+
+                    b.Property<bool>("ShareToFeed")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CampaignId");
+
+                    b.HasIndex("FinalPublishIdempotencyKey")
+                        .IsUnique();
+
+                    b.HasIndex("IdempotencyKey")
+                        .IsUnique();
+
+                    b.HasIndex("Status", "CreatedAt");
+
+                    b.ToTable("PublishJobs", "clipper");
                 });
 
             modelBuilder.Entity("WhopClipper.Api.App.Domain.ReferenceVideo", b =>
@@ -780,10 +979,32 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Navigation("Location");
                 });
 
+            modelBuilder.Entity("WhopClipper.Api.App.Domain.PlatformAccountKit", b =>
+                {
+                    b.HasOne("WhopClipper.Api.App.Domain.Campaign", "Campaign")
+                        .WithMany("PlatformAccountKits")
+                        .HasForeignKey("CampaignId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Campaign");
+                });
+
             modelBuilder.Entity("WhopClipper.Api.App.Domain.PlatformProfile", b =>
                 {
                     b.HasOne("WhopClipper.Api.App.Domain.Campaign", "Campaign")
                         .WithMany("PlatformProfiles")
+                        .HasForeignKey("CampaignId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Campaign");
+                });
+
+            modelBuilder.Entity("WhopClipper.Api.App.Domain.PublishJob", b =>
+                {
+                    b.HasOne("WhopClipper.Api.App.Domain.Campaign", "Campaign")
+                        .WithMany("PublishJobs")
                         .HasForeignKey("CampaignId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
@@ -833,7 +1054,11 @@ namespace WhopClipper.Api.App.Data.Migrations
                 {
                     b.Navigation("Documents");
 
+                    b.Navigation("PlatformAccountKits");
+
                     b.Navigation("PlatformProfiles");
+
+                    b.Navigation("PublishJobs");
 
                     b.Navigation("ReferenceVideos");
 
