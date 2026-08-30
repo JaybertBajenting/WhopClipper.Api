@@ -194,6 +194,32 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         var campaignId = job.CampaignId
             ?? throw new InvalidOperationException("A source pipeline must belong to a campaign.");
         var source = await db.SourceAssets.SingleAsync(x => x.Id == payload.SourceAssetId, cancellationToken);
+        try
+        {
+            await RunSourcePipelineStagesAsync(job, payload, campaignId, source, cancellationToken);
+        }
+        catch when (payload.DeleteSourceWhenDone && Cleanup(source, cancellationToken))
+        {
+            throw;   // unreachable: the filter always returns false, it only runs the cleanup
+        }
+    }
+
+    /// <summary>
+    /// Frees a failed run's download from inside an exception filter, so it happens before the
+    /// stack unwinds and without swallowing the failure. A pipeline that died part way used to
+    /// leave its several-gigabyte source behind; two of those in a row filled the disk and took
+    /// every queued run down with them.
+    /// </summary>
+    private bool Cleanup(SourceAsset source, CancellationToken cancellationToken)
+    {
+        try { ReleaseSourceMediaAsync(source, cancellationToken).GetAwaiter().GetResult(); }
+        catch (Exception ex) { logger.LogWarning(ex, "Could not release the source after a failed pipeline."); }
+        return false;
+    }
+
+    private async Task RunSourcePipelineStagesAsync(JobRecord job, SourcePipelineJobPayload payload,
+        Guid campaignId, SourceAsset source, CancellationToken cancellationToken)
+    {
         var stages = new List<object>();
 
         async Task StageAsync(string name, double progress, object stagePayload, Func<Task> run)
@@ -278,26 +304,52 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
             rendered.Add(plan.OutputFileName);
         }
 
-        var deleted = false;
-        if (payload.DeleteSourceWhenDone && !string.IsNullOrWhiteSpace(source.LocalRelativePath))
-        {
-            // The clips are the deliverable; the VOD is a several-gigabyte intermediate. The
-            // transcript stays, so the source can be reconsidered later without transcribing again.
-            var media = workspace.ResolveRelative(source.LocalRelativePath);
-            if (File.Exists(media))
-            {
-                File.Delete(media);
-                deleted = true;
-            }
-            source.LocalRelativePath = null;
-            source.DownloadedAt = null;
-        }
+        var deleted = payload.DeleteSourceWhenDone && await ReleaseSourceMediaAsync(source, cancellationToken);
 
         job.PayloadJson = JsonSerializer.Serialize(payload, JsonDefaults.Serializer);
         job.ResultJson = JsonSerializer.Serialize(new
         {
             sourceAssetId = payload.SourceAssetId, clips = rendered, sourceDeleted = deleted, stages
         }, JsonDefaults.Serializer);
+    }
+
+    /// <summary>
+    /// Deletes the downloaded VOD and any half-finished download beside it, and forgets it on
+    /// the source record. The clips are the deliverable; the video is a several-gigabyte
+    /// intermediate. The transcript is kept, so the source can be revisited without
+    /// transcribing it again.
+    /// </summary>
+    private async Task<bool> ReleaseSourceMediaAsync(SourceAsset source, CancellationToken cancellationToken)
+    {
+        var deleted = false;
+        if (!string.IsNullOrWhiteSpace(source.LocalRelativePath))
+        {
+            var media = workspace.ResolveRelative(source.LocalRelativePath);
+            if (File.Exists(media))
+            {
+                try { File.Delete(media); deleted = true; }
+                catch (IOException ex) { logger.LogWarning(ex, "Could not delete {Media}", media); }
+            }
+            source.LocalRelativePath = null;
+            source.DownloadedAt = null;
+        }
+
+        // A download killed part way through leaves .part files that nothing else will ever
+        // claim. Two of those filled the disk and took the rest of the queue down with them.
+        var folder = workspace.ResolveRelative(
+            Path.Combine("campaigns", source.CampaignId.ToString("N"), "source"));
+        if (Directory.Exists(folder))
+        {
+            var stem = LocalSourceScanner.VideoIdFromUrl(source.Url);
+            foreach (var leftover in Directory.EnumerateFiles(folder, "*.part"))
+            {
+                if (stem.Length > 0 && !Path.GetFileName(leftover).Contains(stem, StringComparison.OrdinalIgnoreCase)) continue;
+                try { File.Delete(leftover); deleted = true; }
+                catch (IOException ex) { logger.LogWarning(ex, "Could not delete {Leftover}", leftover); }
+            }
+        }
+        if (deleted) await db.SaveChangesAsync(cancellationToken);
+        return deleted;
     }
 
     /// <summary>
