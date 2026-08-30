@@ -25,6 +25,23 @@ public sealed class SourcePipelinePayloadTests
         Assert.Null(payload.HookYFraction);
     }
 
+    /// <summary>
+    /// A flat cap cannot transcribe a long stream: faster-whisper runs at roughly a quarter of
+    /// realtime on CPU, so a 293 minute VOD died at the 30 minute limit having decoded most of
+    /// it. The allowance has to grow with the recording.
+    /// </summary>
+    [Theory]
+    [InlineData(0, 30)]          // nothing known about the media: keep the floor
+    [InlineData(60 * 60, 60)]    // one hour of video
+    [InlineData(293 * 60, 234)]  // the stream that timed out: 0.75x plus 15 minutes of slack
+    public void GivesTranscriptionTimeProportionalToTheRecording(double mediaSeconds, int atLeastMinutes)
+    {
+        var allowed = JobExecutionService.TranscriptionTimeoutForTests(mediaSeconds, 30);
+
+        Assert.True(allowed >= TimeSpan.FromMinutes(atLeastMinutes),
+            $"{mediaSeconds}s of media only got {allowed.TotalMinutes:0} minutes.");
+    }
+
     [Fact]
     public void RoundTripsThroughJsonSoAQueuedPipelineSurvivesARestart()
     {

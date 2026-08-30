@@ -280,6 +280,22 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         }, JsonDefaults.Serializer);
     }
 
+    /// <summary>
+    /// Transcription has to be given time proportional to the recording. A flat 30 minute cap
+    /// cannot finish a five-hour stream - faster-whisper runs at roughly a quarter of realtime
+    /// on CPU - and the job dies at the cap having thrown away everything it decoded.
+    /// </summary>
+    internal static TimeSpan TranscriptionTimeoutForTests(double? durationSeconds, int configuredMinutes) =>
+        TranscriptionTimeout(durationSeconds, configuredMinutes);
+
+    private static TimeSpan TranscriptionTimeout(double? durationSeconds, int configuredMinutes)
+    {
+        var media = TimeSpan.FromSeconds(Math.Max(0, durationSeconds ?? 0));
+        var needed = media * 0.75 + TimeSpan.FromMinutes(15);
+        var floor = TimeSpan.FromMinutes(Math.Max(30, configuredMinutes));
+        return needed > floor ? needed : floor;
+    }
+
     private async Task InspectAsync(JobRecord job, CancellationToken cancellationToken)
     {
         var payload = Deserialize<SourceJobPayload>(job.PayloadJson);
@@ -402,7 +418,7 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         var result = await processRunner.RunAsync(new ProcessInvocation(python,
             [script, media, outputPath, "--model", options.Value.WhisperModel,
                 "--ffmpeg", options.Value.FfmpegPath, "--chunk-seconds", options.Value.TranscriptionChunkSeconds.ToString(CultureInfo.InvariantCulture)],
-            transcriptDirectory, Timeout: TimeSpan.FromMinutes(Math.Max(30, options.Value.ProcessTimeoutMinutes))),
+            transcriptDirectory, Timeout: TranscriptionTimeout(source.DurationSeconds, options.Value.ProcessTimeoutMinutes)),
             cancellationToken);
         Capture(job, result);
         EnsureSuccess(result, "faster-whisper transcription");
