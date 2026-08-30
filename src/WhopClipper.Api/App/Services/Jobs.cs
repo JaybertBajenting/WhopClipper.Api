@@ -260,10 +260,12 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
                 IsApproved = true,
                 ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(
                     payload.Framing, profile?.CallToAction, "Bold White Centered Captions", -12, style.SoundEffects,
-                    string.IsNullOrWhiteSpace(highlight.Hook)
+                    // A hook must end strictly inside its clip. Flooring its length at a fixed
+                    // minimum let it outlive a short clip, and the renderer rejects the whole
+                    // plan for that - which failed a pipeline five clips in.
+                    string.IsNullOrWhiteSpace(highlight.Hook) || style.EndSeconds - style.StartSeconds <= 0.5
                         ? []
-                        : [new OverlayDto(highlight.Hook, 0,
-                            Math.Max(1, style.EndSeconds - style.StartSeconds - 0.04),
+                        : [new OverlayDto(highlight.Hook, 0, style.EndSeconds - style.StartSeconds - 0.04,
                             "Top", 48, "#FFFFFF", "Card", payload.HookYFraction)],
                     style.ColorFlashes, style.ZoomPunches),
                     JsonDefaults.Serializer)

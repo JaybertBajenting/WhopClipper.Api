@@ -45,6 +45,28 @@ public sealed class ClipStylistTests
         Assert.True(end - start > 13.4, $"ended on the dangling word at {end - start:0.##}s");
     }
 
+    /// <summary>
+    /// A styled window must never come back shorter than a usable clip. It did once: the start
+    /// was nudged forward while the original end was kept, and the hook - sized from the clip's
+    /// own length - then outlived it, which the renderer rejects and which failed a whole
+    /// pipeline five clips in.
+    /// </summary>
+    [Theory]
+    [InlineData(10.5, 24.0)]   // one unbroken run of speech, no boundary anywhere
+    [InlineData(10.5, 11.2)]   // a highlight far too short to trim
+    public void NeverReturnsAWindowShorterThanTheOneAskedFor(double from, double to)
+    {
+        var words = Enumerable.Range(0, 60)
+            .Select(i => new TranscriptWord(10.0 + i * 0.3, 10.0 + i * 0.3 + 0.28, "word"))
+            .ToArray();
+
+        var (start, end) = ClipStylist.ChooseWindow(words, from, to);
+
+        Assert.True(end - start >= Math.Min(to - from, 12.0) - 0.001,
+            $"asked for {to - from:0.##}s, got {end - start:0.##}s");
+        Assert.True(end > start);
+    }
+
     [Fact]
     public void NeverOpensPartWayThroughAWord()
     {

@@ -130,7 +130,11 @@ public sealed class ClipStylist(IProcessRunner runner, IOptions<AppOptions> opti
             if (best is null || quality > best.Value.Quality)
                 best = (quality, relative + tail);
         }
-        return best is null ? (start, requestedEnd) : (start, start + best.Value.End);
+        if (best is not null) return (start, start + best.Value.End);
+        // No boundary in reach. The snapped start is still worth keeping - it avoids opening
+        // mid-word - but only while it leaves a usable clip behind it. Nudging the start past
+        // the requested end would hand back a window of almost no length.
+        return requestedEnd - start >= MinimumClipSeconds ? (start, requestedEnd) : (requestedStart, requestedEnd);
     }
 
     private static string Strip(string word) => Regex.Replace(word, "[^a-zA-Z']", string.Empty);
