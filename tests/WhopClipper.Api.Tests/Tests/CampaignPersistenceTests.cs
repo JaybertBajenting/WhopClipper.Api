@@ -7,6 +7,55 @@ using WhopClipper.Api.App.Services;
 
 namespace WhopClipper.Api.Tests;
 
+public sealed class ClipStylistTests
+{
+    private static TranscriptWord[] Sentence(params (double Start, double End, string Word)[] words) =>
+        words.Select(w => new TranscriptWord(w.Start, w.End, w.Word)).ToArray();
+
+    /// <summary>
+    /// Ending on the widest pause ends a clip on hesitation. The One Piece batch shipped with
+    /// ten clips cut while he was still talking - "um", "with", "yeah" - before this existed.
+    /// </summary>
+    [Fact]
+    public void EndsOnAFinishedSentenceRatherThanTheWidestPause()
+    {
+        var words = Sentence(
+            (0, .4, "People"), (.4, .8, "always"), (.8, 1.2, "say"),
+            (1.2, 12.6, "..."),                      // filler to clear the minimum length
+            (12.6, 13.0, "one"), (13.0, 13.4, "piece"), (13.4, 13.9, "is"),
+            (13.9, 14.4, "long."),                   // a real ending, with a breath after it
+            (15.2, 15.6, "So"), (15.6, 16.0, "anyway"));
+
+        var (start, end) = ClipStylist.ChooseWindow(words, 0, 16.0);
+
+        Assert.True(end - start is > 14.0 and < 15.2, $"ended at {end - start:0.##}s");
+    }
+
+    /// <summary>A pause is only an ending if the last word carries meaning.</summary>
+    [Fact]
+    public void WillNotEndOnADanglingFunctionWord()
+    {
+        var words = Sentence(
+            (0, .4, "Some"), (.4, 12.8, "..."),
+            (12.8, 13.2, "Who"),                     // long pause after, but mid-thought
+            (14.6, 15.0, "cares."), (15.6, 16.0, "Next"));
+
+        var (start, end) = ClipStylist.ChooseWindow(words, 0, 16.0);
+
+        Assert.True(end - start > 13.4, $"ended on the dangling word at {end - start:0.##}s");
+    }
+
+    [Fact]
+    public void NeverOpensPartWayThroughAWord()
+    {
+        var words = Sentence((9.0, 10.4, "halfspoken"), (10.6, 11.0, "clean"), (11.0, 20.0, "..."));
+
+        var (start, _) = ClipStylist.ChooseWindow(words, 10.0, 24.0);
+
+        Assert.True(start >= 10.3, $"opened at {start:0.##}s, inside the previous word");
+    }
+}
+
 public sealed class SourcePipelinePayloadTests
 {
     /// <summary>

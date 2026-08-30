@@ -23,7 +23,8 @@ public sealed record ValidateJobPayload(string OutputRelativePath, double Expect
 /// carry a facecam across the top, and a hook anchored there covers the streamer's face.</param>
 public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind Platform = PlatformKind.TikTok,
     int MaxClips = 8, bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude,
-    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = null);
+    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = null,
+    bool ApplyStyling = true);
 
 public sealed class JobQueue
 {
@@ -128,7 +129,8 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
 
 public sealed class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
-    SubjectTracker subjectTracker, HookCardRenderer hookCards, ILogger<JobExecutionService> logger)
+    SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist,
+    ILogger<JobExecutionService> logger)
 {
     public async Task ExecuteAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -226,28 +228,44 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
             .OrderBy(x => x.Rank).Take(Math.Clamp(payload.MaxClips, 1, 25)).ToListAsync(cancellationToken);
         if (highlights.Count == 0) throw new InvalidOperationException("Highlight selection returned nothing for this source.");
 
+        // Styling needs the words and the campaign's own music and effects; without them the
+        // clips come out correct but bare, which is not what the campaign's other clips look like.
+        var transcript = string.IsNullOrWhiteSpace(source.WordTranscriptRelativePath)
+            ? null
+            : CaptionBuilder.ReadTranscript(await File.ReadAllTextAsync(
+                workspace.ResolveRelative(source.WordTranscriptRelativePath!), cancellationToken));
+        var mediaPath = string.IsNullOrWhiteSpace(source.LocalRelativePath)
+            ? null : workspace.ResolveRelative(source.LocalRelativePath!);
+        var mediaAssets = await db.MediaLibraryAssets.AsNoTracking().ToListAsync(cancellationToken);
+
         var rendered = new List<string>();
         for (var index = 0; index < highlights.Count; index++)
         {
             var highlight = highlights[index];
+            var style = payload.ApplyStyling && mediaPath is not null && transcript is { Words.Count: > 0 }
+                ? await clipStylist.BuildAsync(mediaPath, highlight.StartSeconds, highlight.EndSeconds,
+                    transcript.Words, mediaAssets, index, cancellationToken)
+                : new ClipStyle(highlight.StartSeconds, highlight.EndSeconds, [], [], [], null, 0);
             var plan = new EditPlan
             {
                 CampaignId = campaignId, SourceAssetId = payload.SourceAssetId,
                 Platform = payload.Platform,
-                StartSeconds = highlight.StartSeconds, EndSeconds = highlight.EndSeconds,
+                StartSeconds = style.StartSeconds, EndSeconds = style.EndSeconds,
                 Width = profile?.Width ?? 1080, Height = profile?.Height ?? 1920,
                 FramesPerSecond = 25, Crf = 20, NormalizeAudio = true,
                 BurnSubtitles = profile?.BurnSubtitles ?? true,
-                MusicVolume = 0, OutputFileName = WorkspaceService.SafeFileName(
+                MusicAssetId = style.MusicAssetId, MusicVolume = style.MusicVolume,
+                OutputFileName = WorkspaceService.SafeFileName(
                     string.IsNullOrWhiteSpace(highlight.Hook) ? $"clip-{index + 1:00}" : highlight.Hook, $"clip-{index + 1:00}") + ".mp4",
                 IsApproved = true,
                 ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(
-                    payload.Framing, profile?.CallToAction, "Bold White Centered Captions", -12, [],
+                    payload.Framing, profile?.CallToAction, "Bold White Centered Captions", -12, style.SoundEffects,
                     string.IsNullOrWhiteSpace(highlight.Hook)
                         ? []
                         : [new OverlayDto(highlight.Hook, 0,
-                            Math.Max(1, highlight.EndSeconds - highlight.StartSeconds - 0.04),
-                            "Top", 48, "#FFFFFF", "Card", payload.HookYFraction)]),
+                            Math.Max(1, style.EndSeconds - style.StartSeconds - 0.04),
+                            "Top", 48, "#FFFFFF", "Card", payload.HookYFraction)],
+                    style.ColorFlashes, style.ZoomPunches),
                     JsonDefaults.Serializer)
             };
             db.EditPlans.Add(plan);
