@@ -19,11 +19,16 @@ public sealed record TranscribeJobPayload(Guid SourceAssetId, bool Refresh = fal
 public sealed record ValidateJobPayload(string OutputRelativePath, double ExpectedMinDuration, double ExpectedMaxDuration, int Width, int Height);
 /// <param name="DeleteSourceWhenDone">Removes the downloaded VOD once its clips exist, so a
 /// long clip bank can be worked through without holding every source on disk at once.</param>
-/// <param name="HookYFraction">Where the hook card sits. Streams published as a vertical split
-/// carry a facecam across the top, and a hook anchored there covers the streamer's face.</param>
+/// <param name="HookYFraction">Where the hook card sits, as a fraction of frame height.
+/// The old default of 0.06 was measured landing 6px off the streamer's hair on a shipped render,
+/// which is the complaint that prompted this. Two things constrain the card: his head below it,
+/// and the burnt-in captions, which the caption style centres vertically (ASS Alignment 5) and
+/// which the card is composited *over* - so anything near mid-frame hides the captions for the
+/// whole clip. 0.012 is the value that satisfies both, verified on a real render and checked
+/// against 38 frames spanning 13 clips. A full-frame-face source would need this overridden.</param>
 public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind Platform = PlatformKind.TikTok,
     int MaxClips = 8, bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude,
-    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = null,
+    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = 0.012,
     bool ApplyStyling = true);
 
 public sealed class JobQueue

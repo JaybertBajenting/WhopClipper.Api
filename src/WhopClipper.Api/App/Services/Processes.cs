@@ -321,6 +321,24 @@ public static class AiOutputParser
         catch (JsonException) { return []; }
     }
 
+    // A dash holding two halves of a hook together reads as machine-written on a title card, so
+    // it is rewritten to a comma. Only separator dashes go: em, en and friends anywhere, and a
+    // plain hyphen only when it stands alone between spaces. A hyphen inside a word is left
+    // intact, because "co-op" must not become "coop".
+    // \u2010-\u2015 covers hyphen through horizontal bar; \u2212 is the minus sign. Written as
+    // escapes so the class cannot be broken by how this file is re-encoded.
+    private static readonly Regex SeparatorDash = new("\\s*[\u2010-\u2015\u2212]\\s*|\\s+-\\s+",
+        RegexOptions.Compiled);
+
+    internal static string CleanHookText(string hook)
+    {
+        var text = SeparatorDash.Replace(hook, ", ");
+        text = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        // Rewriting can butt the new comma against punctuation that was already there.
+        text = Regex.Replace(text, @",\s*(?=[,.;:!?])", string.Empty);
+        return text.Trim().Trim(',').Trim();
+    }
+
     private static IReadOnlyList<AiHighlight> ParseHighlights(JsonElement root)
     {
         if (root.ValueKind != JsonValueKind.Object || !HasOnlyProperties(root, "highlights") ||
@@ -339,8 +357,8 @@ public static class AiOutputParser
                 !item.TryGetProperty("confidence", out var confidence) || !confidence.TryGetDouble(out var confidenceValue) || confidenceValue is < 0 or > 1 ||
                 !item.TryGetProperty("editPlan", out var plan) || !ValidateEditPlan(plan, endValue - startValue))
                 return [];
-            parsed.Add(new AiHighlight(startValue, endValue, hook.GetString()!, rationale.GetString()!, scoreValue,
-                confidenceValue, plan.Clone()));
+            parsed.Add(new AiHighlight(startValue, endValue, CleanHookText(hook.GetString()!),
+                rationale.GetString()!, scoreValue, confidenceValue, plan.Clone()));
         }
         return parsed;
     }
