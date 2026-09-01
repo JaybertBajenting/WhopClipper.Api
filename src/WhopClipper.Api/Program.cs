@@ -43,6 +43,7 @@ builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
 builder.Services.AddValidatorsFromAssemblyContaining<CreateCampaignValidator>();
 builder.Services.AddSingleton<WorkspaceService>();
+builder.Services.AddSingleton<DiskSpaceGuard>();
 builder.Services.AddSingleton<SettingsRuntimeState>();
 builder.Services.AddSingleton<IProcessRunner, SafeProcessRunner>();
 builder.Services.AddSingleton<JobQueue>();

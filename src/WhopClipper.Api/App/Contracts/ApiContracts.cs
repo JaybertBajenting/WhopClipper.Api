@@ -73,6 +73,21 @@ public sealed record StartSourcePipelineRequest(IReadOnlyList<Guid>? SourceAsset
     IReadOnlyList<string>? Urls = null, PlatformKind Platform = PlatformKind.TikTok, int MaxClips = 8,
     bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude, string? Quality = null,
     string? Framing = null, double? HookYFraction = null);
+/// <summary>Works the campaign's outstanding clip bank without naming each source.</summary>
+/// <param name="MaxSources">Caps how many are queued in one go; null queues every outstanding one.</param>
+/// <param name="DryRun">Reports what would run without queueing anything. Each source is a
+/// multi-gigabyte download and a paid analysis, so being able to look first is worth having.</param>
+public sealed record AutoRunCampaignRequest(PlatformKind Platform = PlatformKind.TikTok, int MaxClips = 8,
+    bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude, string? Quality = null,
+    string? Framing = null, double? HookYFraction = null, int? MaxSources = null, bool DryRun = false);
+/// <param name="Queued">Empty on a dry run; see <paramref name="Outstanding"/> for what would go.</param>
+/// <param name="Outstanding">Sources with no clips yet that resolve to a real video, in run order.</param>
+/// <param name="NotInspected">Sources with no clips and no known duration, so not confirmed to be a
+/// single video - typically the brand's channel and profile links. Left alone; inspect one to
+/// include it.</param>
+/// <param name="Skipped">Sources left alone because they already have clips.</param>
+public sealed record AutoRunCampaignDto(IReadOnlyList<JobDto> Queued, IReadOnlyList<string> Outstanding,
+    IReadOnlyList<string> NotInspected, int Skipped, long EstimatedBytes, long FreeBytes, bool DryRun);
 public sealed record SourceAssetDto(Guid Id, string Url, string? Title, string? Uploader, double? DurationSeconds,
     string? ThumbnailUrl, string? LocalRelativePath, string? SubtitleRelativePath, string Status,
     DateTimeOffset CreatedAt, DateTimeOffset? DownloadedAt, bool IsLocalFile, bool HasWordTranscript);

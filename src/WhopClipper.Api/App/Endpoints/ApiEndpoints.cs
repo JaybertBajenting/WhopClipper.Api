@@ -303,6 +303,59 @@ public static class ApiEndpoints
             return Results.Accepted($"/api/jobs", queued);
         }).WithTags("Sources");
 
+        // Working the whole clip bank without listing every source by hand. Each source is still
+        // its own queued pipeline, so one that fails - no disk, a rate limit that outlasts its
+        // retries - takes only itself down and the rest carry on.
+        campaigns.MapPost("/{id:guid}/auto-run", async (Guid id, AutoRunCampaignRequest? request,
+            AppDbContext db, JobCoordinator coordinator, DiskSpaceGuard diskSpace, CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            var settings = request ?? new AutoRunCampaignRequest();
+
+            // Having clips is the honest test of "already done". The pipeline never sets
+            // HighlightCandidates.IsSelected, so that flag says nothing about what was produced.
+            var withoutClips = await db.SourceAssets
+                .Where(x => x.CampaignId == id && !db.EditPlans.Any(p => p.SourceAssetId == x.Id))
+                .OrderBy(x => x.DurationSeconds ?? 0)
+                .ToListAsync(ct);
+
+            // A known duration is proof yt-dlp resolved this URL to one video. Campaigns collect
+            // the brand's channel, TikTok and Instagram profile links as sources too, and without
+            // this an unattended run would hand a channel page to the downloader as though it were
+            // a VOD - twelve queued sources where three were real. They are reported, not dropped
+            // silently: inspecting one fills in the duration and the next run picks it up.
+            var outstanding = withoutClips.Where(x => x.DurationSeconds is > 0).ToList();
+            var notInspected = withoutClips.Where(x => x.DurationSeconds is null or <= 0)
+                .Select(x => x.Title ?? x.Url ?? x.Id.ToString()).ToList();
+            var skipped = await db.SourceAssets.CountAsync(x => x.CampaignId == id, ct) - withoutClips.Count;
+            if (settings.MaxSources is { } cap && cap > 0) outstanding = outstanding.Take(cap).ToList();
+
+            var queued = new List<JobDto>();
+            if (!settings.DryRun)
+            {
+                foreach (var source in outstanding)
+                {
+                    var job = await coordinator.CreateAsync(id, JobKind.SourcePipeline,
+                        new SourcePipelineJobPayload(source.Id, settings.Platform, settings.MaxClips,
+                            settings.DeleteSourceWhenDone, settings.Mode, settings.Quality,
+                            settings.Framing ?? "SmartCrop", settings.HookYFraction), ct);
+                    queued.Add(job.ToDto());
+                }
+            }
+
+            // Reported rather than enforced here: the queue runs one source at a time and deletes
+            // each before the next, so the run only needs room for the largest, not for the sum.
+            var estimate = outstanding.Count == 0
+                ? 0
+                : outstanding.Max(x => diskSpace.Estimate(x.DurationSeconds, settings.Quality));
+            var names = outstanding
+                .Select(x => x.Title ?? x.Url ?? x.Id.ToString())
+                .ToList();
+            return Results.Accepted("/api/jobs",
+                new AutoRunCampaignDto(queued, names, notInspected, skipped, estimate,
+                    diskSpace.Available, settings.DryRun));
+        }).WithTags("Sources");
+
         campaigns.MapPost("/{id:guid}/sources/scan-local", async (Guid id, AppDbContext db, WorkspaceService workspace,
             LocalSourceScanner scanner, CancellationToken ct) =>
         {
@@ -953,6 +1006,50 @@ public static class ApiEndpoints
                 return Results.Conflict(new { error = "Approved edit plans are immutable and cannot be unapproved." });
             plan.IsApproved = request.Approved; await db.SaveChangesAsync(ct); return Results.Ok(plan.ToDto());
         }).WithTags("Editing");
+        // Gives an existing plan the campaign's house style - the sound cues, colour washes and
+        // punch-ins every other clip has - without moving its in and out points. A plan built by
+        // hand, from a transcript read rather than from the window heuristic, otherwise renders
+        // bare: correct content, none of the styling. Approved plans are immutable, so this
+        // produces a new plan rather than editing the old one.
+        api.MapPost("/edit-plans/{id:guid}/restyle", async (Guid id, AppDbContext db, WorkspaceService workspace,
+            ClipStylist clipStylist, CancellationToken ct) =>
+        {
+            var plan = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+            if (plan is null) return Results.NotFound();
+            var source = await db.SourceAssets.AsNoTracking().SingleOrDefaultAsync(x => x.Id == plan.SourceAssetId, ct);
+            if (source is null || string.IsNullOrWhiteSpace(source.LocalRelativePath))
+                return Results.Conflict(new { error = "Restyling reads the source media, which is no longer on disk for this plan." });
+            if (string.IsNullOrWhiteSpace(source.WordTranscriptRelativePath))
+                return Results.Conflict(new { error = "Restyling needs the source's word transcript. Run a transcribe job first." });
+
+            var transcript = CaptionBuilder.ReadTranscript(await File.ReadAllTextAsync(
+                workspace.ResolveRelative(source.WordTranscriptRelativePath!), ct));
+            var assets = await db.MediaLibraryAssets.AsNoTracking().ToListAsync(ct);
+            var rotation = await db.EditPlans.CountAsync(x => x.CampaignId == plan.CampaignId, ct);
+            var style = await clipStylist.BuildForWindowAsync(workspace.ResolveRelative(source.LocalRelativePath!),
+                plan.StartSeconds, plan.EndSeconds, transcript.Words, assets, rotation, ct);
+
+            var extras = JsonSerializer.Deserialize<EditPlanExtrasDto>(plan.ExtraSettingsJson, JsonDefaults.Serializer);
+            var restyled = new EditPlan
+            {
+                CampaignId = plan.CampaignId, SourceAssetId = plan.SourceAssetId, Platform = plan.Platform,
+                StartSeconds = plan.StartSeconds, EndSeconds = plan.EndSeconds,
+                Width = plan.Width, Height = plan.Height, FramesPerSecond = plan.FramesPerSecond,
+                Crf = plan.Crf, NormalizeAudio = plan.NormalizeAudio, BurnSubtitles = plan.BurnSubtitles,
+                SubtitleRelativePath = plan.SubtitleRelativePath,
+                MusicAssetId = style.MusicAssetId ?? plan.MusicAssetId,
+                MusicVolume = style.MusicAssetId is null ? plan.MusicVolume : style.MusicVolume,
+                OutputFileName = plan.OutputFileName, IsApproved = true,
+                ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(
+                    extras?.Framing ?? "CenterCrop", extras?.CtaOverlayText, extras?.SubtitleStyle,
+                    extras?.MusicDuckingDb ?? -12, style.SoundEffects, extras?.Overlays ?? [],
+                    style.ColorFlashes, style.ZoomPunches), JsonDefaults.Serializer)
+            };
+            db.EditPlans.Add(restyled);
+            await db.SaveChangesAsync(ct);
+            return Results.Created($"/api/edit-plans/{restyled.Id}", restyled.ToDto());
+        }).WithTags("Editing");
+
         api.MapPost("/edit-plans/{id:guid}/renders", async (Guid id, AppDbContext db, JobCoordinator coordinator,
             IOptions<AppOptions> options, CancellationToken ct) =>
         {

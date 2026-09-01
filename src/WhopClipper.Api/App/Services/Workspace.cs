@@ -40,6 +40,18 @@ public sealed class AppOptions
     /// what fails first on a machine that is already short of RAM.</summary>
     public int TranscriptionChunkSeconds { get; set; } = 120;
     public string? OverlayFontPath { get; set; }
+    /// <summary>
+    /// Floor of free space left alone on the workspace drive, whatever the source is worth. A
+    /// download that fills the volume does not just lose itself: it takes down every queued run
+    /// behind it, and leaves .part files that nothing cleans up.
+    /// </summary>
+    public long MinimumFreeDiskBytes { get; set; } = 5L * 1024 * 1024 * 1024;
+    /// <summary>
+    /// Multiplies the estimated source size to cover what briefly coexists with it - yt-dlp's
+    /// separate video and audio streams before they are merged, the merged file, the per-clip
+    /// intermediates and the rendered clips.
+    /// </summary>
+    public double DiskHeadroomFactor { get; set; } = 2.5;
 }
 
 public static class LocalSettingsFile
@@ -66,6 +78,59 @@ public sealed class SettingsRuntimeState
     private int _restartRequired;
     public bool RestartRequired => Volatile.Read(ref _restartRequired) == 1;
     public void MarkRestartRequired() => Interlocked.Exchange(ref _restartRequired, 1);
+}
+
+/// <summary>
+/// Answers whether a source is worth starting, before anything is downloaded.
+///
+/// Without this a run does not fail fast: yt-dlp streams gigabytes, dies with "No space left on
+/// device" part way, and the next queued source repeats it. Four runs went that way in one
+/// morning. Checking first turns each of those into an instant, legible skip.
+/// </summary>
+public sealed class DiskSpaceGuard(WorkspaceService workspace, IOptions<AppOptions> options)
+{
+    /// <summary>
+    /// Rough bytes per second of video for each quality yt-dlp is asked for, taken from the
+    /// campaign's own downloads: a 3.4 hour 720p60 VOD landed at 2.29 GB, which is ~190 KB/s.
+    /// Deliberately generous, because under-estimating is what fills the disk.
+    /// </summary>
+    private static long BytesPerSecond(string quality) => quality.ToLowerInvariant() switch
+    {
+        "audio" => 20_000,
+        "720p" => 200_000,
+        "1080p" => 400_000,
+        _ => 500_000
+    };
+
+    public long Available => new DriveInfo(Path.GetPathRoot(workspace.Root)!).AvailableFreeSpace;
+
+    /// <summary>Bytes this source is expected to need, including everything alongside it.</summary>
+    public long Estimate(double? durationSeconds, string? quality)
+    {
+        // An unknown duration is the dangerous case, not the harmless one: assume a long VOD
+        // rather than waving it through and discovering the truth mid-download.
+        var seconds = durationSeconds is > 0 ? durationSeconds.Value : 3 * 60 * 60;
+        var raw = (long)(seconds * BytesPerSecond(quality ?? options.Value.PreferredVideoQuality));
+        return (long)(raw * Math.Max(1, options.Value.DiskHeadroomFactor));
+    }
+
+    /// <summary>
+    /// Throws when the source cannot fit. The message carries the actual numbers, because
+    /// "No space left on device" three stages deep in a yt-dlp log tells nobody what to free.
+    /// </summary>
+    public void EnsureRoomFor(double? durationSeconds, string? quality)
+    {
+        var needed = Estimate(durationSeconds, quality);
+        var free = Available;
+        var floor = options.Value.MinimumFreeDiskBytes;
+        if (free - needed >= floor) return;
+        throw new InvalidOperationException(
+            $"Not enough disk to process this source. It needs about {Gb(needed)} plus a {Gb(floor)} " +
+            $"reserve, and {Path.GetPathRoot(workspace.Root)} has {Gb(free)} free. " +
+            "Free some space and queue this source again; the other sources were not affected.");
+    }
+
+    private static string Gb(long bytes) => $"{bytes / 1024d / 1024d / 1024d:0.0} GB";
 }
 
 public sealed class WorkspaceService

@@ -134,7 +134,7 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
 
 public sealed class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
-    SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist,
+    SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist, DiskSpaceGuard diskSpace,
     ILogger<JobExecutionService> logger)
 {
     public async Task ExecuteAsync(Guid id, CancellationToken cancellationToken)
@@ -226,6 +226,12 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         Guid campaignId, SourceAsset source, CancellationToken cancellationToken)
     {
         var stages = new List<object>();
+
+        // Checked before anything is fetched. A source that cannot fit fails here in milliseconds
+        // with a message naming the numbers, instead of after minutes of downloading, and because
+        // every source is its own queued job the run simply moves on to the next one.
+        if (string.IsNullOrWhiteSpace(source.LocalRelativePath))
+            diskSpace.EnsureRoomFor(source.DurationSeconds, payload.Quality);
 
         async Task StageAsync(string name, double progress, object stagePayload, Func<Task> run)
         {
@@ -810,7 +816,27 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         Capture(job, result);
         EnsureSuccess(result, "FFmpeg render");
         if (!File.Exists(outputPath)) throw new InvalidOperationException("FFmpeg exited successfully but the output file is missing.");
-        job.ResultJson = JsonSerializer.Serialize(new { outputRelativePath = workspace.ToRelative(outputPath), editPlanId = plan.Id }, JsonDefaults.Serializer);
+
+        // A plan built anywhere other than the source pipeline never sees ClipStylist, so it
+        // renders with captions, logo and music but no cues, washes or punch-ins - correct, and
+        // visibly unlike every other clip in the campaign. Thirteen shipped that way before anyone
+        // noticed by eye. Recorded rather than thrown: a bare clip is occasionally what was wanted,
+        // and failing a finished encode over styling would be the worse outcome.
+        var unstyled = (extras.SoundEffects?.Count ?? 0) == 0
+            && (extras.ColorFlashes?.Count ?? 0) == 0
+            && (extras.ZoomPunches?.Count ?? 0) == 0;
+        if (unstyled)
+            logger.LogWarning("Edit plan {PlanId} rendered without the campaign's house style. "
+                + "POST /api/edit-plans/{PlanId}/restyle applies it without moving the cut.", plan.Id, plan.Id);
+
+        job.ResultJson = JsonSerializer.Serialize(new
+        {
+            outputRelativePath = workspace.ToRelative(outputPath),
+            editPlanId = plan.Id,
+            styling = unstyled
+                ? "none: no sound cues, colour flashes or zoom punches. POST /api/edit-plans/{id}/restyle applies the campaign style to this plan's existing cut."
+                : "applied",
+        }, JsonDefaults.Serializer);
     }
 
     /// <summary>

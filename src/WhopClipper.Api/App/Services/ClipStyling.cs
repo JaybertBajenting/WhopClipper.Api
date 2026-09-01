@@ -60,6 +60,21 @@ public sealed class ClipStylist(IProcessRunner runner, IOptions<AppOptions> opti
         CancellationToken cancellationToken)
     {
         var (start, end) = ChooseWindow(words, startSeconds, endSeconds);
+        return await BuildForWindowAsync(mediaPath, start, end, words, assets, rotation, cancellationToken);
+    }
+
+    /// <summary>
+    /// Styles a window that has already been decided, skipping <see cref="ChooseWindow"/>.
+    ///
+    /// Needed for clips whose in and out points were chosen deliberately - by reading the
+    /// transcript rather than by the window heuristic - which must keep their exact cut while
+    /// still earning the cues, washes and punches every other clip in the campaign has.
+    /// ChooseWindow would clamp them to 12-19.5s and cut the payoff out of the longer ones.
+    /// </summary>
+    public async Task<ClipStyle> BuildForWindowAsync(string mediaPath, double start, double end,
+        IReadOnlyList<TranscriptWord> words, IReadOnlyList<MediaLibraryAsset> assets, int rotation,
+        CancellationToken cancellationToken)
+    {
         var music = Pick(assets, MediaAssetKind.Music, rotation);
         var envelope = await OnsetEnvelopeAsync(mediaPath, start, end - start, cancellationToken);
         if (envelope.Length == 0)

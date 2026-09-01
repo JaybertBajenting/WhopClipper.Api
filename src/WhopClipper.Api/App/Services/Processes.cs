@@ -191,9 +191,36 @@ public abstract class CliAiProvider(IProcessRunner runner) : IAiMediaProvider
         return lines.Length == 0 ? $"The CLI exited with code {result.ExitCode}." : string.Join(" | ", lines.Take(3));
     }
 
+    /// <summary>Attempts, and the wait before each retry. Long enough to outlast a short rate limit
+    /// without stalling a queue for the rest of the night.</summary>
+    private static readonly TimeSpan[] RetryDelays = [TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(90)];
+
+    /// <summary>
+    /// A rate limit is the queue's problem, not this source's. An overnight run lost a source to a
+    /// single 429 after the call had already been paid for, so transient refusals are waited out
+    /// here. Anything else - a bad schema, an expired login - repeats identically and costs money
+    /// each time, so it is raised on the first attempt.
+    /// </summary>
+    internal static bool IsTransient(ProcessResult result)
+    {
+        if (result.ExitCode == 0) return false;
+        var combined = result.StandardError + "\n" + result.StandardOutput;
+        return combined.Contains("api_error_status\":429", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("api_error_status\":529", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("rate_limit", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("overloaded", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("too many requests", StringComparison.OrdinalIgnoreCase);
+    }
+
     public async Task<AiProviderResponse> AnalyzeAsync(AiProviderRequest request, CancellationToken cancellationToken)
     {
         var result = await runner.RunAsync(CreateInvocation(request), cancellationToken);
+        for (var attempt = 0; attempt < RetryDelays.Length && IsTransient(result); attempt++)
+        {
+            await Task.Delay(RetryDelays[attempt], cancellationToken);
+            result = await runner.RunAsync(CreateInvocation(request), cancellationToken);
+        }
         if (result.TimedOut) throw new TimeoutException($"{Name} timed out. {Describe(result)}");
         if (result.ExitCode != 0) throw new InvalidOperationException($"{Name} failed (exit {result.ExitCode}). {Describe(result)}");
         var output = await GetParserOutputAsync(request, result, cancellationToken);
