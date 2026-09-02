@@ -891,15 +891,43 @@ public static class ApiEndpoints
     private static void MapJobs(RouteGroupBuilder api)
     {
         var jobs = api.MapGroup("/jobs").WithTags("Jobs");
-        jobs.MapGet("/", async (Guid? campaignId, JobStatus? status, AppDbContext db, CancellationToken ct) =>
+        jobs.MapGet("/", async (Guid? campaignId, JobStatus? status, int? limit, AppDbContext db,
+            CancellationToken ct) =>
         {
             var query = db.Jobs.AsNoTracking().AsQueryable();
             if (campaignId.HasValue) query = query.Where(x => x.CampaignId == campaignId);
             if (status.HasValue) query = query.Where(x => x.Status == status);
-            var values = await query.OrderByDescending(x => x.CreatedAt).Take(100).ToListAsync(ct);
+            // Bounded because the caller polls this every couple of seconds, but the caller says
+            // how far back it wants: the list is paged in the UI, and a page count computed over a
+            // silently truncated list would report the last page as the last job.
+            var take = Math.Clamp(limit ?? 200, 1, 1000);
+            var values = await query.OrderByDescending(x => x.CreatedAt).Take(take).ToListAsync(ct);
             var campaignIds = values.Where(x => x.CampaignId.HasValue).Select(x => x.CampaignId!.Value).Distinct().ToArray();
             var names = await db.Campaigns.AsNoTracking().Where(x => campaignIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.Name, ct);
-            return Results.Ok(values.Select(x => x.ToDto(x.CampaignId.HasValue && names.TryGetValue(x.CampaignId.Value, out var name) ? name : null)));
+
+            // Which video each job is working on. Without it every row in a campaign reads the
+            // same, and a queue of pipelines cannot be told apart - which is how a run got
+            // cancelled and a retry started on the wrong source.
+            var sourceIds = values.Select(x => x.PayloadId("sourceAssetId")).OfType<Guid>().Distinct().ToArray();
+            var planIds = values.Select(x => x.PayloadId("editPlanId")).OfType<Guid>().Distinct().ToArray();
+            var sourceTitles = await db.SourceAssets.AsNoTracking().Where(x => sourceIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x.Title ?? x.Url, ct);
+            // A render is better named by the clip it produces than by the hours-long VOD behind it.
+            var planNames = await db.EditPlans.AsNoTracking().Where(x => planIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x.OutputFileName, ct);
+
+            string? Subject(JobRecord job)
+            {
+                if (job.PayloadId("editPlanId") is { } planId && planNames.TryGetValue(planId, out var plan))
+                    return Path.GetFileNameWithoutExtension(plan);
+                if (job.PayloadId("sourceAssetId") is { } sourceId && sourceTitles.TryGetValue(sourceId, out var title))
+                    return title;
+                return null;
+            }
+
+            return Results.Ok(values.Select(x => x.ToDto(
+                x.CampaignId.HasValue && names.TryGetValue(x.CampaignId.Value, out var name) ? name : null,
+                Subject(x))));
         });
         jobs.MapGet("/{id:guid}", async (Guid id, AppDbContext db, CancellationToken ct) =>
         {

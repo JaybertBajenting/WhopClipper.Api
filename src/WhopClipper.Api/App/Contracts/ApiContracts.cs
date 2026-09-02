@@ -129,9 +129,12 @@ public sealed record EditPlanDto(Guid Id, Guid CampaignId, Guid SourceAssetId, P
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects,
     IReadOnlyList<OverlayDto> Overlays, DateTimeOffset CreatedAt,
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null);
+/// <param name="SubjectName">What this job is working on - the source video's title, or for a
+/// render the clip's own name. Every job in a campaign otherwise shows only the campaign name, so
+/// a queue of pipelines is indistinguishable and you cannot tell which video you are watching.</param>
 public sealed record JobDto(Guid Id, Guid? CampaignId, JobKind Kind, JobStatus Status, double Progress,
     string? ResultJson, JsonElement? Result, string? Error, string? CampaignName, int? ExitCode, int Attempt, DateTimeOffset CreatedAt,
-    DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt);
+    DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt, string? SubjectName = null);
 public sealed record AddMediaLocationRequest(string Path, MediaAssetKind Kind);
 public sealed record UpdateMediaAssetRequest(string[]? Tags, string? Mood, string? Energy, string? Genre, double? Bpm, bool Favorite, string? LicenseNotes);
 public sealed record MediaLocationDto(Guid Id, string Path, MediaAssetKind Kind, bool Enabled, DateTimeOffset CreatedAt);
@@ -353,9 +356,30 @@ public static class ApiMappings
         value.DownloadedAt, string.IsNullOrWhiteSpace(value.Url),
         !string.IsNullOrWhiteSpace(value.WordTranscriptRelativePath));
 
-    public static JobDto ToDto(this JobRecord value, string? campaignName = null) => new(value.Id, value.CampaignId, value.Kind, value.Status,
+    public static JobDto ToDto(this JobRecord value, string? campaignName = null, string? subjectName = null) => new(value.Id, value.CampaignId, value.Kind, value.Status,
         value.Progress, value.ResultJson, JsonDefaults.ParseElement(value.ResultJson), value.Error, campaignName,
-        value.ExitCode, value.Attempt, value.CreatedAt, value.StartedAt, value.CompletedAt);
+        value.ExitCode, value.Attempt, value.CreatedAt, value.StartedAt, value.CompletedAt, subjectName);
+
+    /// <summary>
+    /// Reads the id a job's payload points at. The payload shape changes per stage - a pipeline
+    /// swaps its own payload as it runs - so this looks for the property rather than deserialising
+    /// into any one type, and returns nothing rather than throwing on a shape it does not know.
+    /// </summary>
+    public static Guid? PayloadId(this JobRecord value, string property)
+    {
+        if (string.IsNullOrWhiteSpace(value.PayloadJson)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(value.PayloadJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                   document.RootElement.TryGetProperty(property, out var element) &&
+                   element.ValueKind == JsonValueKind.String &&
+                   Guid.TryParse(element.GetString(), out var id)
+                ? id
+                : null;
+        }
+        catch (JsonException) { return null; }
+    }
 
     public static EditPlanDto ToDto(this EditPlan value)
     {
