@@ -6,7 +6,9 @@ public enum JobStatus { Queued, Running, Completed, Failed, Cancelled }
 public enum JobKind { InspectSource, Download, AiAnalysis, Render, Validate, ReferenceAnalysis, Transcribe, SourcePipeline }
 public enum AiMode { Claude, Codex, Auto, Compare }
 public enum MediaAssetKind { Music, SoundEffect }
-public enum CampaignDocumentKind { Pdf, Word, Text, Markdown }
+// Html is appended rather than inserted: these are stored as integers, so an earlier position
+// would silently retype every document already in the database.
+public enum CampaignDocumentKind { Pdf, Word, Text, Markdown, Html }
 public enum DocumentExtractionStatus { Pending, Extracted, Failed }
 public enum ReferenceVideoStatus { Pending, Analyzing, Analyzed, Failed }
 public enum PublishingConnectionMode { Api, Manual }

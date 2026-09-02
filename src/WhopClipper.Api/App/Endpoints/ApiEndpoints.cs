@@ -609,6 +609,35 @@ public static class ApiEndpoints
             }
         });
 
+        // Campaign briefs are not always a file. Reading the page's markup rather than a screenshot
+        // of it keeps every link exactly as published - a Drive folder id mixing 1, l and I cannot
+        // survive OCR, and one wrong character loses the campaign's footage - and captures sections
+        // that were never scrolled into view. What comes back is inert data, never instructions.
+        campaigns.MapPost("/{id:guid}/documents/fetch", async (Guid id, FetchBriefPageRequest request,
+            AppDbContext db, CampaignPageFetcher fetcher, CampaignDocumentService documents,
+            CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            try
+            {
+                var page = await fetcher.FetchAsync(request.Url, ct);
+                var stored = await documents.StoreFetchedPageAsync(id, page, ct);
+                db.CampaignDocuments.Add(stored.Document);
+                await db.SaveChangesAsync(ct);
+                return Results.Created($"/api/campaigns/{id}/documents/{stored.Document.Id}",
+                    new { document = stored.Document.ToDto(), warning = stored.Warning });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["url"] = [ex.Message] });
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !ct.IsCancellationRequested)
+            {
+                return Results.ValidationProblem(new Dictionary<string, string[]>
+                    { ["url"] = ["That page could not be reached. Check the address and your connection."] });
+            }
+        });
+
         // The client logo burned into every clip for this campaign. Body is the raw image so a
         // logo upload works the same way a brief upload does.
         campaigns.MapPost("/{id:guid}/branding/logo", async (Guid id, string? fileName, HttpContext context,

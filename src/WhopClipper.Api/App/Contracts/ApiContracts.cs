@@ -38,6 +38,8 @@ public sealed record CampaignDocumentDto(Guid Id, string FileName, CampaignDocum
     int? PageCount, int ExtractedCharacterCount, DocumentExtractionStatus ExtractionStatus, string? ExtractionError,
     bool IncludeInExtraction, string RelativePath, DateTimeOffset UploadedAt);
 public sealed record UpdateCampaignDocumentRequest(bool IncludeInExtraction);
+/// <summary>Address of a campaign brief published as a web page rather than sent as a file.</summary>
+public sealed record FetchBriefPageRequest(string Url);
 public sealed record ReferenceVideoDto(Guid Id, string Label, string? Url, string? LocalRelativePath, string? Notes,
     bool IsPrimary, double? DurationSeconds, ReferenceVideoStatus Status, string? Error, JsonElement? StyleProfile,
     DateTimeOffset CreatedAt, DateTimeOffset? AnalyzedAt);

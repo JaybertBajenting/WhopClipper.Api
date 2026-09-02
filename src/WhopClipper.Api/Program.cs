@@ -55,6 +55,19 @@ builder.Services.AddSingleton<HookCardRenderer>();
 builder.Services.AddSingleton<ClipStylist>();
 builder.Services.AddSingleton<BriefLinkDetector>();
 builder.Services.AddScoped<CampaignDocumentService>();
+builder.Services.AddScoped<CampaignPageFetcher>();
+// Redirects are followed by hand inside the fetcher so each hop is re-checked against the
+// private-address guard; letting the handler follow them would check only the typed address.
+builder.Services.AddHttpClient(CampaignPageFetcher.ClientName, client =>
+    {
+        client.Timeout = TimeSpan.FromSeconds(20);
+        client.MaxResponseContentBufferSize = CampaignPageFetcher.MaxPageBytes;
+    })
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false,
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+    });
 builder.Services.AddScoped<CampaignBrandingService>();
 builder.Services.AddScoped<LocalSourceScanner>();
 builder.Services.AddScoped<RequirementService>();
