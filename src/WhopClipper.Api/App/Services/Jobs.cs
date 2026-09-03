@@ -135,7 +135,7 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
 public sealed class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
     SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist, DiskSpaceGuard diskSpace,
-    ILogger<JobExecutionService> logger)
+    GoogleDriveClient drive, ILogger<JobExecutionService> logger)
 {
     public async Task ExecuteAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -383,6 +383,11 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
     {
         var payload = Deserialize<SourceJobPayload>(job.PayloadJson);
         var source = await db.SourceAssets.SingleAsync(x => x.Id == payload.SourceAssetId, cancellationToken);
+        if (GoogleDriveClient.TryParse(source.Url) is { } driveTarget)
+        {
+            await InspectDriveAsync(job, source, driveTarget, cancellationToken);
+            return;
+        }
         var directory = workspace.CampaignDirectory(source.CampaignId);
         var inspectArguments = new List<string>([.. CookieArguments(), .. JsRuntimeArguments()])
         {
@@ -403,6 +408,101 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         job.ResultJson = JsonSerializer.Serialize(source.ToDto(), JsonDefaults.Serializer);
     }
 
+    /// <summary>
+    /// Drive metadata without yt-dlp. A folder is not a source: it becomes one source per video
+    /// inside it and then stops existing, because a folder row can never be downloaded, transcribed
+    /// or clipped, and leaving it in the list only produces a row that fails forever.
+    /// </summary>
+    private async Task InspectDriveAsync(JobRecord job, SourceAsset source, DriveTarget target,
+        CancellationToken cancellationToken)
+    {
+        if (target.Kind == DriveTargetKind.Folder)
+        {
+            var files = await drive.ListFolderAsync(target.Id, cancellationToken);
+            var videos = files.Where(x => x.IsVideo).ToList();
+            if (videos.Count == 0)
+                throw new InvalidOperationException(
+                    "That Drive folder holds no video files. Check the link, or add the videos individually.");
+
+            var added = new List<string>();
+            foreach (var file in videos)
+            {
+                var url = $"https://drive.google.com/file/d/{file.Id}/view";
+                if (await db.SourceAssets.AnyAsync(x => x.CampaignId == source.CampaignId && x.Url == url, cancellationToken))
+                    continue;
+                db.SourceAssets.Add(new SourceAsset
+                {
+                    CampaignId = source.CampaignId, Url = url, Title = file.FileName,
+                    MetadataJson = DriveMetadata(file),
+                });
+                added.Add(file.FileName);
+            }
+            db.SourceAssets.Remove(source);
+            await db.SaveChangesAsync(cancellationToken);
+            job.ResultJson = JsonSerializer.Serialize(new
+            {
+                expandedFolder = target.Id, videos = added,
+                note = "The folder was replaced by the videos inside it.",
+            }, JsonDefaults.Serializer);
+            return;
+        }
+
+        var probe = await drive.ProbeAsync(target.Id, cancellationToken)
+            ?? throw new InvalidOperationException(
+                "That Drive link could not be read. It may be private, deleted, or a folder that is no longer shared.");
+        source.Title = probe.FileName;
+        source.MetadataJson = DriveMetadata(probe);
+        // Duration is not in Drive's headers. It stays null until ffprobe sees the file; the DTO
+        // proves this is a video from the content type instead, so the source is still processable.
+        job.ResultJson = JsonSerializer.Serialize(source.ToDto(), JsonDefaults.Serializer);
+    }
+
+    private static string DriveMetadata(DriveFile file) => JsonSerializer.Serialize(new
+    {
+        driveId = file.Id, title = file.FileName, contentType = file.ContentType, fileSizeBytes = file.SizeBytes,
+    }, JsonDefaults.Serializer);
+
+    /// <summary>
+    /// Streams a Drive file straight to the campaign's source folder. The point of doing this rather
+    /// than shelling to yt-dlp is that each way it can fail is knowable in advance and can be said
+    /// plainly - the wrong kind of file, no room on disk, or Google throttling a shared file - rather
+    /// than surfacing as an extractor traceback that says none of those things.
+    /// </summary>
+    private async Task DownloadFromDriveAsync(JobRecord job, SourceAsset source, string driveId,
+        string sourceDirectory, CancellationToken cancellationToken)
+    {
+        var file = await drive.ProbeAsync(driveId, cancellationToken)
+            ?? throw new InvalidOperationException(
+                "That Drive file could not be read. It may be private, deleted, or Google may be limiting it right now.");
+        if (!file.IsVideo)
+            throw new InvalidOperationException(
+                $"“{file.FileName}” is {file.ContentType}, not video, so it cannot be used as source footage. "
+                + "Campaign briefs often link a watermark or logo here; add that under Branding instead.");
+
+        // The probe gives the real byte count, so this checks the actual file rather than the
+        // duration-based estimate used elsewhere, which cannot see how large a Drive master is.
+        diskSpace.EnsureRoomForBytes(file.SizeBytes, file.FileName);
+
+        Directory.CreateDirectory(sourceDirectory);
+        var destination = Path.Combine(sourceDirectory, $"{Path.GetFileNameWithoutExtension(file.FileName)}-{file.Id}{Path.GetExtension(file.FileName)}");
+        WorkspaceService.EnsureInside(sourceDirectory, destination);
+        await drive.DownloadAsync(file, destination, fraction =>
+        {
+            // Reported straight onto the record; the queue persists it on the next save.
+            job.Progress = Math.Clamp(.05 + fraction * .9, 0, .95);
+        }, cancellationToken);
+
+        source.LocalRelativePath = workspace.ToRelative(destination);
+        source.Title ??= file.FileName;
+        source.MetadataJson = DriveMetadata(file);
+        source.DownloadedAt = DateTimeOffset.UtcNow;
+        // Drive carries no subtitles, so transcription runs from the media as it does for local files.
+        source.SubtitleRelativePath = null;
+        job.ResultJson = JsonSerializer.Serialize(new
+            { path = source.LocalRelativePath, subtitlePath = (string?)null, reused = false, bytes = file.SizeBytes },
+            JsonDefaults.Serializer);
+    }
+
     private async Task DownloadAsync(JobRecord job, CancellationToken cancellationToken)
     {
         var payload = Deserialize<SourceJobPayload>(job.PayloadJson);
@@ -418,6 +518,11 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
             }
         }
         var sourceDirectory = workspace.ResolveRelative(Path.Combine("campaigns", source.CampaignId.ToString("N"), "source"));
+        if (GoogleDriveClient.TryParse(source.Url) is { Kind: DriveTargetKind.File } driveFile)
+        {
+            await DownloadFromDriveAsync(job, source, driveFile.Id, sourceDirectory, cancellationToken);
+            return;
+        }
         var requestedQuality = payload.Quality ?? options.Value.PreferredVideoQuality;
         var quality = requestedQuality.ToLowerInvariant() switch
         {

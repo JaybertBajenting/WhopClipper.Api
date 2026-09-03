@@ -118,6 +118,22 @@ public sealed class DiskSpaceGuard(WorkspaceService workspace, IOptions<AppOptio
     /// Throws when the source cannot fit. The message carries the actual numbers, because
     /// "No space left on device" three stages deep in a yt-dlp log tells nobody what to free.
     /// </summary>
+    /// <summary>
+    /// The same check when the exact size is already known, which beats estimating from a duration.
+    /// Still multiplied by the headroom factor: the download and whatever is cut from it coexist.
+    /// </summary>
+    public void EnsureRoomForBytes(long sizeBytes, string fileName)
+    {
+        var needed = (long)(sizeBytes * Math.Max(1, options.Value.DiskHeadroomFactor));
+        var free = Available;
+        var floor = options.Value.MinimumFreeDiskBytes;
+        if (free - needed >= floor) return;
+        throw new InvalidOperationException(
+            $"Not enough disk for “{fileName}”. It is {Gb(sizeBytes)} and needs about {Gb(needed)} with "
+            + $"working room, plus a {Gb(floor)} reserve, and {Path.GetPathRoot(workspace.Root)} has {Gb(free)} free. "
+            + "Free some space and queue this source again; the other sources were not affected.");
+    }
+
     public void EnsureRoomFor(double? durationSeconds, string? quality)
     {
         var needed = Estimate(durationSeconds, quality);

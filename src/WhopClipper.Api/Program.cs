@@ -56,6 +56,16 @@ builder.Services.AddSingleton<ClipStylist>();
 builder.Services.AddSingleton<BriefLinkDetector>();
 builder.Services.AddScoped<CampaignDocumentService>();
 builder.Services.AddScoped<CampaignPageFetcher>();
+builder.Services.AddSingleton<GoogleDriveClient>();
+// Redirects followed automatically here, unlike the brief fetcher: these are Drive's own hops
+// between drive.google.com and drive.usercontent.google.com, not user-supplied addresses. No
+// timeout, because a twelve-gigabyte source legitimately takes a long time.
+builder.Services.AddHttpClient(GoogleDriveClient.ClientName, client => client.Timeout = Timeout.InfiniteTimeSpan)
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = true,
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+    });
 // Redirects are followed by hand inside the fetcher so each hop is re-checked against the
 // private-address guard; letting the handler follow them would check only the typed address.
 builder.Services.AddHttpClient(CampaignPageFetcher.ClientName, client =>

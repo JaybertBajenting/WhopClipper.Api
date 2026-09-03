@@ -552,9 +552,13 @@ public static class ApiEndpoints
                     db.SourceAssets.Add(source);
                     await db.SaveChangesAsync(ct);
                     await coordinator.CreateAsync(id, JobKind.InspectSource, new SourceJobPayload(source.Id), ct);
+                    // A Drive folder has nothing to download until it is expanded, and queuing one
+                    // anyway is how a single link turned into a wall of identical failures. The
+                    // inspect job replaces it with the videos inside, which are downloadable.
+                    var isDriveFolder = GoogleDriveClient.TryParse(url) is { Kind: DriveTargetKind.Folder };
                     // The brief lists this footage to be clipped, so fetch it rather than
                     // leaving the user to press download on every row afterwards.
-                    if (request.Download)
+                    if (request.Download && !isDriveFolder)
                     {
                         await coordinator.CreateAsync(id, JobKind.Download, new SourceJobPayload(source.Id), ct);
                         queued++;

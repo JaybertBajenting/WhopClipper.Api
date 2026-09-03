@@ -92,7 +92,11 @@ public sealed record AutoRunCampaignDto(IReadOnlyList<JobDto> Queued, IReadOnlyL
     IReadOnlyList<string> NotInspected, int Skipped, long EstimatedBytes, long FreeBytes, bool DryRun);
 public sealed record SourceAssetDto(Guid Id, string Url, string? Title, string? Uploader, double? DurationSeconds,
     string? ThumbnailUrl, string? LocalRelativePath, string? SubtitleRelativePath, string Status,
-    DateTimeOffset CreatedAt, DateTimeOffset? DownloadedAt, bool IsLocalFile, bool HasWordTranscript);
+    DateTimeOffset CreatedAt, DateTimeOffset? DownloadedAt, bool IsLocalFile, bool HasWordTranscript,
+    /// <summary>Confirmed to be a single video, so it can be handed to the pipeline. A known
+    /// duration proves it; so does a video content type, which is all Drive reports before the
+    /// file is on disk. Without the second test a Drive source could never be processed.</summary>
+    bool IsVideo = false, long? FileSizeBytes = null);
 public sealed record StartAiAnalysisRequest(Guid SourceAssetId, AiMode? Mode = null, PlatformKind Platform = PlatformKind.TikTok,
     string? Transcript = null);
 public sealed record SoundEffectPlacementDto(Guid AssetId, double AtSeconds, double GainDb = -6);
@@ -356,7 +360,31 @@ public static class ApiMappings
         value.DurationSeconds, value.ThumbnailUrl, value.LocalRelativePath, value.SubtitleRelativePath,
         value.DownloadedAt.HasValue ? "Downloaded" : value.Title is not null ? "Inspected" : "Pending", value.CreatedAt,
         value.DownloadedAt, string.IsNullOrWhiteSpace(value.Url),
-        !string.IsNullOrWhiteSpace(value.WordTranscriptRelativePath));
+        !string.IsNullOrWhiteSpace(value.WordTranscriptRelativePath),
+        value.DurationSeconds is > 0 || MetadataSaysVideo(value.MetadataJson),
+        MetadataSize(value.MetadataJson));
+
+    private static bool MetadataSaysVideo(string? metadataJson) =>
+        ReadMetadata(metadataJson, "contentType")?.GetString()?
+            .StartsWith("video/", StringComparison.OrdinalIgnoreCase) ?? false;
+
+    private static long? MetadataSize(string? metadataJson) =>
+        ReadMetadata(metadataJson, "fileSizeBytes") is { } element && element.TryGetInt64(out var bytes)
+            ? bytes : null;
+
+    /// <summary>Metadata is whatever the inspector wrote, so a missing or malformed field is normal.</summary>
+    private static JsonElement? ReadMetadata(string? metadataJson, string property)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(metadataJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty(property, out var element)
+                ? element.Clone() : null;
+        }
+        catch (JsonException) { return null; }
+    }
 
     public static JobDto ToDto(this JobRecord value, string? campaignName = null, string? subjectName = null) => new(value.Id, value.CampaignId, value.Kind, value.Status,
         value.Progress, value.ResultJson, JsonDefaults.ParseElement(value.ResultJson), value.Error, campaignName,
