@@ -64,8 +64,12 @@ public sealed record DetectedLinkDto(string Url, string Host, string Kind, strin
 public sealed record ImportLinksRequest(IReadOnlyList<string> Urls, string Target, bool ConfirmedPermission, bool Download = true);
 public sealed record ImportLinksResult(int Added, int Skipped, int Queued, IReadOnlyList<string> Errors);
 public sealed record LocalSourceScanDto(int Attached, int Added, int AlreadyKnown, string Folder, IReadOnlyList<string> Notes);
+/// <param name="Title">What the clip is about - the hook burned onto it.</param>
+/// <param name="Caption">Ready to paste into an upload form, with the campaign's required
+/// hashtags and mentions already in it. A missing required hashtag gets a clip rejected.</param>
 public sealed record RenderedClipDto(string RelativePath, string FileName, string Platform, long SizeBytes,
-    DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds);
+    DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds,
+    string Title = "", string Caption = "");
 public sealed record AddSourceRequest(string Url);
 public sealed record InspectSourceRequest(string Url);
 public sealed record StartDownloadRequest(Guid SourceAssetId, string? Quality = null, bool Refresh = false);

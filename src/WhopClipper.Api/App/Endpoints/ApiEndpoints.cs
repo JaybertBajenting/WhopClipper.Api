@@ -845,6 +845,9 @@ public static class ApiEndpoints
             var outputRoot = workspace.ResolveRelative(Path.Combine("campaigns", id.ToString("N"), "output"));
             Directory.CreateDirectory(outputRoot);
             var plans = await db.EditPlans.AsNoTracking().Where(x => x.CampaignId == id).ToListAsync(ct);
+            // Loaded once for the whole listing: the caption's required hashtags live on the
+            // platform profile, and uploading by hand without them gets a clip rejected.
+            var profiles = await db.PlatformProfiles.AsNoTracking().Where(x => x.CampaignId == id).ToListAsync(ct);
 
             var clips = Directory.EnumerateFiles(outputRoot, "*", SearchOption.AllDirectories)
                 .Where(x => RenderedClipExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
@@ -856,8 +859,11 @@ public static class ApiEndpoints
                     var stem = Path.GetFileNameWithoutExtension(path);
                     var plan = plans.FirstOrDefault(x => stem.StartsWith(
                         Path.GetFileNameWithoutExtension(x.OutputFileName), StringComparison.OrdinalIgnoreCase));
+                    var profile = plan is null ? null : profiles.FirstOrDefault(x => x.Platform == plan.Platform);
+                    var copy = ClipCaptionComposer.Compose(plan, profile, info.Name);
                     return new RenderedClipDto(workspace.ToRelative(path), info.Name, platform, info.Length,
-                        new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero), plan?.Id, plan?.StartSeconds, plan?.EndSeconds);
+                        new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero), plan?.Id, plan?.StartSeconds, plan?.EndSeconds,
+                        copy.Title, copy.Caption);
                 })
                 .OrderByDescending(x => x.CreatedAt)
                 .ToList();
