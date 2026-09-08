@@ -55,6 +55,7 @@ builder.Services.AddSingleton<HookCardRenderer>();
 builder.Services.AddSingleton<ClipStylist>();
 builder.Services.AddSingleton<BriefLinkDetector>();
 builder.Services.AddScoped<CampaignDocumentService>();
+builder.Services.AddScoped<WorkspaceMaintenanceService>();
 builder.Services.AddScoped<CampaignPageFetcher>();
 builder.Services.AddSingleton<GoogleDriveClient>();
 // Redirects followed automatically here, unlike the brief fetcher: these are Drive's own hops

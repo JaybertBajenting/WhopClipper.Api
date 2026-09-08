@@ -1229,6 +1229,34 @@ public static class ApiEndpoints
             state.MarkRestartRequired();
             return Results.Ok(new { saved = true, restartRequiredToApplyChanges = true, settingsPath = LocalSettingsFile.Path });
         }).WithTags("Settings");
+        // Media left behind when a campaign's rows were deleted but its folder could not be. The
+        // app has nothing pointing at it afterwards, so without this the disk it holds never
+        // comes back and nobody can tell why.
+        api.MapGet("/system/orphaned-campaign-folders", async (WorkspaceMaintenanceService maintenance,
+            CancellationToken ct) => Results.Ok(await maintenance.FindOrphansAsync(ct))).WithTags("System");
+
+        api.MapDelete("/system/orphaned-campaign-folders/{folderName}", async (string folderName,
+            WorkspaceMaintenanceService maintenance, CancellationToken ct) =>
+        {
+            try
+            {
+                return await maintenance.DeleteOrphanAsync(folderName, ct)
+                    ? Results.Ok(new { deleted = true })
+                    : Results.NotFound();
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["folderName"] = [ex.Message] });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Results.ValidationProblem(new Dictionary<string, string[]>
+                {
+                    ["folderName"] = ["The folder is still in use. Close anything reading from it and try again."],
+                });
+            }
+        }).WithTags("System");
+
         api.MapGet("/system/dependencies", async (DependencyService service, CancellationToken ct) => Results.Ok(await service.CheckAsync(ct))).WithTags("System");
         api.MapGet("/tool-status", async (DependencyService service, CancellationToken ct) => Results.Ok(await service.CheckAsync(ct))).WithTags("System");
     }
