@@ -325,6 +325,8 @@ public sealed class PodcastSplitSupportTests
             {"id":"bbbbbbbbbbb","title":"Teofimo Lopez vs Richard Commey knockout","duration":400,"channel":"Top Rank Boxing"}
             {"id":"ccccccccccc","title":"Rocky IV (1985) - Teofimo Lopez knockout training","duration":180,"channel":"Clips"}
             {"id":"ddddddddddd","title":"Teofimo Lopez knockout highlights","duration":250,"channel":"Movieclips"}
+            {"id":"fffffffffff","title":"ROCKY | Teofimo Lopez knockout scene remake","duration":250,"channel":"Fan Edits"}
+            {"id":"ggggggggggg","title":"Creed Gets Knocked Down, Teofimo Lopez style","duration":250,"channel":"Clips"}
             """;
         var named = BrollCandidates.Rank(BrollCandidates.ParseSearch(output), "Teofimo Lopez knockout highlights");
         var generic = BrollCandidates.Rank(BrollCandidates.ParseSearch(

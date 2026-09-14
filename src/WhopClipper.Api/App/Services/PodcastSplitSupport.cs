@@ -326,7 +326,7 @@ public static class BrollCandidates
     /// <summary>Scripted and re-edited video. A drama scene or a sketch is not footage of anything that happened,
     /// and skit and reaction channels burn their own captions over the picture, which fights the clip's captions.</summary>
     private static readonly Regex Scripted = new(
-        @"\b(s\d{1,2}\s?ep?\d{1,2}|season\s+\d+|episode\s+\d+|full\s+episode|movie|movies|film|trailer|scene|sitcom|sketch|skit|parody|reaction|reacts|dhar\s+mann|snl|movieclips|official\s+clip)\b|\((19|20)\d{2}\)",
+        @"\b(s\d{1,2}\s?ep?\d{1,2}|season\s+\d+|episode\s+\d+|full\s+episode|movie|movies|film|trailer|scene|sitcom|sketch|skit|parody|reaction|reacts|dhar\s+mann|snl|movieclips|official\s+clip|rocky|creed|southpaw|raging\s+bull|million\s+dollar\s+baby|cinderella\s+man|hands\s+of\s+stone|bleed\s+for\s+this)\b|\((19|20)\d{2}\)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>Film studios and their clip channels: a Rocky scene came through under a title with no "movie" in it.</summary>
