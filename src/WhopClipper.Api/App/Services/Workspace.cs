@@ -121,12 +121,13 @@ public sealed class DiskSpaceGuard(WorkspaceService workspace, IOptions<AppOptio
     /// <summary>
     /// The same check when the exact size is already known, which beats estimating from a duration.
     /// Still multiplied by the headroom factor: the download and whatever is cut from it coexist.
+    /// A file that is small and deleted within minutes can pass its own, smaller <paramref name="reserveBytes"/>.
     /// </summary>
-    public void EnsureRoomForBytes(long sizeBytes, string fileName)
+    public void EnsureRoomForBytes(long sizeBytes, string fileName, long? reserveBytes = null)
     {
         var needed = (long)(sizeBytes * Math.Max(1, options.Value.DiskHeadroomFactor));
         var free = Available;
-        var floor = options.Value.MinimumFreeDiskBytes;
+        var floor = reserveBytes ?? options.Value.MinimumFreeDiskBytes;
         if (free - needed >= floor) return;
         throw new InvalidOperationException(
             $"Not enough disk for “{fileName}”. It is {Gb(sizeBytes)} and needs about {Gb(needed)} with "

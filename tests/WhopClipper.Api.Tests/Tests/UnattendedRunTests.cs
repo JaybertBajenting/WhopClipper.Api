@@ -140,6 +140,19 @@ public sealed class DiskSpaceGuardTests
         Assert.True(guard.Estimate(3600, "audio") * 5 < guard.Estimate(3600, "1080p"));
     }
 
+    /// <summary>
+    /// A short B-roll probe passes its own reserve. Held to the source floor, a drive at 2.3 GB free refused
+    /// every probe and the clips rendered with no footage underneath.
+    /// </summary>
+    [Fact]
+    public void ASmallDownloadCanKeepASmallerReserveThanASource()
+    {
+        var guard = Guard(floorBytes: long.MaxValue / 4);
+
+        Assert.Throws<InvalidOperationException>(() => guard.EnsureRoomForBytes(12_000_000, "probe.mp4"));
+        guard.EnsureRoomForBytes(12_000_000, "probe.mp4", reserveBytes: 0);
+    }
+
     /// <summary>The reserve is the point: a run must not be allowed to consume the last byte.</summary>
     [Fact]
     public void RefusesWhenTheSourceWouldEatIntoTheReserve()

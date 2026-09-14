@@ -94,6 +94,19 @@ public sealed class PodcastSplitEndpointTests
         Assert.Equal("When MJ LT Golfed for $38K", JobExecutionService.SearchableTitle("When MJ & LT Golfed for $38K ⛳️"));
     }
 
+    /// <summary>Three renders of one story share a file name prefix; each must list its own plan's footage.</summary>
+    [Fact]
+    public void ARenderIsMatchedToItsOwnPlanNotTheOldestWithTheSameTitle()
+    {
+        var oldest = new EditPlan { OutputFileName = "Teofimo's Chilling Warning to Ryan Garcia.mp4", CreatedAt = DateTimeOffset.UtcNow.AddHours(-1) };
+        var middle = new EditPlan { OutputFileName = oldest.OutputFileName, CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-30) };
+        var newest = new EditPlan { OutputFileName = oldest.OutputFileName, CreatedAt = DateTimeOffset.UtcNow };
+        var plans = new List<EditPlan> { oldest, middle, newest };
+
+        Assert.Same(middle, ApiEndpoints.MatchPlanForOutput(plans, $"Teofimo's Chilling Warning to Ryan Garcia-{middle.Id:N}"));
+        Assert.Same(newest, ApiEndpoints.MatchPlanForOutput(plans, $"Teofimo's Chilling Warning to Ryan Garcia-{Guid.NewGuid():N}"));
+    }
+
     /// <summary>Plans stored before the style existed carry no podcast-split block and must still load.</summary>
     [Fact]
     public void PlanExtrasFromBeforeTheStyleStillParse()

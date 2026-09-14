@@ -28,6 +28,16 @@ public static class ApiEndpoints
         return app;
     }
 
+    /// <summary>
+    /// Finds the plan a rendered file came from. Podcast-split renders end in their plan id, which is exact.
+    /// Matching by name alone took the oldest of three plans that shared a story title, so a Teofimo clip
+    /// listed a cancelled render's footage. Other renders end in a job id and still match by name, newest first.
+    /// </summary>
+    internal static EditPlan? MatchPlanForOutput(IReadOnlyList<EditPlan> plans, string stem) =>
+        plans.FirstOrDefault(x => stem.EndsWith(x.Id.ToString("N"), StringComparison.OrdinalIgnoreCase))
+        ?? plans.Where(x => stem.StartsWith(Path.GetFileNameWithoutExtension(x.OutputFileName), StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(x => x.CreatedAt).FirstOrDefault();
+
     private static void MapDashboard(RouteGroupBuilder api)
     {
         api.MapGet("/dashboard", async (AppDbContext db, WorkspaceService workspace, CancellationToken ct) =>
@@ -858,8 +868,7 @@ public static class ApiEndpoints
                     var platform = Path.GetFileName(Path.GetDirectoryName(path)) ?? string.Empty;
                     // Renders are named "<plan output name>-<job id>.mp4"; match the plan by prefix.
                     var stem = Path.GetFileNameWithoutExtension(path);
-                    var plan = plans.FirstOrDefault(x => stem.StartsWith(
-                        Path.GetFileNameWithoutExtension(x.OutputFileName), StringComparison.OrdinalIgnoreCase));
+                    var plan = MatchPlanForOutput(plans, stem);
                     var profile = plan is null ? null : profiles.FirstOrDefault(x => x.Platform == plan.Platform);
                     var copy = ClipCaptionComposer.Compose(plan, profile, info.Name);
                     return new RenderedClipDto(workspace.ToRelative(path), info.Name, platform, info.Length,

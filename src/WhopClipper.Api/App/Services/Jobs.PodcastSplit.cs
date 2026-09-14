@@ -280,6 +280,10 @@ public sealed partial class JobExecutionService
         var topShots = await FrameCameraAsync(spanPath, pieces, video, clipDirectory, cancellationToken);
         var brollPlan = await PlanBrollAsync(campaignId, payload.Mode, source, story, clipWords, clipSeconds, cancellationToken);
         var (broll, gaps) = await FindBrollAsync(brollPlan.Moments, clipSeconds, style.BrollShotSeconds, clipDirectory, cancellationToken);
+        // With no footage at all the bottom half is only a blurred copy of the camera, which is not the style.
+        if (broll.Count == 0)
+            throw new InvalidOperationException($"No B-roll could be downloaded for “{story.Title}”, so it was not rendered. "
+                + string.Join(" ", gaps.Select(x => x.Reason).Distinct()));
 
         var split = new PodcastSplitPlanDto(workspace.ToRelative(spanPath), video.Width, video.Height,
             pieces.Select(x => new StoryPieceDto(Math.Round(x.Start, 3), Math.Round(x.End, 3))).ToList(),
@@ -582,6 +586,10 @@ public sealed partial class JobExecutionService
         return (shots, gaps);
     }
 
+    /// <summary>A probe is ~12 MB and deleted with its clip, so it keeps a small reserve free rather than the source floor.
+    /// Held to the 5 GB floor, a drive at 2.3 GB free refused every probe and the clips rendered with no footage.</summary>
+    private const long BrollProbeReserveBytes = 1L * 1024 * 1024 * 1024;
+
     private async Task<IReadOnlyList<BrollProbe>> ProbeMomentAsync(string query, double secondsNeeded, string brollDirectory,
         HashSet<string> usedVideos, CancellationToken cancellationToken)
     {
@@ -607,7 +615,7 @@ public sealed partial class JobExecutionService
             if (end - start < 4) continue;
             try
             {
-                diskSpace.EnsureRoomForBytes((long)((end - start) * 400_000), candidate.Title);
+                diskSpace.EnsureRoomForBytes((long)((end - start) * 400_000), candidate.Title, BrollProbeReserveBytes);
                 var path = await DownloadSectionAsync(candidate.Url, start, end, brollDirectory,
                     $"{WorkspaceService.SafeFileName(candidate.Id, "clip")}-{(int)start}", 1080, false, cancellationToken);
                 var measurement = Path.ChangeExtension(path, ".probe.json");
