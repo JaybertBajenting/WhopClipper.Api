@@ -145,7 +145,10 @@ public sealed class DependencyService(IProcessRunner runner, IOptions<AppOptions
     }
 }
 
-public sealed record AiProviderRequest(string Prompt, string SchemaPath, string WorkingDirectory);
+/// <param name="SchemaJson">The schema handed to the CLI. Null means the highlight schema, which is
+/// what every call used before the podcast-split style needed stories and B-roll plans too.
+/// Codex reads <paramref name="SchemaPath"/>, so write the same schema there.</param>
+public sealed record AiProviderRequest(string Prompt, string SchemaPath, string WorkingDirectory, string? SchemaJson = null);
 public sealed record AiHighlight(double StartSeconds, double EndSeconds, string Hook, string Rationale,
     double Score, double Confidence, JsonElement EditPlan);
 public sealed record AiProviderResponse(string Provider, IReadOnlyList<AiHighlight> Highlights, string RawOutput, int ExitCode);
@@ -156,6 +159,10 @@ public interface IAiMediaProvider
     string Name { get; }
     Task<AiProviderAvailability> CheckAvailabilityAsync(string workingDirectory, CancellationToken cancellationToken);
     Task<AiProviderResponse> AnalyzeAsync(AiProviderRequest request, CancellationToken cancellationToken);
+    /// <summary>Runs any schema and returns the payload <paramref name="accept"/> recognises, with the
+    /// same rate-limit retries as highlight analysis.</summary>
+    Task<JsonElement> RunStructuredAsync(AiProviderRequest request, Func<JsonElement, bool> accept,
+        CancellationToken cancellationToken);
 }
 
 public abstract class CliAiProvider(IProcessRunner runner) : IAiMediaProvider
@@ -215,6 +222,24 @@ public abstract class CliAiProvider(IProcessRunner runner) : IAiMediaProvider
 
     public async Task<AiProviderResponse> AnalyzeAsync(AiProviderRequest request, CancellationToken cancellationToken)
     {
+        var (result, output) = await RunWithRetriesAsync(request, cancellationToken);
+        var highlights = AiOutputParser.Parse(output);
+        if (highlights.Count == 0)
+            throw new InvalidOperationException($"{Name} returned no schema-valid highlights. {Describe(result)}");
+        return new AiProviderResponse(Name, highlights, output, result.ExitCode);
+    }
+
+    public async Task<JsonElement> RunStructuredAsync(AiProviderRequest request, Func<JsonElement, bool> accept,
+        CancellationToken cancellationToken)
+    {
+        var (result, output) = await RunWithRetriesAsync(request, cancellationToken);
+        return StructuredOutput.Extract(output, accept)
+            ?? throw new InvalidOperationException($"{Name} returned nothing matching the schema. {Describe(result)}");
+    }
+
+    private async Task<(ProcessResult Result, string Output)> RunWithRetriesAsync(AiProviderRequest request,
+        CancellationToken cancellationToken)
+    {
         var result = await runner.RunAsync(CreateInvocation(request), cancellationToken);
         for (var attempt = 0; attempt < RetryDelays.Length && IsTransient(result); attempt++)
         {
@@ -223,11 +248,7 @@ public abstract class CliAiProvider(IProcessRunner runner) : IAiMediaProvider
         }
         if (result.TimedOut) throw new TimeoutException($"{Name} timed out. {Describe(result)}");
         if (result.ExitCode != 0) throw new InvalidOperationException($"{Name} failed (exit {result.ExitCode}). {Describe(result)}");
-        var output = await GetParserOutputAsync(request, result, cancellationToken);
-        var highlights = AiOutputParser.Parse(output);
-        if (highlights.Count == 0)
-            throw new InvalidOperationException($"{Name} returned no schema-valid highlights. {Describe(result)}");
-        return new AiProviderResponse(Name, highlights, output, result.ExitCode);
+        return (result, await GetParserOutputAsync(request, result, cancellationToken));
     }
 
     /// <summary>
@@ -258,7 +279,7 @@ public sealed class ClaudeCliProvider(IProcessRunner runner, IOptions<AppOptions
         // Structured output is delivered through a tool call, so a single turn is not enough:
         // the run stops with stop_reason "tool_use" before the JSON is produced. Plan mode
         // and safe mode remain the boundary that keeps the run read-only.
-        ["-p", "--output-format", "json", "--json-schema", AiSchemas.HighlightSchema, "--max-turns", "8",
+        ["-p", "--output-format", "json", "--json-schema", request.SchemaJson ?? AiSchemas.HighlightSchema, "--max-turns", "8",
             "--safe-mode", "--no-session-persistence", "--permission-mode", "plan"],
         request.WorkingDirectory, request.Prompt);
 

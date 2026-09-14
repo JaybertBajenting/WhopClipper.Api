@@ -26,10 +26,13 @@ public sealed record ValidateJobPayload(string OutputRelativePath, double Expect
 /// which the card is composited *over* - so anything near mid-frame hides the captions for the
 /// whole clip. 0.012 is the value that satisfies both, verified on a real render and checked
 /// against 38 frames spanning 13 clips. A full-frame-face source would need this overridden.</param>
+/// <param name="EditStyle">Overrides the campaign's stored style for this run. Null follows the campaign.</param>
+/// <param name="Stories">Pieces chosen by hand. When set, story selection is skipped and exactly these
+/// are built - how a reference short is recreated from the moments it was cut from.</param>
 public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind Platform = PlatformKind.TikTok,
     int MaxClips = 8, bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude,
     string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = 0.012,
-    bool ApplyStyling = true);
+    bool ApplyStyling = true, string? EditStyle = null, IReadOnlyList<ImportedStoryDto>? Stories = null);
 
 public sealed class JobQueue
 {
@@ -132,7 +135,7 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
     }
 }
 
-public sealed class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
+public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
     SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist, DiskSpaceGuard diskSpace,
     GoogleDriveClient drive, ILogger<JobExecutionService> logger)
@@ -225,6 +228,15 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
     private async Task RunSourcePipelineStagesAsync(JobRecord job, SourcePipelineJobPayload payload,
         Guid campaignId, SourceAsset source, CancellationToken cancellationToken)
     {
+        // The podcast-split style never downloads a whole episode: it reads YouTube's own captions,
+        // picks stories, and fetches only the minutes each story needs. Branching here keeps the
+        // full-VOD disk check below from refusing an episode that is never going to be downloaded.
+        if (await ResolveEditStyleAsync(campaignId, payload.EditStyle, cancellationToken) is { Style: EditStyles.PodcastSplit } podcastStyle)
+        {
+            await RunPodcastSplitPipelineAsync(job, payload, campaignId, source, podcastStyle, cancellationToken);
+            return;
+        }
+
         var stages = new List<object>();
 
         // Checked before anything is fetched. A source that cannot fit fails here in milliseconds
@@ -804,6 +816,13 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         var plan = await db.EditPlans.SingleAsync(x => x.Id == payload.EditPlanId, cancellationToken);
         if (options.Value.RequireEditApproval && !plan.IsApproved)
             throw new InvalidOperationException("The edit plan must be approved before rendering.");
+        // A podcast-split plan renders from its own downloaded span, not from the source video,
+        // which is never downloaded whole for this style.
+        if (IsPodcastSplitPlan(plan))
+        {
+            await RenderPodcastSplitAsync(job, plan, cancellationToken);
+            return;
+        }
         var source = await db.SourceAssets.SingleAsync(x => x.Id == plan.SourceAssetId, cancellationToken);
         if (string.IsNullOrWhiteSpace(source.LocalRelativePath)) throw new InvalidOperationException("The source has not been downloaded.");
         var sourcePath = workspace.ResolveRelative(source.LocalRelativePath);

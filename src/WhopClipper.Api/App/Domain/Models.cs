@@ -44,6 +44,8 @@ public sealed class Campaign
     public string? Notes { get; set; }
     /// <summary>Serialized <c>CampaignBrandingDto</c>: the client logo burned into every clip, and where it sits.</summary>
     public string? BrandingJson { get; set; }
+    /// <summary>Serialized <c>CampaignEditStyleDto</c>: which edit the campaign's clips get. Null is the streamer style.</summary>
+    public string? EditStyleJson { get; set; }
     public CampaignStatus Status { get; set; } = CampaignStatus.Draft;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;

@@ -117,6 +117,9 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<DateTimeOffset?>("Deadline")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<string>("EditStyleJson")
+                        .HasColumnType("text");
+
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasColumnType("text");

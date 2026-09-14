@@ -24,6 +24,7 @@ public static class ApiEndpoints
         MapMediaLibrary(api);
         MapSettings(api);
         PublishingEndpoints.Map(api);
+        PodcastSplitEndpoints.Map(api);
         return app;
     }
 
@@ -863,7 +864,7 @@ public static class ApiEndpoints
                     var copy = ClipCaptionComposer.Compose(plan, profile, info.Name);
                     return new RenderedClipDto(workspace.ToRelative(path), info.Name, platform, info.Length,
                         new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero), plan?.Id, plan?.StartSeconds, plan?.EndSeconds,
-                        copy.Title, copy.Caption);
+                        copy.Title, copy.Caption, PodcastSplitEndpoints.DescribeClip(plan));
                 })
                 .OrderByDescending(x => x.CreatedAt)
                 .ToList();

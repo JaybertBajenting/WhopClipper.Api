@@ -22,7 +22,7 @@ public sealed record CampaignDetail(Guid Id, string Name, string? WhopUrl, strin
     CampaignStatus Status, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
     IReadOnlyList<RequirementRevisionDto> RequirementRevisions, IReadOnlyList<PlatformProfileDto> PlatformProfiles,
     IReadOnlyList<SourceAssetDto> Sources, IReadOnlyList<CampaignDocumentDto> Documents,
-    IReadOnlyList<ReferenceVideoDto> ReferenceVideos, CampaignBrandingDto? Branding);
+    IReadOnlyList<ReferenceVideoDto> ReferenceVideos, CampaignBrandingDto? Branding, CampaignEditStyleDto? EditStyle = null);
 /// <summary>
 /// The client logo burned into every clip for a campaign. Sizes are fractions of the output
 /// frame so one setting covers every platform preset. <paramref name="LogoCropRect"/> is the
@@ -69,7 +69,7 @@ public sealed record LocalSourceScanDto(int Attached, int Added, int AlreadyKnow
 /// hashtags and mentions already in it. A missing required hashtag gets a clip rejected.</param>
 public sealed record RenderedClipDto(string RelativePath, string FileName, string Platform, long SizeBytes,
     DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds,
-    string Title = "", string Caption = "");
+    string Title = "", string Caption = "", RenderedClipStyleDto? Style = null);
 public sealed record AddSourceRequest(string Url);
 public sealed record InspectSourceRequest(string Url);
 public sealed record StartDownloadRequest(Guid SourceAssetId, string? Quality = null, bool Refresh = false);
@@ -116,9 +116,12 @@ public sealed record OverlayDto(string Text, double StartSeconds, double EndSeco
 public sealed record ColorFlashDto(double AtSeconds, double DurationSeconds = 0.5, double Intensity = 0.45, string Color = "Green");
 /// <summary>Punch-in on a beat; reference edits run 1.1x-2.3x over 0.3-1.0s.</summary>
 public sealed record ZoomPunchDto(double AtSeconds, double DurationSeconds = 0.5, double Scale = 1.25);
+/// <param name="PodcastSplit">Set only on podcast-split plans, whose Framing is "PodcastSplit": the
+/// downloaded span, camera shots, B-roll and clip-clock words the renderer needs.</param>
 public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, string? SubtitleStyle,
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects, IReadOnlyList<OverlayDto> Overlays,
-    IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null);
+    IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
+    PodcastSplitPlanDto? PodcastSplit = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,
@@ -339,11 +342,15 @@ public static class ApiMappings
         value.Sources.OrderByDescending(x => x.CreatedAt).Select(ToDto).ToList(),
         value.Documents.OrderBy(x => x.UploadedAt).Select(ToDto).ToList(),
         value.ReferenceVideos.OrderByDescending(x => x.IsPrimary).ThenBy(x => x.CreatedAt).Select(ToDto).ToList(),
-        value.ReadBranding());
+        value.ReadBranding(), value.ReadEditStyle());
 
     /// <summary>Null until a logo is uploaded; there is nothing to burn in before that.</summary>
     public static CampaignBrandingDto? ReadBranding(this Campaign value) =>
         string.IsNullOrWhiteSpace(value.BrandingJson) ? null : JsonDefaults.Parse<CampaignBrandingDto?>(value.BrandingJson, null);
+
+    /// <summary>Null until a style is chosen; every existing campaign keeps the streamer style.</summary>
+    public static CampaignEditStyleDto? ReadEditStyle(this Campaign value) =>
+        string.IsNullOrWhiteSpace(value.EditStyleJson) ? null : JsonDefaults.Parse<CampaignEditStyleDto?>(value.EditStyleJson, null);
 
     public static CampaignDocumentDto ToDto(this CampaignDocument value) => new(value.Id, value.FileName, value.Kind,
         value.SizeBytes, value.PageCount, value.ExtractedCharacterCount, value.ExtractionStatus, value.ExtractionError,
