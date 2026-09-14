@@ -179,6 +179,30 @@ def content_box(np, frames):
     return int(cols[0]), int(rows[0]), int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)
 
 
+def is_dark(np, frame):
+    """A frame that is nearly black and nearly flat: a fade, a black slate, or the first frames of a
+    section cut before its keyframe, which decode as nothing."""
+    gray = frame.mean(axis=2)
+    return float(gray.mean()) < 22 and float(gray.std()) < 14
+
+
+def subtract(interval, bad):
+    """What is left of an interval once every bad stretch is taken out of it."""
+    pieces = [interval]
+    for bad_start, bad_end in bad:
+        remaining = []
+        for start, end in pieces:
+            if bad_end <= start or bad_start >= end:
+                remaining.append((start, end))
+                continue
+            if bad_start > start:
+                remaining.append((start, bad_start))
+            if bad_end < end:
+                remaining.append((bad_end, end))
+        pieces = remaining
+    return pieces
+
+
 def intersection(a, b):
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -187,7 +211,7 @@ def intersection(a, b):
     return max(0.0, x1 - x0) * max(0.0, y1 - y0)
 
 
-def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_fraction=1.0, keep_focus=False):
+def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_fraction=1.0, keep_focus=False, face_at=0.42):
     """Tries crops across the picture and a few punch-ins, and keeps the one that leaves the logos
     out while staying closest to the subject. Overlap dominates the score: any logo pixel left in
     costs more than moving off-centre."""
@@ -203,7 +227,7 @@ def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_f
         # The subject's own position first, then sweeps across the frame.
         xs = [min(max(cx, fx - crop_w / 2.0), cx + cw - crop_w)]
         xs += [cx + (cw - crop_w) * k / 16.0 for k in range(17)]
-        ys = [min(max(cy, fy - 0.42 * crop_h), cy + ch - crop_h)]
+        ys = [min(max(cy, fy - face_at * crop_h), cy + ch - crop_h)]
         ys += [cy + (ch - crop_h) * k / 4.0 for k in range(5)]
         for x in xs:
             for y in ys:
@@ -214,13 +238,13 @@ def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_f
                         0.3 * crop_w <= fx - x <= 0.7 * crop_w and 0.12 * crop_h <= fy - y <= 0.62 * crop_h):
                     continue
                 overlap = sum(intersection(rect, box) for box in boxes)
-                off_subject = abs((x + crop_w / 2.0) - fx) / cw + 0.5 * abs((y + 0.42 * crop_h) - fy) / ch
+                off_subject = abs((x + crop_w / 2.0) - fx) / cw + 0.5 * abs((y + face_at * crop_h) - fy) / ch
                 score = overlap * 10.0 + off_subject * 40.0 + (zoom - 1.0) * 30.0
                 if best is None or score < best[0]:
                     best = (score, rect, overlap)
     if best is None:
         # A face so close to the frame edge that no crop can centre it: frame it as well as possible.
-        return choose_crop(boxes, area, focus, zooms, height_fraction, keep_focus=False)
+        return choose_crop(boxes, area, focus, zooms, height_fraction, keep_focus=False, face_at=face_at)
     return best[1], best[2]
 
 
@@ -276,17 +300,26 @@ def probe(args):
     area = content_box(np, frames)
     rect, _ = choose_crop(boxes, area)
 
+    # Dark frames are never footage. A render once showed 1.5 seconds of black under the guest because
+    # every shot started at 0.0 of its section: the first half second is skipped as keyframe warm-up,
+    # shots are cut around each dark stretch, and footage that is mostly dark is not used at all.
+    dark = [(t - SAMPLE_STEP, t + SAMPLE_STEP) for t, f in samples if is_dark(np, f)]
+    dark_share = len(dark) / float(len(samples))
+    bad = [(0.0, 0.5)] + dark
     shots = []
     bounds = [0.0] + cuts + [end_time]
-    for index in range(len(bounds) - 1):
-        # Skip the frames either side of a cut: dissolves and flash frames live there.
-        start = bounds[index] + (0.25 if index > 0 else 0.0)
-        stop = bounds[index + 1] - (0.15 if index + 1 < len(bounds) - 1 else 0.0)
-        if stop - start >= args.min_shot:
-            shots.append({"in": round(start, 3), "duration": round(stop - start, 3)})
+    if dark_share < 0.5:
+        for index in range(len(bounds) - 1):
+            # Skip the frames either side of a cut: dissolves and flash frames live there.
+            start = bounds[index] + (0.25 if index > 0 else 0.0)
+            stop = bounds[index + 1] - (0.15 if index + 1 < len(bounds) - 1 else 0.0)
+            for usable_start, usable_end in subtract((start, stop), bad):
+                if usable_end - usable_start >= args.min_shot:
+                    shots.append({"in": round(usable_start, 3), "duration": round(usable_end - usable_start, 3)})
 
     payload = {
         "width": width, "height": height, "still": bool(still), "motion": round(motion, 2),
+        "darkShare": round(dark_share, 2),
         "shots": shots, "crop": to_source(rect, scale, width, height), "blur": blur_boxes(boxes, rect),
         "logoBoxes": len(boxes),
     }
@@ -338,7 +371,10 @@ def topcrop(args):
     # Sponsor bugs stay put through every camera switch; the set behind the guest does not. With at
     # least two different angles, anything that never moved is an overlay.
     distinct = any(float(np.mean(np.abs(means[i] - means[0]))) > 25 for i in range(1, len(means)))
-    boxes, _ = overlay_boxes(cv2, np, overlay_frames, spans_cuts=distinct, locked=not distinct)
+    # A podcast's own sponsor bugs sit in the corners. Pooling a host angle with a guest angle is not
+    # enough to tell the set from an overlay - the angle with more screen time makes its whole set
+    # "persist" - and that blurred a guest's head, so the camera half only ever looks in the corners.
+    boxes, _ = overlay_boxes(cv2, np, overlay_frames, spans_cuts=distinct, locked=True)
     area = (0, 0, ANALYSIS_WIDTH, int(round(ANALYSIS_WIDTH * height / max(1, width))))
 
     shots = []
@@ -351,7 +387,10 @@ def topcrop(args):
             focus = (sorted(p[0] for p in found)[len(found) // 2], sorted(p[1] for p in found)[len(found) // 2])
         else:
             focus = previous_focus
-        rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0, 1.1, 1.2), height_fraction=args.height_fraction, keep_focus=True)
+        # The measured Double Coverage punch-in and no tighter, with the face a third of the way down so
+        # the top of the head stays in: centring it at 42% cut off a seated guest's forehead.
+        rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0,), height_fraction=args.height_fraction,
+                              keep_focus=True, face_at=0.3)
         shots.append({
             "in": round(shot["in"], 3), "duration": round(shot["duration"], 3),
             "crop": to_source(rect, scale, width, height), "blur": blur_boxes(boxes, rect), "face": bool(found),

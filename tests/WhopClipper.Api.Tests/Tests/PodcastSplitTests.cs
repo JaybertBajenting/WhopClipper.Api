@@ -133,6 +133,17 @@ public sealed class SeamCaptionTests
     }
 
     [Fact]
+    public void AnEmphasisWordIsItalicOnlyTheFirstTimeItIsSaid()
+    {
+        var ass = CaptionBuilder.BuildSeamAss(
+            [W("car", 0, 0.4), W("the", 0.4, 0.8), W("car", 0.8, 1.2), W("22", 1.2, 1.6), W("22", 1.6, 2)], 3, ["car"]);
+
+        Assert.Single(Lines(ass), x => x.EndsWith("{\\i1}CAR{\\i0}", StringComparison.Ordinal));
+        Assert.Single(Lines(ass), x => x.EndsWith(",CAR", StringComparison.Ordinal));
+        Assert.Equal(2, Lines(ass).Count(x => x.EndsWith("{\\i1}22{\\i0}", StringComparison.Ordinal)));
+    }
+
+    [Fact]
     public void SwearingIsStarredButTheWordStaysReadable()
     {
         var ass = CaptionBuilder.BuildSeamAss([W("badass", 0, 0.5), W("fucking", 0.5, 1), W("class", 1, 1.5)], 2);
@@ -304,6 +315,23 @@ public sealed class PodcastSplitSupportTests
         var ranked = BrollCandidates.Rank(BrollCandidates.ParseSearch(output), "Kobe Bryant game winner Bucks 2009");
 
         Assert.Equal(new[] { "aaaaaaaaaaa", "eeeeeeeeeee" }, ranked.Select(x => x.Id));
+    }
+
+    [Fact]
+    public void AResultMustShareWordsWithItsSearchAndFilmClipsAreOut()
+    {
+        const string output = """
+            {"id":"aaaaaaaaaaa","title":"Man shadowboxing in the forest","duration":300,"channel":"Fit"}
+            {"id":"bbbbbbbbbbb","title":"Teofimo Lopez vs Richard Commey knockout","duration":400,"channel":"Top Rank Boxing"}
+            {"id":"ccccccccccc","title":"Rocky IV (1985) - Teofimo Lopez knockout training","duration":180,"channel":"Clips"}
+            {"id":"ddddddddddd","title":"Teofimo Lopez knockout highlights","duration":250,"channel":"Movieclips"}
+            """;
+        var named = BrollCandidates.Rank(BrollCandidates.ParseSearch(output), "Teofimo Lopez knockout highlights");
+        var generic = BrollCandidates.Rank(BrollCandidates.ParseSearch(
+            """{"id":"eeeeeeeeeee","title":"Forest walk 4K","duration":300,"channel":"Nature"}"""), "forest b roll");
+
+        Assert.Equal(new[] { "bbbbbbbbbbb" }, named.Select(x => x.Id));
+        Assert.Equal(new[] { "eeeeeeeeeee" }, generic.Select(x => x.Id));
     }
 
     [Fact]

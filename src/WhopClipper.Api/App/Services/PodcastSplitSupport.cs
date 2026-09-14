@@ -300,11 +300,20 @@ public static class BrollCandidates
         return entries;
     }
 
+    /// <summary>
+    /// A result has to share words with its search to be used at all. Taking the top results whatever they
+    /// matched put a stranger boxing in a forest, and an ESPN studio desk, under Teofimo's warning to Ryan
+    /// Garcia. A named search needs two of its words in the title; a plain "b roll" search needs one.
+    /// </summary>
     public static IReadOnlyList<BrollSearchEntry> Rank(IReadOnlyList<BrollSearchEntry> entries, string query, int take = 3)
     {
         var wanted = Tokens(query);
+        wanted.Remove("roll");
+        var generic = query.Contains("b roll", StringComparison.OrdinalIgnoreCase) || query.Contains("b-roll", StringComparison.OrdinalIgnoreCase);
+        var required = generic || wanted.Count < 2 ? 1 : 2;
         return entries.Where(Usable)
             .Select(x => (Entry: x, Overlap: Tokens(x.Title).Count(wanted.Contains)))
+            .Where(x => x.Overlap >= required)
             .OrderByDescending(x => x.Overlap).ThenBy(x => x.Entry.Order)
             .Take(take).Select(x => x.Entry).ToList();
     }
@@ -317,7 +326,12 @@ public static class BrollCandidates
     /// <summary>Scripted and re-edited video. A drama scene or a sketch is not footage of anything that happened,
     /// and skit and reaction channels burn their own captions over the picture, which fights the clip's captions.</summary>
     private static readonly Regex Scripted = new(
-        @"\b(s\d{1,2}\s?ep?\d{1,2}|season\s+\d+|episode\s+\d+|full\s+episode|movie|film|trailer|scene|sitcom|sketch|skit|parody|reaction|reacts|dhar\s+mann|snl)\b",
+        @"\b(s\d{1,2}\s?ep?\d{1,2}|season\s+\d+|episode\s+\d+|full\s+episode|movie|movies|film|trailer|scene|sitcom|sketch|skit|parody|reaction|reacts|dhar\s+mann|snl|movieclips|official\s+clip)\b|\((19|20)\d{2}\)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>Film studios and their clip channels: a Rocky scene came through under a title with no "movie" in it.</summary>
+    private static readonly Regex FilmChannels = new(
+        @"movieclips|netflix|hbo|warner|paramount|sony pictures|universal pictures|rotten tomatoes|filmselect|lionsgate|\bmgm\b|disney|prime video",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static bool Usable(BrollSearchEntry entry) =>
@@ -325,6 +339,7 @@ public static class BrollCandidates
         && entry.LiveStatus is not ("is_live" or "is_upcoming" or "post_live")
         && !entry.Title.Contains("#shorts", StringComparison.OrdinalIgnoreCase)
         && !Scripted.IsMatch(entry.Title)
+        && !(entry.Channel is { } studio && FilmChannels.IsMatch(studio))
         // The channel's own shorts are the edits being copied, never source footage.
         && !(entry.Channel is { } channel && Regex.IsMatch(Regex.Replace(channel.ToLowerInvariant(), "[^a-z0-9]", string.Empty), "doub(le|l3)coverage"));
 

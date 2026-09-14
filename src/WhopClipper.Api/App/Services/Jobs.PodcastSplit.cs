@@ -464,9 +464,13 @@ public sealed partial class JobExecutionService
             - Name the real people and events: "Kobe Bryant game winner vs Bucks 2009", "Nate Diaz Ultimate Fighter 5
               finale", "Dana White press conference". Real game and fight highlights, press conferences, interviews,
               news clips and official music videos are what the channel uses.
+            - Every query about a person contains that person's full name. When the guest talks about himself - his
+              fights, his career, what he will do to someone - search for his own real footage by name, for example
+              "Teofimo Lopez knockout highlights". When he talks about another athlete, search for that athlete by name.
             - For an idea with no specific footage - a car dealership, counting cash, a mansion - search for plain
               real-world footage and end the query with "b roll", for example "luxury car dealership b roll".
-            - Never movies, TV shows, sketches, skits, reaction videos or anything with its own captions on screen,
+            - Never movies or film scenes (Rocky, Creed and the like), TV shows, sketches, skits, reaction videos,
+              studio desk shows, or anything with its own captions on screen,
               and never the podcast itself or its guests sitting in the studio.
             The first moment starts at 0 and the moments cover the whole clip, about one every two or three seconds.
             emphasis: at most five words a viewer should notice - a name, a number, the punch word - set in italics.

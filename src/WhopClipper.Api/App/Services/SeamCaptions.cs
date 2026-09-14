@@ -76,6 +76,7 @@ public static partial class CaptionBuilder
                 ? Math.Max(0, tokens[index].Start)
                 : Math.Max(tokens[index].Start, starts[index - 1] + MinimumWordSeconds);
 
+        var italicised = new HashSet<string>(StringComparer.Ordinal);
         for (var index = 0; index < tokens.Count; index++)
         {
             var start = starts[index];
@@ -88,7 +89,7 @@ public static partial class CaptionBuilder
 
             var text = Escape(Censor(tokens[index].Word).ToUpperInvariant());
             // The override tags go on after escaping, or Escape would neutralise them.
-            if (IsEmphasis(tokens[index].Word, emphasised)) text = "{\\i1}" + text + "{\\i0}";
+            if (IsEmphasis(tokens[index].Word, emphasised, italicised)) text = "{\\i1}" + text + "{\\i0}";
             builder.Append(CultureInfo.InvariantCulture,
                 $"Dialogue: 0,{Stamp(start)},{Stamp(end)},Caption,,0,0,0,{text}\n");
         }
@@ -135,9 +136,17 @@ public static partial class CaptionBuilder
         return merged;
     }
 
-    private static bool IsEmphasis(string token, HashSet<string> emphasised) =>
-        token.Any(char.IsDigit) ||
-        token.Split(' ', StringSplitOptions.RemoveEmptyEntries).Any(part => emphasised.Contains(NormaliseForMatch(part)));
+    /// <summary>
+    /// Numbers are always set in italics. A chosen word is italic only the first time it is said: the
+    /// first rebuilt clip put 22 of its 105 captions in italics because repeated words kept qualifying,
+    /// and emphasis on every repeat stops meaning anything.
+    /// </summary>
+    private static bool IsEmphasis(string token, HashSet<string> emphasised, HashSet<string> italicised)
+    {
+        if (token.Any(char.IsDigit)) return true;
+        var parts = token.Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(NormaliseForMatch).ToList();
+        return parts.Any(emphasised.Contains) && italicised.Add(string.Join(' ', parts));
+    }
 
     private static string NormaliseForMatch(string value) =>
         new(value.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
