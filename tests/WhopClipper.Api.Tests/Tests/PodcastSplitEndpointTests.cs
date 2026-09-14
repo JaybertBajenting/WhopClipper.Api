@@ -73,6 +73,27 @@ public sealed class PodcastSplitEndpointTests
         Assert.Equal(478.3, story.Pieces[0].StartSeconds);
     }
 
+    /// <summary>
+    /// During a session limit every B-roll plan failed and the clips rendered from a title search, eleven
+    /// with no footage at all. An outage has to fail the story instead; a bad plan may still fall back.
+    /// </summary>
+    [Theory]
+    [InlineData("Claude is not available: You've hit your session limit · resets 6:50am (Asia/Manila)", true)]
+    [InlineData("Claude failed (exit 1). rate_limit_error", true)]
+    [InlineData("Claude returned nothing matching the schema. The CLI produced no output.", false)]
+    public void AnAiOutageFailsTheStoryInsteadOfShippingTitleOnlyFootage(string message, bool outage)
+    {
+        Assert.Equal(outage, JobExecutionService.IsProviderOutage(new InvalidOperationException(message)));
+    }
+
+    [Fact]
+    public void TheTitleFallbackSearchesWordsNotEmoji()
+    {
+        Assert.Equal("How Ohtani secretly saved his teammate’s family",
+            JobExecutionService.SearchableTitle("How Ohtani secretly saved his teammate’s family 😳"));
+        Assert.Equal("When MJ LT Golfed for $38K", JobExecutionService.SearchableTitle("When MJ & LT Golfed for $38K ⛳️"));
+    }
+
     /// <summary>Plans stored before the style existed carry no podcast-split block and must still load.</summary>
     [Fact]
     public void PlanExtrasFromBeforeTheStyleStillParse()

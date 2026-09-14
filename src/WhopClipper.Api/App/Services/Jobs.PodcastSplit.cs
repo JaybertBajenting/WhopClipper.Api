@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using WhopClipper.Api.App.Contracts;
 using WhopClipper.Api.App.Domain;
@@ -240,18 +241,33 @@ public sealed partial class JobExecutionService
     {
         if (story.EpisodePieces.Count == 0) throw new InvalidOperationException($"“{story.Title}” has no pieces.");
 
-        // Only the minutes this story spans, with a little either side for the keyframe to land in.
+        // Only the minutes this story spans, with a little either side for the keyframe to land in. An
+        // episode already on disk - downloaded for an earlier run of the campaign - is used in place: no
+        // download, and its clock is the episode's own. HLS sections of one episode crashed FFmpeg twice
+        // while that same episode sat in the source folder.
         var spanStart = Math.Max(0, story.EpisodePieces.Min(x => x.Start) - SpanPaddingSeconds);
         var spanEnd = story.EpisodePieces.Max(x => x.End) + SpanPaddingSeconds;
-        diskSpace.EnsureRoomForBytes((long)((spanEnd - spanStart) * 500_000), story.Title);
-        var spanPath = await DownloadSectionAsync(source.Url, spanStart, spanEnd, clipDirectory, "span", 1080, true, cancellationToken);
+        var localEpisode = string.IsNullOrWhiteSpace(source.LocalRelativePath) ? null : workspace.ResolveRelative(source.LocalRelativePath);
+        string spanPath;
+        (double Start, double End)? transcribeWindow = null;
+        if (localEpisode is not null && File.Exists(localEpisode))
+        {
+            spanPath = localEpisode;
+            transcribeWindow = (spanStart, spanEnd);
+        }
+        else
+        {
+            diskSpace.EnsureRoomForBytes((long)((spanEnd - spanStart) * 500_000), story.Title);
+            spanPath = await DownloadSectionAsync(source.Url, spanStart, spanEnd, clipDirectory, "span", 1080, true, cancellationToken);
+        }
         var video = await ProbeVideoAsync(spanPath, cancellationToken);
 
         // Exact words on the span's own clock, then where the span really sits on the episode clock.
-        var spanWords = await TranscribeSpanAsync(spanPath, Path.Combine(clipDirectory, "span.words.json"), video, cancellationToken);
+        var spanWords = await TranscribeSpanAsync(spanPath, Path.Combine(clipDirectory, "span.words.json"), video,
+            transcribeWindow, cancellationToken);
         var reference = episode.Words.Where(x => x.Start >= spanStart - 20 && x.Start <= spanEnd + 20).ToList();
         var aligned = TranscriptAligner.EstimateOffset(reference, spanWords);
-        var offset = aligned?.Offset ?? spanStart;
+        var offset = aligned?.Offset ?? (transcribeWindow is null ? spanStart : 0);
         if (aligned is null)
             logger.LogWarning("Could not align the span for {Title}; assuming it starts at the requested {Start:0.0}s", story.Title, spanStart);
 
@@ -320,7 +336,8 @@ public sealed partial class JobExecutionService
                 WorkspaceService.EnsureInside(directory, path);
                 return path;
             }
-            if (!last.StandardError.Contains("format is not available", StringComparison.OrdinalIgnoreCase)) break;
+            // Any HLS failure - a missing format, or FFmpeg dying part way through a section - gets one
+            // attempt through the ordinary formats before the story is given up.
         }
         throw new InvalidOperationException(
             $"Could not download {start:0}-{end:0}s of {url}. {(last?.TimedOut == true ? "The download timed out." : Tail(last?.StandardError))}");
@@ -364,15 +381,22 @@ public sealed partial class JobExecutionService
     }
 
     private async Task<IReadOnlyList<TranscriptWord>> TranscribeSpanAsync(string spanPath, string outputPath, VideoProbe video,
-        CancellationToken cancellationToken)
+        (double Start, double End)? window, CancellationToken cancellationToken)
     {
         var script = ResolveScript("transcribe.py");
         var python = string.IsNullOrWhiteSpace(options.Value.PythonPath) ? "python" : options.Value.PythonPath!;
-        var result = await processRunner.RunAsync(new ProcessInvocation(python,
-            [script, spanPath, outputPath, "--model", options.Value.WhisperModel, "--ffmpeg", options.Value.FfmpegPath,
-                "--chunk-seconds", options.Value.TranscriptionChunkSeconds.ToString(Invariant)],
-            Path.GetDirectoryName(spanPath)!, Timeout: TranscriptionTimeout(video.DurationSeconds, options.Value.ProcessTimeoutMinutes)),
-            cancellationToken);
+        var arguments = new List<string>
+        {
+            script, spanPath, outputPath, "--model", options.Value.WhisperModel, "--ffmpeg", options.Value.FfmpegPath,
+            "--chunk-seconds", options.Value.TranscriptionChunkSeconds.ToString(Invariant)
+        };
+        // A whole episode on disk is transcribed across this story's minutes only; transcribe.py keeps the
+        // words on the file's own clock.
+        if (window is { } range)
+            arguments.AddRange(["--start", range.Start.ToString("0.###", Invariant), "--end", range.End.ToString("0.###", Invariant)]);
+        var seconds = window is { } span ? span.End - span.Start : video.DurationSeconds;
+        var result = await processRunner.RunAsync(new ProcessInvocation(python, arguments, Path.GetDirectoryName(outputPath)!,
+            Timeout: TranscriptionTimeout(seconds, options.Value.ProcessTimeoutMinutes)), cancellationToken);
         EnsureSuccess(result, "faster-whisper transcription of the section");
         var transcript = File.Exists(outputPath)
             ? CaptionBuilder.ReadTranscript(await File.ReadAllTextAsync(outputPath, cancellationToken))
@@ -380,7 +404,8 @@ public sealed partial class JobExecutionService
         if (transcript is not { Words.Count: > 0 })
             throw new InvalidOperationException("No speech was found in the downloaded section.");
         // Whisper's clock starts at the first audio sample; FFmpeg's -ss counts from the file start.
-        return video.AudioLead <= 0.001
+        // A windowed transcription seeks the file, so its words already sit on the file's clock.
+        return video.AudioLead <= 0.001 || window is not null
             ? transcript.Words
             : transcript.Words.Select(x => new TranscriptWord(x.Start + video.AudioLead, x.End + video.AudioLead, x.Word)).ToList();
     }
@@ -459,12 +484,28 @@ public sealed partial class JobExecutionService
             if (StoryParser.ParseBrollPlan(element, clipSeconds) is { } plan) return plan;
             logger.LogWarning("The B-roll plan for {Title} had no usable moments; searching on the title instead.", story.Title);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !IsProviderOutage(ex))
         {
             logger.LogWarning(ex, "B-roll planning failed for {Title}; searching on the title instead.", story.Title);
         }
-        return new BrollPlan([new BrollMoment(0, clipSeconds, story.Title)], []);
+        return new BrollPlan([new BrollMoment(0, clipSeconds, SearchableTitle(story.Title))], []);
     }
+
+    /// <summary>
+    /// The AI being unavailable - a usage limit, an expired login, a timeout - is no reason to ship a clip
+    /// whose footage came from one search on its title. Eleven of the first 23 recreations rendered with no
+    /// footage at all that way during a session limit, so an outage fails the story and it can be queued
+    /// again. Only a plan that came back empty or unusable falls back to the title.
+    /// </summary>
+    internal static bool IsProviderOutage(Exception exception) =>
+        exception is TimeoutException
+        || exception.Message.Contains("is not available", StringComparison.OrdinalIgnoreCase)
+        || exception.Message.Contains("limit", StringComparison.OrdinalIgnoreCase)
+        || exception.Message.Contains("overloaded", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>A title as a search: emoji and punctuation only narrow the results to nothing.</summary>
+    internal static string SearchableTitle(string title) =>
+        string.Join(' ', Regex.Split(title, @"[^\p{L}\p{N}'’$]+").Where(x => x.Length > 0));
 
     private async Task<(IReadOnlyList<BrollShotDto> Shots, IReadOnlyList<BrollGapDto> Gaps)> FindBrollAsync(
         IReadOnlyList<BrollMoment> moments, double clipSeconds, double shotSeconds, string clipDirectory,
