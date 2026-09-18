@@ -13,7 +13,8 @@ public sealed class PodcastSplitRenderTests
     private static readonly string Root = Path.GetTempPath();
 
     private static FfmpegPodcastSplitSpec Spec(IReadOnlyList<FfmpegBrollShot>? broll = null,
-        FfmpegLogoOverlay? logo = null, string? music = null, IReadOnlyList<FfmpegTopShot>? top = null) => new(
+        FfmpegLogoOverlay? logo = null, string? music = null, IReadOnlyList<FfmpegTopShot>? top = null,
+        double musicStart = 0) => new(
         Path.Combine(Root, "span.mp4"), 1920, 1080, Path.Combine(Root, "out.mp4"), 30, 20,
         top ??
         [
@@ -26,7 +27,7 @@ public sealed class PodcastSplitRenderTests
             new FfmpegBrollShot(Path.Combine(Root, "b.mp4"), 0, 4.5, new PixelRect(100, 0, 810, 720), 1280, 720,
                 [new PixelRect(20, 800, 200, 80)]),
         ],
-        Path.Combine(Root, "captions.ass"), music, 0.3, -10, logo);
+        Path.Combine(Root, "captions.ass"), music, 0.3, -10, logo, MusicStartSeconds: musicStart);
 
     private static string Graph(IReadOnlyList<string> args) => args[args.ToList().IndexOf("-filter_complex") + 1];
 
@@ -76,14 +77,9 @@ public sealed class PodcastSplitRenderTests
     }
 
     [Fact]
-    public void WithNoFootageTheBottomHalfIsABlurredCopyNotABlackHole()
+    public void MissingRequiredFootageIsRejectedInsteadOfDuplicatingTheCamera()
     {
-        var graph = Graph(FfmpegArgumentBuilder.BuildPodcastSplit(Spec(broll: [])));
-
-        Assert.Contains("[top]split=2[topmain][topcopy]", graph);
-        Assert.Contains("boxblur=", graph);
-        Assert.Contains("[topmain]pad=1080:1920:0:0:color=black[bg]", graph);
-        Assert.DoesNotContain("concat=n=0", graph);
+        Assert.Throws<ArgumentException>(() => FfmpegArgumentBuilder.BuildPodcastSplit(Spec(broll: [])));
     }
 
     [Fact]
@@ -95,6 +91,39 @@ public sealed class PodcastSplitRenderTests
         Assert.Contains("[4:a]atrim=0:7,asetpts=PTS-STARTPTS,volume=0.3[musicbase]", graph);
         Assert.Contains("[musicbase][voicekey]sidechaincompress=threshold=0.05:ratio=5:attack=20:release=500[musicducked]", graph);
         Assert.Contains("[voice][musicducked]amix=inputs=2:duration=first:dropout_transition=2,loudnorm=I=-14:TP=-1.5:LRA=11[aout]", graph);
+    }
+
+    /// <summary>
+    /// The usable hook of a track is often minutes in - the guide puts one song's at 2:11 - so the
+    /// song is seeked before it is read. Starting every bed at 0:00 would lay the intro under the clip.
+    /// </summary>
+    [Fact]
+    public void MusicStartsWhereTheSegmentGuideMarksIt()
+    {
+        var song = Path.Combine(Root, "bed.mp3");
+
+        var args = FfmpegArgumentBuilder.BuildPodcastSplit(Spec(music: song, musicStart: 131)).ToList();
+
+        var input = args.LastIndexOf("-i");
+        Assert.Equal(song, args[input + 1]);
+        Assert.Equal(["-ss", "131", "-stream_loop", "-1", "-t", "7", "-i", song], args.Skip(input - 6).Take(8).ToArray());
+    }
+
+    /// <summary>A track the guide does not mention plays from its beginning, exactly as before.</summary>
+    [Fact]
+    public void ASongWithNoSegmentIsNotSeeked()
+    {
+        var args = FfmpegArgumentBuilder.BuildPodcastSplit(Spec(music: Path.Combine(Root, "bed.mp3"))).ToList();
+
+        var input = args.LastIndexOf("-i");
+        Assert.Equal(["-stream_loop", "-1", "-t", "7"], args.Skip(input - 4).Take(4).ToArray());
+    }
+
+    [Fact]
+    public void RejectsASongThatStartsBeforeItsOwnBeginning()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            FfmpegArgumentBuilder.BuildPodcastSplit(Spec(music: Path.Combine(Root, "bed.mp3"), musicStart: -2)));
     }
 
     [Fact]
@@ -314,7 +343,7 @@ public sealed class PodcastSplitSupportTests
 
         var ranked = BrollCandidates.Rank(BrollCandidates.ParseSearch(output), "Kobe Bryant game winner Bucks 2009");
 
-        Assert.Equal(new[] { "aaaaaaaaaaa", "eeeeeeeeeee" }, ranked.Select(x => x.Id));
+        Assert.Equal(new[] { "aaaaaaaaaaa" }, ranked.Select(x => x.Id));
     }
 
     [Fact]
@@ -353,6 +382,150 @@ public sealed class PodcastSplitSupportTests
         Assert.NotNull(claude);
         Assert.NotNull(codex);
         Assert.Null(echoed);
-        Assert.NotNull(StoryParser.ParseBrollPlan(claude!.Value, 10));
+        Assert.NotNull(StoryParser.ParseBrollPlan(claude!.Value, 2));
+    }
+
+    [Theory]
+    [InlineData("Teofimo Lopez knockout highlights", "Mike Tyson knockout highlights")]
+    [InlineData("Kobe Bryant game winner Bucks 2009", "Bucks highlights 2009")]
+    [InlineData("Teofimo Lopez vs Richard Commey knockout", "Teofimo Lopez vs Josh Taylor knockout")]
+    public void SharedFootageWordsNeverSubstituteForTheRequestedPersonOrEvent(string query, string wrongTitle)
+    {
+        var wrong = new BrollSearchEntry("aaaaaaaaaaa", wrongTitle, 300, "Sports", null, 0);
+        Assert.Empty(BrollCandidates.Rank([wrong], query));
+    }
+
+    /// <summary>
+    /// Plans describe the action, but videos are titled after people. Nine of nine Teofimo stories lost
+    /// their footage to queries like these, so a search that comes back short is retried on the names.
+    /// </summary>
+    [Theory]
+    [InlineData("Teofimo Lopez taking body punches fight highlights", "Teofimo Lopez highlights")]
+    [InlineData("Rolando Romero overhand right boxing highlights", "Rolando Romero highlights")]
+    [InlineData("Kobe Bryant game winner vs Bucks 2009", "Kobe Bryant Bucks 2009 highlights")]
+    public void ADescribedSearchFallsBackToTheNamesInIt(string query, string expected)
+    {
+        Assert.Equal(expected, BrollCandidates.Simplify(query));
+    }
+
+    [Theory]
+    [InlineData("luxury car dealership b roll")] // Already generic: there is nothing to strip.
+    [InlineData("counting cash closeup")] // No name to search for.
+    [InlineData("Teofimo Lopez highlights")] // Already the names alone.
+    public void AQueryWithNothingToStripIsNotRetried(string query)
+    {
+        Assert.Null(BrollCandidates.Simplify(query));
+    }
+
+    [Fact]
+    public void TheNamesAloneMatchTheFootageTheDescribedQueryMissed()
+    {
+        var entry = new BrollSearchEntry("bbbbbbbbbbb", "8 MINUTES OF TEOFIMO LOPEZ HIGHLIGHTS", 480, "Boxing", null, 0);
+        const string described = "Teofimo Lopez pull counter defensive boxing highlights";
+
+        Assert.Empty(BrollCandidates.Rank([entry], described));
+        Assert.Single(BrollCandidates.Rank([entry], BrollCandidates.Simplify(described)!));
+    }
+
+    [Theory]
+    [InlineData(1, 10)] // Missing opening.
+    [InlineData(0, 9)]  // Missing ending.
+    public void PartialSemanticPlansAreRejected(double start, double end)
+    {
+        var root = JsonSerializer.SerializeToElement(new
+        {
+            moments = new[] { new { startSeconds = start, endSeconds = end, query = "Teofimo Lopez highlights" } },
+            emphasis = Array.Empty<string>()
+        });
+        Assert.Null(StoryParser.ParseBrollPlan(root, 10));
+    }
+
+    [Fact]
+    public void MissingSemanticMiddleCannotBeFilledByCarryingThePreviousSubject()
+    {
+        using var root = JsonDocument.Parse("""
+            {"moments":[
+              {"startSeconds":0,"endSeconds":3,"query":"Teofimo Lopez highlights"},
+              {"startSeconds":5,"endSeconds":10,"query":"Ryan Garcia highlights"}
+            ],"emphasis":[]}
+            """);
+        Assert.Null(StoryParser.ParseBrollPlan(root.RootElement, 10));
+    }
+}
+
+public sealed class BrollCleanAllocatorTests
+{
+    [Fact]
+    public void ASlotSpansSeveralCleanIntervalsWithoutReadingTheExcludedFramesBetweenThem()
+    {
+        var allocation = BrollCleanAllocator.Allocate([new BrollSlot(0, 2.2, 0, "Teofimo Lopez")],
+            [new BrollCleanStretch(0, 0.5, 1.3), new BrollCleanStretch(1, 4, 3)]);
+
+        Assert.Empty(allocation.Gaps);
+        Assert.Equal(2, allocation.Takes.Count);
+        Assert.Equal(1.3, allocation.Takes[0].DurationSeconds, 6);
+        Assert.Equal(4, allocation.Takes[1].InSeconds, 6);
+        Assert.Equal(0.9, allocation.Takes[1].DurationSeconds, 6);
+        Assert.Equal(2.2, allocation.Takes.Sum(x => x.DurationSeconds), 6);
+    }
+
+    [Fact]
+    public void InsufficientFootageRemainsAnExplicitGapAndBlocksRendering()
+    {
+        var allocation = BrollCleanAllocator.Allocate([new BrollSlot(5, 2.2, 1, "Ryan Garcia")],
+            [new BrollCleanStretch(0, 0.5, 1.3)]);
+
+        var gap = Assert.Single(allocation.Gaps);
+        Assert.Equal(6.3, gap.AtSeconds, 6);
+        Assert.Equal(0.9, gap.DurationSeconds, 6);
+        Assert.Equal("Ryan Garcia", gap.Query);
+        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(allocation.Takes.Count,
+            allocation.Gaps.Sum(x => x.DurationSeconds), clipSeconds: 2));
+    }
+
+    /// <summary>
+    /// A second or two nothing could be found for holds the neighbouring shot instead of losing the
+    /// clip, which is what Matthew asked for after nine of nine stories failed on gaps of 1.5 to 4
+    /// seconds. Beyond a sixth of the clip the footage no longer illustrates what is said, so it fails.
+    /// </summary>
+    [Fact]
+    public void ASecondOrTwoWithoutFootageIsHeldButAThirdOfTheClipIsNot()
+    {
+        BrollCleanAllocator.RequireComplete(shotCount: 8, gapSeconds: 4, clipSeconds: 30);
+
+        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(8, 10, 30));
+    }
+
+    [Fact]
+    public void ConsecutiveSlotsConsumeEachCleanFrameAtMostOnce()
+    {
+        var allocation = BrollCleanAllocator.Allocate(
+            [new BrollSlot(0, 2.2, 0, "a"), new BrollSlot(2.2, 2.2, 0, "a")],
+            [new BrollCleanStretch(0, 1, 3), new BrollCleanStretch(1, 6, 2)]);
+
+        Assert.Empty(allocation.Gaps);
+        Assert.Equal(4.4, allocation.Takes.Sum(x => x.DurationSeconds), 6);
+        Assert.All(allocation.Takes.Where(x => x.StretchIndex == 0), x => Assert.True(x.InSeconds + x.DurationSeconds <= 4.000001));
+        Assert.All(allocation.Takes.Where(x => x.StretchIndex == 1), x => Assert.True(x.InSeconds + x.DurationSeconds <= 8.000001));
+        Assert.Equal(3.2, allocation.Takes[1].InSeconds, 6);
+    }
+
+    [Fact]
+    public void TinyCleanRemaindersDoNotCreateInvalidSubFrameShots()
+    {
+        var allocation = BrollCleanAllocator.Allocate([new BrollSlot(0, 2.2, 0, "a")],
+            [new BrollCleanStretch(0, 0, 2.18), new BrollCleanStretch(1, 5, 1)]);
+
+        Assert.Empty(allocation.Gaps);
+        Assert.All(allocation.Takes, x => Assert.True(x.DurationSeconds >= 0.059999));
+        Assert.Equal(2.2, allocation.Takes.Sum(x => x.DurationSeconds), 6);
+        Assert.True(allocation.Takes[0].InSeconds + allocation.Takes[0].DurationSeconds <= 2.18);
+    }
+
+    [Fact]
+    public void EmptyFootageCannotPassEvenWithAnEmptyGapList()
+    {
+        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(0, 0, 20));
+        BrollCleanAllocator.RequireComplete(1, 0, 20);
     }
 }

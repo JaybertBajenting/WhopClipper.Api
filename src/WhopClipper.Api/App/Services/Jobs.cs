@@ -1238,6 +1238,7 @@ public sealed class MediaLibraryService(AppDbContext db)
         {
             var root = Path.GetFullPath(location.Path);
             if (!Directory.Exists(root)) continue;
+            var guide = await MusicSegmentGuide.ReadAsync(root, cancellationToken);
             foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).Where(x => SupportedExtensions.Contains(Path.GetExtension(x))))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1251,6 +1252,12 @@ public sealed class MediaLibraryService(AppDbContext db)
                 }
                 existing.SizeBytes = file.Length;
                 existing.ContentHash = await WorkspaceService.HashFileAsync(path, cancellationToken);
+                // A track the guide does not mention keeps its nulls and plays from the top.
+                if (guide.TryGetValue(file.Name, out var segment))
+                {
+                    existing.SegmentStartSeconds = segment.StartSeconds;
+                    existing.SegmentEndSeconds = segment.EndSeconds;
+                }
                 existing.IndexedAt = DateTimeOffset.UtcNow;
                 count++;
             }

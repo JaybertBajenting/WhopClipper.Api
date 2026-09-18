@@ -25,7 +25,7 @@ public static class EditStyles
 public sealed record CampaignEditStyleDto(string Style = EditStyles.Streamer, double MusicVolume = 0.3,
     double MusicDuckingDb = -10, string CaptionFont = "Segoe UI Black", int CaptionFontSize = 84,
     double LogoWidthFraction = 0.2, double LogoRightMarginFraction = 0.074, double LogoTopMarginFraction = 0.071,
-    double BrollShotSeconds = 2.2);
+    double BrollShotSeconds = 2.2, Guid? MusicLocationId = null);
 
 public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 

@@ -121,7 +121,7 @@ public sealed record ZoomPunchDto(double AtSeconds, double DurationSeconds = 0.5
 public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, string? SubtitleStyle,
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects, IReadOnlyList<OverlayDto> Overlays,
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
-    PodcastSplitPlanDto? PodcastSplit = null);
+    PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,
@@ -153,7 +153,8 @@ public sealed record UpdateMediaAssetRequest(string[]? Tags, string? Mood, strin
 public sealed record MediaLocationDto(Guid Id, string Path, MediaAssetKind Kind, bool Enabled, DateTimeOffset CreatedAt);
 public sealed record MediaAssetDto(Guid Id, Guid LocationId, string FileName, MediaAssetKind Kind, long SizeBytes,
     string ContentHash, double? DurationSeconds, string[] Tags, string? Mood, string? Energy, string? Genre,
-    double? Bpm, bool Favorite, string? LicenseNotes, DateTimeOffset IndexedAt);
+    double? Bpm, bool Favorite, string? LicenseNotes, DateTimeOffset IndexedAt,
+    double? SegmentStartSeconds = null, double? SegmentEndSeconds = null);
 public sealed record UpdateSettingsRequest(string WorkspaceRoot, string YtDlpPath, string FfmpegPath,
     string FfprobePath, string ClaudePath, string CodexPath, int ProcessTimeoutMinutes,
     AiMode DefaultAiMode = AiMode.Compare, int MaxConcurrentMediaJobs = 1, bool RequireEditApproval = true,
@@ -435,5 +436,6 @@ public static class ApiMappings
 
     public static MediaAssetDto ToDto(this MediaLibraryAsset value) => new(value.Id, value.LocationId, value.FileName,
         value.Kind, value.SizeBytes, value.ContentHash, value.DurationSeconds, JsonDefaults.Parse(value.TagsJson, Array.Empty<string>()),
-        value.Mood, value.Energy, value.Genre, value.Bpm, value.IsFavorite, value.LicenseNotes, value.IndexedAt);
+        value.Mood, value.Energy, value.Genre, value.Bpm, value.IsFavorite, value.LicenseNotes, value.IndexedAt,
+        value.SegmentStartSeconds, value.SegmentEndSeconds);
 }

@@ -478,6 +478,12 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<string>("Mood")
                         .HasColumnType("text");
 
+                    b.Property<double?>("SegmentEndSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("SegmentStartSeconds")
+                        .HasColumnType("double precision");
+
                     b.Property<long>("SizeBytes")
                         .HasColumnType("bigint");
 

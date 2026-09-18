@@ -67,9 +67,13 @@ public sealed partial class JobExecutionService
 
         var profile = await db.PlatformProfiles.AsNoTracking()
             .SingleOrDefaultAsync(x => x.CampaignId == campaignId && x.Platform == payload.Platform, cancellationToken);
-        var music = await db.MediaLibraryAssets.AsNoTracking()
-            .Where(x => x.Location.Enabled && x.Kind == MediaAssetKind.Music)
-            .OrderBy(x => x.FileName).ToListAsync(cancellationToken);
+        // A campaign can name its own folder of beds; without one it draws from every enabled folder,
+        // which is how the streamer style has always worked.
+        var musicQuery = db.MediaLibraryAssets.AsNoTracking()
+            .Where(x => x.Location.Enabled && x.Kind == MediaAssetKind.Music);
+        if (style.MusicLocationId is { } musicLocationId)
+            musicQuery = musicQuery.Where(x => x.LocationId == musicLocationId);
+        var music = await musicQuery.OrderBy(x => x.FileName).ToListAsync(cancellationToken);
 
         var clips = new List<object>();
         var failures = 0;
@@ -280,10 +284,12 @@ public sealed partial class JobExecutionService
         var topShots = await FrameCameraAsync(spanPath, pieces, video, clipDirectory, cancellationToken);
         var brollPlan = await PlanBrollAsync(campaignId, payload.Mode, source, story, clipWords, clipSeconds, cancellationToken);
         var (broll, gaps) = await FindBrollAsync(brollPlan.Moments, clipSeconds, style.BrollShotSeconds, clipDirectory, cancellationToken);
-        // With no footage at all the bottom half is only a blurred copy of the camera, which is not the style.
-        if (broll.Count == 0)
-            throw new InvalidOperationException($"No B-roll could be downloaded for “{story.Title}”, so it was not rendered. "
-                + string.Join(" ", gaps.Select(x => x.Reason).Distinct()));
+        // Retain the exact failed searches/times even when media is released and no edit plan is
+        // created. Required footage may not be replaced by an unrelated adjacent shot.
+        await File.WriteAllTextAsync(Path.Combine(clipDirectory, "broll-review.json"),
+            JsonSerializer.Serialize(new { story.Title, brollPlan.Moments, shots = broll, gaps }, JsonDefaults.Serializer),
+            cancellationToken);
+        BrollCleanAllocator.RequireComplete(broll.Count, gaps.Sum(x => x.DurationSeconds), clipSeconds);
 
         var split = new PodcastSplitPlanDto(workspace.ToRelative(spanPath), video.Width, video.Height,
             pieces.Select(x => new StoryPieceDto(Math.Round(x.Start, 3), Math.Round(x.End, 3))).ToList(),
@@ -293,6 +299,9 @@ public sealed partial class JobExecutionService
             Math.Round(offset, 3), story.Title);
 
         var episodeStart = Math.Max(0, pieces[0].Start + offset);
+        // One song per clip, rotating through the library so a batch does not repeat itself, and each
+        // one starting where the folder's segment guide puts its hook.
+        var track = music.Count == 0 ? null : music[index % music.Count];
         return new EditPlan
         {
             CampaignId = campaignId, SourceAssetId = source.Id, Platform = payload.Platform,
@@ -300,12 +309,13 @@ public sealed partial class JobExecutionService
             Width = FfmpegArgumentBuilder.SplitWidth, Height = FfmpegArgumentBuilder.SplitHeight,
             FramesPerSecond = video.FramesPerSecond, Crf = 20, NormalizeAudio = true,
             BurnSubtitles = profile?.BurnSubtitles ?? true,
-            MusicAssetId = music.Count == 0 ? null : music[index % music.Count].Id,
+            MusicAssetId = track?.Id,
             MusicVolume = style.MusicVolume,
             OutputFileName = WorkspaceService.SafeFileName(story.Title, $"story-{index + 1:00}") + ".mp4",
             IsApproved = true,
             ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(EditStyles.PodcastSplit, null, "Seam",
-                style.MusicDuckingDb, [], [], PodcastSplit: split), JsonDefaults.Serializer)
+                style.MusicDuckingDb, [], [], PodcastSplit: split, MusicStartSeconds: track?.SegmentStartSeconds),
+                JsonDefaults.Serializer)
         };
     }
 
@@ -471,6 +481,11 @@ public sealed partial class JobExecutionService
             - Every query about a person contains that person's full name. When the guest talks about himself - his
               fights, his career, what he will do to someone - search for his own real footage by name, for example
               "Teofimo Lopez knockout highlights". When he talks about another athlete, search for that athlete by name.
+            - Keep every query searchable: the names, and at most one word for the kind of footage (highlights,
+              knockout, fight, interview, training, press conference). Videos are titled after people and events, so a
+              described action - "overhand right", "pull counter", "taking body punches" - matches no real title and
+              loses the moment. Write "Rolando Romero knockout highlights", never "Rolando Romero overhand right boxing
+              highlights". Several moments in a row may share one query.
             - For an idea with no specific footage - a car dealership, counting cash, a mansion - search for plain
               real-world footage and end the query with "b roll", for example "luxury car dealership b roll".
             - Never movies or film scenes (Rocky, Creed and the like), TV shows, sketches, skits, reaction videos,
@@ -490,20 +505,20 @@ public sealed partial class JobExecutionService
             var element = await RunStructuredAiAsync(campaignId, "broll", mode, prompt, StorySchemas.Broll,
                 x => x.TryGetProperty("moments", out _), cancellationToken);
             if (StoryParser.ParseBrollPlan(element, clipSeconds) is { } plan) return plan;
-            logger.LogWarning("The B-roll plan for {Title} had no usable moments; searching on the title instead.", story.Title);
+            throw new InvalidOperationException($"The B-roll plan for “{story.Title}” contains no usable moments.");
         }
         catch (Exception ex) when (ex is not OperationCanceledException && !IsProviderOutage(ex))
         {
-            logger.LogWarning(ex, "B-roll planning failed for {Title}; searching on the title instead.", story.Title);
+            throw new InvalidOperationException($"B-roll planning failed for “{story.Title}”. " +
+                "A valid moment-by-moment footage plan is required; the clip was not rendered.", ex);
         }
-        return new BrollPlan([new BrollMoment(0, clipSeconds, SearchableTitle(story.Title))], []);
     }
 
     /// <summary>
     /// The AI being unavailable - a usage limit, an expired login, a timeout - is no reason to ship a clip
     /// whose footage came from one search on its title. Eleven of the first 23 recreations rendered with no
     /// footage at all that way during a session limit, so an outage fails the story and it can be queued
-    /// again. Only a plan that came back empty or unusable falls back to the title.
+    /// again. Empty or unusable plans also fail: a title-only search cannot establish per-moment relevance.
     /// </summary>
     internal static bool IsProviderOutage(Exception exception) =>
         exception is TimeoutException
@@ -523,7 +538,7 @@ public sealed partial class JobExecutionService
         var brollDirectory = Path.Combine(clipDirectory, "broll");
         Directory.CreateDirectory(brollDirectory);
         var usedVideos = new HashSet<string>(StringComparer.Ordinal);
-        var placed = new List<(BrollSlot Slot, BrollShotDto? Shot)>();
+        var placed = new List<(double At, BrollShotDto? Shot, double GapSeconds)>();
         var gaps = new List<BrollGapDto>();
 
         foreach (var group in slots.GroupBy(x => x.MomentIndex))
@@ -534,44 +549,34 @@ public sealed partial class JobExecutionService
             // Moving footage first; a still photo only fills in once the moving shots run out.
             var stretches = probes.OrderBy(x => x.Still)
                 .SelectMany(p => p.Shots.Select(s => (Probe: p, s.In, s.Duration))).ToList();
-            var cursor = 0;
-            var consumed = 0.0;
-            foreach (var slot in needed)
+            var allocation = BrollCleanAllocator.Allocate(needed, stretches.Select((s, i) =>
+                new BrollCleanStretch(i, s.In, s.Duration)).ToList());
+            foreach (var take in allocation.Takes)
             {
-                BrollShotDto? shot = null;
-                while (cursor < stretches.Count)
-                {
-                    var stretch = stretches[cursor];
-                    var remaining = stretch.Duration - consumed;
-                    if (remaining >= Math.Min(slot.DurationSeconds, 1.2))
-                    {
-                        shot = new BrollShotDto(workspace.ToRelative(stretch.Probe.Path), Math.Round(stretch.In + consumed, 3),
-                            slot.DurationSeconds, stretch.Probe.Crop, stretch.Probe.Width, stretch.Probe.Height,
-                            stretch.Probe.Blur, slot.Query, stretch.Probe.Source.Url, stretch.Probe.Source.Title);
-                        consumed += slot.DurationSeconds;
-                        if (stretch.Duration - consumed < 1.0) { cursor++; consumed = 0; }
-                        break;
-                    }
-                    cursor++;
-                    consumed = 0;
-                }
-                if (shot is null)
-                    gaps.Add(new BrollGapDto(Math.Round(slot.AtSeconds, 3), Math.Round(slot.DurationSeconds, 3), slot.Query,
-                        probes.Count == 0 ? "No usable video came back for this search." : "Not enough clean footage in the results."));
-                placed.Add((slot, shot));
+                var probe = stretches[take.StretchIndex].Probe;
+                placed.Add((take.AtSeconds, new BrollShotDto(workspace.ToRelative(probe.Path), take.InSeconds,
+                    take.DurationSeconds, probe.Crop, probe.Width, probe.Height, probe.Blur, take.Query,
+                    probe.Source.Url, probe.Source.Title), 0));
+            }
+            foreach (var slot in allocation.Gaps)
+            {
+                gaps.Add(new BrollGapDto(Math.Round(slot.AtSeconds, 3), Math.Round(slot.DurationSeconds, 3), slot.Query,
+                    probes.Count == 0 ? "No usable video came back for this search." : "Not enough clean footage in the results."));
+                placed.Add((slot.AtSeconds, null, slot.DurationSeconds));
             }
         }
 
-        // Every second of the clip needs a picture. A slot with nothing is covered by stretching the shot
-        // before it - or the one after, at the very start - and is reported as a gap either way.
+        // A moment whose own footage could not be found holds the shot before it - the one after, at the
+        // very start - rather than costing the clip. It stays in the gap report either way, and
+        // RequireComplete caps how much of a clip may be carried this way.
         var shots = new List<BrollShotDto>();
         var carried = 0.0;
-        foreach (var (slot, shot) in placed)
+        foreach (var (_, shot, gapSeconds) in placed.OrderBy(x => x.At))
         {
             if (shot is null)
             {
-                if (shots.Count > 0) shots[^1] = shots[^1] with { DurationSeconds = shots[^1].DurationSeconds + slot.DurationSeconds };
-                else carried += slot.DurationSeconds;
+                if (shots.Count > 0) shots[^1] = shots[^1] with { DurationSeconds = shots[^1].DurationSeconds + gapSeconds };
+                else carried += gapSeconds;
                 continue;
             }
             shots.Add(carried > 0 ? shot with { DurationSeconds = shot.DurationSeconds + carried } : shot);
@@ -579,7 +584,7 @@ public sealed partial class JobExecutionService
         }
         if (shots.Count > 0)
         {
-            // Floating-point slot maths must still land exactly on the clip length.
+            // Slot arithmetic must still land exactly on the clip length, or the halves drift apart.
             var drift = clipSeconds - shots.Sum(x => x.DurationSeconds);
             shots[^1] = shots[^1] with { DurationSeconds = shots[^1].DurationSeconds + drift };
         }
@@ -590,7 +595,22 @@ public sealed partial class JobExecutionService
     /// Held to the 5 GB floor, a drive at 2.3 GB free refused every probe and the clips rendered with no footage.</summary>
     private const long BrollProbeReserveBytes = 1L * 1024 * 1024 * 1024;
 
+    /// <summary>
+    /// Searches for a moment's footage, and when that comes back short, once more on the names alone.
+    /// A plan query describes the action - "Rolando Romero overhand right boxing highlights" - and no real
+    /// video is titled that, so relevance rejected every result and nine of nine stories lost their footage.
+    /// </summary>
     private async Task<IReadOnlyList<BrollProbe>> ProbeMomentAsync(string query, double secondsNeeded, string brollDirectory,
+        HashSet<string> usedVideos, CancellationToken cancellationToken)
+    {
+        var probes = await ProbeQueryAsync(query, secondsNeeded, brollDirectory, usedVideos, cancellationToken);
+        var collected = probes.Sum(x => x.Shots.Sum(shot => shot.Duration));
+        if (collected >= secondsNeeded + 0.5 || BrollCandidates.Simplify(query) is not { } names) return probes;
+        logger.LogInformation("Footage for {Query} was short; searching again for {Names}", query, names);
+        return [.. probes, .. await ProbeQueryAsync(names, secondsNeeded - collected, brollDirectory, usedVideos, cancellationToken)];
+    }
+
+    private async Task<IReadOnlyList<BrollProbe>> ProbeQueryAsync(string query, double secondsNeeded, string brollDirectory,
         HashSet<string> usedVideos, CancellationToken cancellationToken)
     {
         var search = await processRunner.RunAsync(new ProcessInvocation(options.Value.YtDlpPath,
@@ -714,6 +734,8 @@ public sealed partial class JobExecutionService
     {
         var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)!;
         var split = extras.PodcastSplit!;
+        BrollCleanAllocator.RequireComplete(split.Broll.Count, split.Gaps.Sum(x => x.DurationSeconds),
+            split.TopShots.Sum(x => x.DurationSeconds));
         var spanPath = workspace.ResolveRelative(split.SpanRelativePath);
         if (!File.Exists(spanPath))
             throw new FileNotFoundException(
@@ -741,8 +763,15 @@ public sealed partial class JobExecutionService
         }
 
         string? musicPath = null;
+        var musicStart = 0.0;
         if (plan.MusicAssetId is { } musicId)
-            musicPath = (await ResolveAudioAssetAsync(musicId, MediaAssetKind.Music, cancellationToken)).FullPath;
+        {
+            var track = await ResolveAudioAssetAsync(musicId, MediaAssetKind.Music, cancellationToken);
+            musicPath = track.FullPath;
+            // The plan carries the segment it was built with; the library covers plans made before
+            // the guide existed, or a guide edited since.
+            musicStart = Math.Max(0, extras.MusicStartSeconds ?? track.SegmentStartSeconds ?? 0);
+        }
         var logo = await ResolveBrandingLogoAsync(plan.CampaignId, cancellationToken);
         if (logo is not null) logo = logo with { WidthFraction = style.LogoWidthFraction };
 
@@ -760,7 +789,8 @@ public sealed partial class JobExecutionService
             outputPath, plan.FramesPerSecond, plan.Crf,
             split.TopShots.Select(x => new FfmpegTopShot(x.InSeconds, x.DurationSeconds, ToPixels(x.Crop), x.Blur?.Select(ToPixels).ToList())).ToList(),
             broll, subtitlePath, musicPath, plan.MusicVolume, extras.MusicDuckingDb, logo,
-            style.LogoRightMarginFraction, style.LogoTopMarginFraction, plan.NormalizeAudio, options.Value.EncoderThreads));
+            style.LogoRightMarginFraction, style.LogoTopMarginFraction, plan.NormalizeAudio, options.Value.EncoderThreads,
+            musicStart));
         plan.LastFfmpegArgumentsJson = JsonSerializer.Serialize(args, JsonDefaults.Serializer);
         logger.LogInformation("Render {PlanId} filter graph: {Graph}", plan.Id,
             args.SkipWhile(x => x != "-filter_complex").Skip(1).FirstOrDefault());

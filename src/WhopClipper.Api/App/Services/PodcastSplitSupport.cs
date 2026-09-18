@@ -196,7 +196,16 @@ public static class StoryParser
             if (query is null || query.Length is < 2 or > 120) continue;
             parsed.Add(new BrollMoment(start, Math.Min(end, clipSeconds), query));
         }
-        return parsed.Count == 0 ? null : new BrollPlan(parsed.OrderBy(x => x.StartSeconds).ToList(), ReadStrings(root, "emphasis"));
+        if (parsed.Count == 0) return null;
+        var ordered = parsed.OrderBy(x => x.StartSeconds).ToList();
+        var coveredUntil = 0.0;
+        foreach (var moment in ordered)
+        {
+            // Missing semantic coverage must not silently inherit the last subject's footage.
+            if (moment.StartSeconds > coveredUntil + 0.05) return null;
+            coveredUntil = Math.Max(coveredUntil, moment.EndSeconds);
+        }
+        return coveredUntil < clipSeconds - 0.05 ? null : new BrollPlan(ordered, ReadStrings(root, "emphasis"));
     }
 
     /// <summary>Overlapping pieces become one: the same words twice reads as a stutter.</summary>
@@ -231,6 +240,81 @@ public static class StoryParser
 }
 
 public sealed record BrollSlot(double AtSeconds, double DurationSeconds, int MomentIndex, string Query);
+
+public sealed record BrollCleanStretch(int Index, double InSeconds, double DurationSeconds);
+public sealed record BrollCleanTake(int StretchIndex, double AtSeconds, double InSeconds, double DurationSeconds, string Query);
+public sealed record BrollCleanAllocation(IReadOnlyList<BrollCleanTake> Takes, IReadOnlyList<BrollSlot> Gaps);
+
+/// <summary>Consumes only measured clean intervals. A slot may use several intervals; it must never
+/// read through the excluded frames between them or borrow footage from a different subject.</summary>
+public static class BrollCleanAllocator
+{
+    private const double MinimumShotSeconds = 0.06;
+
+    public static BrollCleanAllocation Allocate(IReadOnlyList<BrollSlot> slots, IReadOnlyList<BrollCleanStretch> stretches)
+    {
+        var takes = new List<BrollCleanTake>();
+        var gaps = new List<BrollSlot>();
+        var cursor = 0;
+        var consumed = 0.0;
+        foreach (var slot in slots)
+        {
+            var needed = slot.DurationSeconds;
+            var at = slot.AtSeconds;
+            while (needed > 0.000001)
+            {
+                if (cursor >= stretches.Count)
+                {
+                    gaps.Add(slot with { AtSeconds = at, DurationSeconds = needed });
+                    break;
+                }
+                var stretch = stretches[cursor];
+                var remaining = stretch.DurationSeconds - consumed;
+                var duration = Math.Min(remaining, needed);
+                // Avoid a sub-frame tail requiring an invalid FFmpeg shot. Leave it for the next
+                // clean interval together with enough neighbouring time to make a real shot.
+                var tail = needed - duration;
+                if (tail > 0.000001 && tail < MinimumShotSeconds)
+                    duration -= MinimumShotSeconds - tail;
+                if (duration < MinimumShotSeconds - 0.000001)
+                {
+                    cursor++;
+                    consumed = 0;
+                    continue;
+                }
+                takes.Add(new BrollCleanTake(stretch.Index, at, stretch.InSeconds + consumed, duration, slot.Query));
+                consumed += duration;
+                at += duration;
+                needed -= duration;
+                if (stretch.DurationSeconds - consumed < MinimumShotSeconds - 0.000001)
+                {
+                    cursor++;
+                    consumed = 0;
+                }
+            }
+        }
+        return new BrollCleanAllocation(takes, gaps);
+    }
+
+    /// <summary>
+    /// How much of a clip may be carried by holding the neighbouring shot a little longer when a
+    /// moment's own footage cannot be found. Matthew chose this over losing the whole clip to a
+    /// second or two; at 30 seconds it is about four and a half, and every gap is still reported.
+    /// </summary>
+    public const double MaximumHeldFraction = 0.15;
+
+    public static void RequireComplete(int shotCount, double gapSeconds, double clipSeconds)
+    {
+        if (shotCount == 0)
+            throw new InvalidOperationException("No B-roll was found for this clip at all. It was not rendered, "
+                + "because the bottom half would only be a blurred copy of the camera.");
+        var allowed = Math.Max(0, clipSeconds) * MaximumHeldFraction;
+        if (gapSeconds > allowed + 0.000001)
+            throw new InvalidOperationException($"Required B-roll is incomplete ({gapSeconds:0.###} seconds uncovered, "
+                + $"and at most {allowed:0.#} may be held from a neighbouring shot). The clip was not rendered; "
+                + "provide relevant footage for those moments and queue the story again.");
+    }
+}
 
 /// <summary>
 /// Splits the bottom half into shots. Each moment the AI picked covers the clip from where it is
@@ -280,6 +364,36 @@ public static class BrollCandidates
         "when", "how", "who", "vs", "video", "footage", "clip",
     };
 
+    // These describe the kind of footage, not its subject. Two matches such as "knockout highlights"
+    // must not make Mike Tyson footage pass a search for Teofimo Lopez.
+    private static readonly HashSet<string> FootageWords = new(StringComparer.Ordinal)
+    {
+        "highlight", "highlights", "knockout", "knockouts", "training", "workout", "workouts",
+        "fight", "fights", "fighting", "boxing", "interview", "interviews", "press", "conference",
+        "game", "games", "winner", "winning", "compilation", "best", "moments", "career", "full",
+        "official", "news", "event", "performance", "practice", "behind", "scenes", "arrives", "arrival",
+    };
+
+    /// <summary>
+    /// The names in a query plus one word for the kind of footage, or null when there is nothing to
+    /// strip. Real videos are titled after people and events, so the descriptive half of a query is
+    /// what makes it match nothing: "Teofimo Lopez taking body punches fight highlights" finds no
+    /// title, while "Teofimo Lopez highlights" finds the fight footage that moment needed.
+    /// </summary>
+    public static string? Simplify(string query)
+    {
+        if (query.Contains("b roll", StringComparison.OrdinalIgnoreCase)
+            || query.Contains("b-roll", StringComparison.OrdinalIgnoreCase)) return null;
+        var words = query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        // A name, or the year of the event, which titles do carry. One capitalised word alone may just
+        // be the start of the phrase, so it takes two to call something a name.
+        var names = words.Where(x => (char.IsUpper(x[0]) && x.Any(char.IsLetter))
+            || (x.Length == 4 && x.All(char.IsDigit))).ToList();
+        if (names.Count(x => char.IsUpper(x[0])) < 2) return null;
+        var simplified = $"{string.Join(' ', names)} highlights";
+        return simplified.Equals(query, StringComparison.OrdinalIgnoreCase) ? null : simplified;
+    }
+
     public static IReadOnlyList<BrollSearchEntry> ParseSearch(string output)
     {
         var entries = new List<BrollSearchEntry>();
@@ -311,8 +425,14 @@ public static class BrollCandidates
         wanted.Remove("roll");
         var generic = query.Contains("b roll", StringComparison.OrdinalIgnoreCase) || query.Contains("b-roll", StringComparison.OrdinalIgnoreCase);
         var required = generic || wanted.Count < 2 ? 1 : 2;
+        var subject = wanted.Where(x => !FootageWords.Contains(x)).ToHashSet(StringComparer.Ordinal);
         return entries.Where(Usable)
-            .Select(x => (Entry: x, Overlap: Tokens(x.Title).Count(wanted.Contains)))
+            .Select(x => (Entry: x, TitleWords: Tokens(x.Title)))
+            // Named searches must retain all subject/event words, including an explicitly requested
+            // opponent or year. If there is no identity information, require manual revision of the
+            // query rather than treating an action-word match as proof of relevance.
+            .Where(x => generic || (subject.Count > 0 && subject.All(x.TitleWords.Contains)))
+            .Select(x => (x.Entry, Overlap: x.TitleWords.Count(wanted.Contains)))
             .Where(x => x.Overlap >= required)
             .OrderByDescending(x => x.Overlap).ThenBy(x => x.Entry.Order)
             .Take(take).Select(x => x.Entry).ToList();

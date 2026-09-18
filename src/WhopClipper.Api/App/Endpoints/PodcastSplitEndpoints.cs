@@ -25,6 +25,10 @@ public static partial class PodcastSplitEndpoints
             CancellationToken ct) =>
         {
             var errors = ValidateStyle(request);
+            // A campaign draws its beds from one folder, so one show's music cannot turn up under another's.
+            if (request.MusicLocationId is { } locationId && !await db.MediaLibraryLocations
+                    .AnyAsync(x => x.Id == locationId && x.Kind == MediaAssetKind.Music, ct))
+                errors["musicLocationId"] = ["That music folder is not in the media library."];
             if (errors.Count > 0) return Results.ValidationProblem(errors);
             var campaign = await db.Campaigns.SingleOrDefaultAsync(x => x.Id == id, ct);
             if (campaign is null) return Results.NotFound();

@@ -273,6 +273,10 @@ public sealed class MediaLibraryAsset
     public double? Bpm { get; set; }
     public bool IsFavorite { get; set; }
     public string? LicenseNotes { get; set; }
+    /// <summary>The part of the track to play under a clip, from the folder's segment guide.
+    /// Null means start at the top, which is what every asset indexed before the guide existed does.</summary>
+    public double? SegmentStartSeconds { get; set; }
+    public double? SegmentEndSeconds { get; set; }
     public DateTimeOffset IndexedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 

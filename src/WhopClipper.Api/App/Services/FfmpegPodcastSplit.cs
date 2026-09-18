@@ -26,7 +26,7 @@ public sealed record FfmpegPodcastSplitSpec(string SpanPath, int SpanWidth, int 
     int FramesPerSecond, int Crf, IReadOnlyList<FfmpegTopShot> TopShots, IReadOnlyList<FfmpegBrollShot> Broll,
     string? SubtitlePath = null, string? MusicPath = null, double MusicVolume = 0.3, double MusicDuckingDb = -10,
     FfmpegLogoOverlay? Logo = null, double LogoRightMarginFraction = 0.074, double LogoTopMarginFraction = 0.071,
-    bool NormalizeAudio = true, int EncoderThreads = 0);
+    bool NormalizeAudio = true, int EncoderThreads = 0, double MusicStartSeconds = 0);
 
 public static partial class FfmpegArgumentBuilder
 {
@@ -67,6 +67,10 @@ public static partial class FfmpegArgumentBuilder
         if (!string.IsNullOrWhiteSpace(spec.MusicPath))
         {
             musicInput = nextInput++;
+            // The hook of a track is usually a minute or two in, so the folder's guide says where to
+            // start it; from there the song simply keeps playing. The loop is only a safety net for a
+            // song that ends before the clip does.
+            if (spec.MusicStartSeconds > 0) args.AddRange(["-ss", Number(spec.MusicStartSeconds)]);
             args.AddRange(["-stream_loop", "-1", "-t", Number(total), "-i", spec.MusicPath]);
         }
 
@@ -98,16 +102,7 @@ public static partial class FfmpegArgumentBuilder
         // the voice and the cuts in the camera can never drift apart.
         graph.Add($"{joined}concat=n={spec.TopShots.Count}:v=1:a=1[top][voice0]");
 
-        var topLabel = "top";
-        if (spec.Broll.Count == 0)
-        {
-            // Nothing usable was found for any moment. A blurred copy of the guest keeps the
-            // layout intact instead of leaving half the frame black.
-            graph.Add("[top]split=2[topmain][topcopy]");
-            graph.Add("[topcopy]boxblur=luma_radius=40:luma_power=2:chroma_radius=20:chroma_power=2,eq=brightness=-0.08[bottom]");
-            topLabel = "topmain";
-        }
-        else
+        const string topLabel = "top";
         {
             var labels = new StringBuilder();
             for (var index = 0; index < spec.Broll.Count; index++)
@@ -183,11 +178,14 @@ public static partial class FfmpegArgumentBuilder
         if (spec.Crf is < 0 or > 51) throw new ArgumentOutOfRangeException(nameof(spec.Crf));
         if (spec.MusicVolume is < 0 or > 1) throw new ArgumentOutOfRangeException(nameof(spec.MusicVolume));
         if (spec.MusicDuckingDb is < -40 or > 0) throw new ArgumentOutOfRangeException(nameof(spec.MusicDuckingDb));
+        if (double.IsNaN(spec.MusicStartSeconds) || double.IsInfinity(spec.MusicStartSeconds) || spec.MusicStartSeconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(spec.MusicStartSeconds), "A song cannot start before its own beginning.");
         if (spec.LogoRightMarginFraction is < 0 or > 0.45 || spec.LogoTopMarginFraction is < 0 or > 0.45)
             throw new ArgumentOutOfRangeException(nameof(spec), "Logo margins must be between 0 and 0.45 of the frame.");
         if (spec.TopShots.Count is < 1 or > 40)
             throw new ArgumentException("A podcast split needs between 1 and 40 camera shots.", nameof(spec));
-        if (spec.Broll.Count > 80) throw new ArgumentException("Too many B-roll shots.", nameof(spec));
+        if (spec.Broll.Count is < 1 or > 80)
+            throw new ArgumentException("A podcast split requires between 1 and 80 B-roll shots; a blurred camera copy is not B-roll.", nameof(spec));
 
         foreach (var shot in spec.TopShots)
         {
