@@ -484,16 +484,17 @@ public sealed class BrollCleanAllocatorTests
     }
 
     /// <summary>
-    /// A second or two nothing could be found for holds the neighbouring shot instead of losing the
-    /// clip, which is what Matthew asked for after nine of nine stories failed on gaps of 1.5 to 4
-    /// seconds. Beyond a sixth of the clip the footage no longer illustrates what is said, so it fails.
+    /// Gaps nothing could be found for hold the neighbouring shot instead of losing the clip, which is
+    /// what Matthew asked for after whole stories failed on short gaps. The limit is a third of the clip:
+    /// a talk-show moment with a few unmatched seconds renders, but a clip that is mostly unmatched fails.
     /// </summary>
     [Fact]
-    public void ASecondOrTwoWithoutFootageIsHeldButAThirdOfTheClipIsNot()
+    public void FootageGapsUpToAThirdOfTheClipAreHeldButMoreFails()
     {
         BrollCleanAllocator.RequireComplete(shotCount: 8, gapSeconds: 4, clipSeconds: 30);
+        BrollCleanAllocator.RequireComplete(shotCount: 8, gapSeconds: 10, clipSeconds: 30);
 
-        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(8, 10, 30));
+        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(8, 13, 30));
     }
 
     [Fact]

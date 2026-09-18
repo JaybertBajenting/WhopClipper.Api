@@ -297,11 +297,13 @@ public static class BrollCleanAllocator
     }
 
     /// <summary>
-    /// How much of a clip may be carried by holding the neighbouring shot a little longer when a
-    /// moment's own footage cannot be found. Matthew chose this over losing the whole clip to a
-    /// second or two; at 30 seconds it is about four and a half, and every gap is still reported.
+    /// How much of a clip may be carried by holding the neighbouring shot longer when a moment's own
+    /// footage cannot be found. Matthew chose this over losing the whole clip: talk and business
+    /// episodes rarely have literal footage for every moment ("how he handles hate comments"), and a
+    /// stricter limit lost most of their highlights. At 30 seconds this is about ten seconds, and
+    /// every gap is still reported; a clip that is mostly unmatched still fails.
     /// </summary>
-    public const double MaximumHeldFraction = 0.15;
+    public const double MaximumHeldFraction = 0.35;
 
     public static void RequireComplete(int shotCount, double gapSeconds, double clipSeconds)
     {
