@@ -60,7 +60,7 @@ public sealed class PodcastSplitRenderTests
 
         Assert.Contains("[vout]split=2[voutfinal][voutpreview]", graph);
         Assert.Contains("[voicenorm]asplit=2[voicemix][voicepreview]", graph);
-        Assert.Contains("[voicemix][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]", graph);
+        Assert.Contains("[voicemix][musicducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]", graph);
         // Two outputs: the final (with the music mix) first, then the voice-only preview last.
         Assert.Equal(preview, args[^1]);
         Assert.Contains(Path.Combine(Root, "out.mp4"), args);
@@ -132,7 +132,7 @@ public sealed class PodcastSplitRenderTests
         Assert.Contains("[voicemain]loudnorm=I=-14:TP=-1.5:LRA=11,volume=1[voicenorm]", graph);
         Assert.Contains("[4:a]atrim=0:7,asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-2,volume=0.3[musicbase]", graph);
         Assert.Contains("[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio=5:attack=5:release=300[musicducked]", graph);
-        Assert.Contains("[voicenorm][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]", graph);
+        Assert.Contains("[voicenorm][musicducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]", graph);
     }
 
     /// <summary>

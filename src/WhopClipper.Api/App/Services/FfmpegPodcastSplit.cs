@@ -198,7 +198,11 @@ public static partial class FfmpegArgumentBuilder
             var musicLevel = spec.NormalizeAudio ? "loudnorm=I=-14:TP=-2," : string.Empty;
             graph.Add($"[{musicInput.Value}:a]atrim=0:{Number(total)},asetpts=PTS-STARTPTS,{musicLevel}volume={Number(spec.MusicVolume)}[musicbase]");
             graph.Add($"[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio={ratio}:attack=5:release=300[musicducked]");
-            graph.Add($"[{voiceForMix}][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]");
+            // normalize=0 stops amix from dividing every input by the input count, which otherwise drops
+            // the whole mix ~5 dB. The voice keeps its loudnorm level; the ducked music (measured
+            // inaudible under speech) only fills the gaps; alimiter catches the rare summed peak. This also
+            // makes the music-free preview's voice match the baked final's voice, so the live preview is true.
+            graph.Add($"[{voiceForMix}][musicducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]");
         }
 
         args.AddRange(["-filter_complex", string.Join(';', graph), "-map", $"[{videoOut}]", "-map", "[aout]",
