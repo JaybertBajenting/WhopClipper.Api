@@ -77,3 +77,7 @@ public sealed record PodcastSplitPlanDto(string SpanRelativePath, int SpanWidth,
     IReadOnlyList<StoryPieceDto> Pieces, IReadOnlyList<TopShotDto> TopShots, IReadOnlyList<BrollShotDto> Broll,
     IReadOnlyList<BrollGapDto> Gaps, IReadOnlyList<ClipWordDto> Words, IReadOnlyList<string> Emphasis,
     double EpisodeOffsetSeconds, string Title = "");
+
+/// <summary>Point one clip at a specific bed. Null <paramref name="MusicStartSeconds"/> falls back to the
+/// asset's own segment start from the folder guide, so each song still enters at its marked hook.</summary>
+public sealed record SetPlanMusicRequest(Guid? MusicAssetId, double? MusicStartSeconds);

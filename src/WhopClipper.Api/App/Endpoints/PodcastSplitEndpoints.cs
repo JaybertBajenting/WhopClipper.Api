@@ -88,6 +88,32 @@ public static partial class PodcastSplitEndpoints
             return Results.Accepted("/api/jobs", job.ToDto());
         }).WithTags("Edit style");
 
+        // Point one clip at a specific bed without re-rendering it. Updates the plan's music id and the
+        // stored start (the asset's own segment when the caller doesn't pass one), so the live preview and
+        // any later re-render both use the new song. Used to give each highlight its own bed from the folder.
+        api.MapPut("/edit-plans/{planId:guid}/music", async (Guid planId, SetPlanMusicRequest request,
+            AppDbContext db, CancellationToken ct) =>
+        {
+            var plan = await db.EditPlans.SingleOrDefaultAsync(x => x.Id == planId, ct);
+            if (plan is null) return Results.NotFound();
+            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+            if (extras?.PodcastSplit is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
+            double? start = request.MusicStartSeconds;
+            if (request.MusicAssetId is { } assetId)
+            {
+                var asset = await db.MediaLibraryAssets.AsNoTracking()
+                    .SingleOrDefaultAsync(x => x.Id == assetId && x.Kind == MediaAssetKind.Music, ct);
+                if (asset is null) return Results.BadRequest(new { error = "No such music asset." });
+                start ??= asset.SegmentStartSeconds ?? 0;
+            }
+            else start = null;
+            if (start is < 0) return Results.BadRequest(new { error = "Music start cannot be negative." });
+            plan.MusicAssetId = request.MusicAssetId;
+            plan.ExtraSettingsJson = JsonSerializer.Serialize(extras with { MusicStartSeconds = start }, JsonDefaults.Serializer);
+            await db.SaveChangesAsync(ct);
+            return Results.Ok(new { plan.MusicAssetId, musicStartSeconds = start });
+        }).WithTags("Edit style");
+
         campaigns.MapPut("/{id:guid}/edit-style", async (Guid id, CampaignEditStyleDto request, AppDbContext db,
             CancellationToken ct) =>
         {
