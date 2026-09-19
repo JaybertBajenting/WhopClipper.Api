@@ -38,6 +38,28 @@ public static partial class PodcastSplitEndpoints
             return Results.Ok(new { plan.SourceAssetId, Title = title, Pieces = pieces, plan.MusicAssetId });
         }).WithTags("Edit style");
 
+        // Re-render one clip from its stored story, picking up the campaign's current voice/music
+        // volumes. This is what the app's "Re-render" button calls after the sliders are adjusted.
+        api.MapPost("/edit-plans/{planId:guid}/rerender", async (Guid planId, AppDbContext db,
+            JobCoordinator coordinator, CancellationToken ct) =>
+        {
+            var plan = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == planId, ct);
+            if (plan is null) return Results.NotFound();
+            var split = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)?.PodcastSplit;
+            if (split is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
+            var pieces = split.Pieces.Select(p => new StoryPieceDto(
+                Math.Round(p.StartSeconds + split.EpisodeOffsetSeconds, 3),
+                Math.Round(p.EndSeconds + split.EpisodeOffsetSeconds, 3))).ToList();
+            var title = string.IsNullOrWhiteSpace(split.Title)
+                ? System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName) : split.Title;
+            var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId);
+            var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.SourcePipeline,
+                new SourcePipelineJobPayload(plan.SourceAssetId, plan.Platform, MaxClips: 1,
+                    DeleteSourceWhenDone: false, Mode: AiMode.Auto, EditStyle: EditStyles.PodcastSplit,
+                    Stories: new[] { story }), ct);
+            return Results.Accepted("/api/jobs", job.ToDto());
+        }).WithTags("Edit style");
+
         campaigns.MapPut("/{id:guid}/edit-style", async (Guid id, CampaignEditStyleDto request, AppDbContext db,
             CancellationToken ct) =>
         {
@@ -106,6 +128,7 @@ public static partial class PodcastSplitEndpoints
         var errors = new Dictionary<string, string[]>();
         if (!EditStyles.IsKnown(style.Style)) errors["style"] = [$"Style must be {EditStyles.Streamer} or {EditStyles.PodcastSplit}."];
         if (style.MusicVolume is < 0 or > 1) errors["musicVolume"] = ["Music volume must be between 0 and 1."];
+        if (style.VoiceVolume is < 0 or > 4) errors["voiceVolume"] = ["Voice volume must be between 0 and 4."];
         if (style.MusicDuckingDb is < -40 or > 0) errors["musicDuckingDb"] = ["Ducking must be between -40 and 0 dB."];
         if (style.CaptionFontSize is < 40 or > 160) errors["captionFontSize"] = ["Caption size must be 40-160."];
         // The name lands inside an ASS style line, where a comma would start the next field.

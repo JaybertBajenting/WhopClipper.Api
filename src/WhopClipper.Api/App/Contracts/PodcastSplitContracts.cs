@@ -22,10 +22,11 @@ public static class EditStyles
 /// </summary>
 /// <param name="MusicVolume">Level of the bed before ducking. The reference shorts keep music
 /// audible in the pauses, 0-9 dB under the speech.</param>
-public sealed record CampaignEditStyleDto(string Style = EditStyles.Streamer, double MusicVolume = 0.3,
-    double MusicDuckingDb = -10, string CaptionFont = "Segoe UI Black", int CaptionFontSize = 84,
+public sealed record CampaignEditStyleDto(string Style = EditStyles.Streamer, double MusicVolume = 0.2,
+    double MusicDuckingDb = -14, string CaptionFont = "Segoe UI Black", int CaptionFontSize = 84,
     double LogoWidthFraction = 0.2, double LogoRightMarginFraction = 0.074, double LogoTopMarginFraction = 0.071,
-    double BrollShotSeconds = 2.2, Guid? MusicLocationId = null);
+    double BrollShotSeconds = 2.2, Guid? MusicLocationId = null, IReadOnlyList<string>? ExcludedMusic = null,
+    double VoiceVolume = 1.0);
 
 public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 

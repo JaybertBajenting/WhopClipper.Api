@@ -74,6 +74,10 @@ public sealed partial class JobExecutionService
         if (style.MusicLocationId is { } musicLocationId)
             musicQuery = musicQuery.Where(x => x.LocationId == musicLocationId);
         var music = await musicQuery.OrderBy(x => x.FileName).ToListAsync(cancellationToken);
+        // Songs the campaign has blacklisted (e.g. one that drowned the speech) are dropped from the
+        // rotation by file name, so the folder itself is never touched.
+        if (style.ExcludedMusic is { Count: > 0 } excluded)
+            music = music.Where(x => !excluded.Contains(x.FileName, StringComparer.OrdinalIgnoreCase)).ToList();
 
         var clips = new List<object>();
         var failures = 0;
@@ -794,9 +798,11 @@ public sealed partial class JobExecutionService
         var args = FfmpegArgumentBuilder.BuildPodcastSplit(new FfmpegPodcastSplitSpec(spanPath, split.SpanWidth, split.SpanHeight,
             outputPath, plan.FramesPerSecond, plan.Crf,
             split.TopShots.Select(x => new FfmpegTopShot(x.InSeconds, x.DurationSeconds, ToPixels(x.Crop), x.Blur?.Select(ToPixels).ToList(), x.Fit)).ToList(),
-            broll, subtitlePath, musicPath, plan.MusicVolume, extras.MusicDuckingDb, logo,
+            // Volumes come from the live campaign edit style, so adjusting the sliders and re-rendering
+            // takes effect immediately - even on a clip whose plan was built with the old values.
+            broll, subtitlePath, musicPath, style.MusicVolume, style.MusicDuckingDb, logo,
             style.LogoRightMarginFraction, style.LogoTopMarginFraction, plan.NormalizeAudio, options.Value.EncoderThreads,
-            musicStart));
+            musicStart, style.VoiceVolume));
         plan.LastFfmpegArgumentsJson = JsonSerializer.Serialize(args, JsonDefaults.Serializer);
         logger.LogInformation("Render {PlanId} filter graph: {Graph}", plan.Id,
             args.SkipWhile(x => x != "-filter_complex").Skip(1).FirstOrDefault());

@@ -28,7 +28,7 @@ public sealed record FfmpegPodcastSplitSpec(string SpanPath, int SpanWidth, int 
     int FramesPerSecond, int Crf, IReadOnlyList<FfmpegTopShot> TopShots, IReadOnlyList<FfmpegBrollShot> Broll,
     string? SubtitlePath = null, string? MusicPath = null, double MusicVolume = 0.3, double MusicDuckingDb = -10,
     FfmpegLogoOverlay? Logo = null, double LogoRightMarginFraction = 0.074, double LogoTopMarginFraction = 0.071,
-    bool NormalizeAudio = true, int EncoderThreads = 0, double MusicStartSeconds = 0);
+    bool NormalizeAudio = true, int EncoderThreads = 0, double MusicStartSeconds = 0, double VoiceVolume = 1.0);
 
 public static partial class FfmpegArgumentBuilder
 {
@@ -164,12 +164,22 @@ public static partial class FfmpegArgumentBuilder
             graph.Add($"[voice0]{loudness}[aout]");
         else
         {
-            var ratio = Math.Clamp(Math.Abs(spec.MusicDuckingDb) / 2d, 2d, 20d).ToString("0.##", invariant);
-            graph.Add("[voice0]asplit=2[voice][voicekey]");
-            graph.Add($"[{musicInput.Value}:a]atrim=0:{Number(total)},asetpts=PTS-STARTPTS,volume={Number(spec.MusicVolume)}[musicbase]");
-            graph.Add($"[musicbase][voicekey]sidechaincompress=threshold=0.05:ratio={ratio}:attack=20:release=500[musicducked]");
-            graph.Add($"[voice][musicducked]amix=inputs=2:duration=first:dropout_transition=2" +
-                      (spec.NormalizeAudio ? $",{loudness}" : string.Empty) + "[aout]");
+            // Voice-forward mix. The voice is normalised to a loud, consistent target FIRST; the music
+            // is a fixed level UNDER it and ducked further while anyone talks; then only a limiter
+            // catches peaks. The old graph mixed raw voice with the music and loudnorm'd the SUM, so a
+            // loud, dense track (the slowed/reverb beds) set the level and buried the speech.
+            var ratio = Math.Clamp(Math.Abs(spec.MusicDuckingDb) / 2d, 4d, 20d).ToString("0.##", invariant);
+            graph.Add("[voice0]asplit=2[voicemain][voicekey]");
+            // Voice normalised to a consistent level, then the user's voice gain. Both voice and music
+            // gains are controlled from the app's sliders so the balance is dialled in, not guessed.
+            graph.Add($"[voicemain]{loudness},volume={Number(spec.VoiceVolume)}[voicenorm]");
+            // Normalise the music to the same target as the voice, THEN set it a fixed amount under with
+            // MusicVolume - so a loud, hot-mastered track cannot beat a quietly recorded voice. At 0.2
+            // that is about 14 dB under before ducking; ducking drops it further while anyone talks.
+            var musicLevel = spec.NormalizeAudio ? "loudnorm=I=-14:TP=-2," : string.Empty;
+            graph.Add($"[{musicInput.Value}:a]atrim=0:{Number(total)},asetpts=PTS-STARTPTS,{musicLevel}volume={Number(spec.MusicVolume)}[musicbase]");
+            graph.Add($"[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio={ratio}:attack=5:release=300[musicducked]");
+            graph.Add("[voicenorm][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]");
         }
 
         args.AddRange(["-filter_complex", string.Join(';', graph), "-map", "[vout]", "-map", "[aout]",
@@ -188,6 +198,7 @@ public static partial class FfmpegArgumentBuilder
         if (spec.FramesPerSecond is < 12 or > 120) throw new ArgumentOutOfRangeException(nameof(spec.FramesPerSecond));
         if (spec.Crf is < 0 or > 51) throw new ArgumentOutOfRangeException(nameof(spec.Crf));
         if (spec.MusicVolume is < 0 or > 1) throw new ArgumentOutOfRangeException(nameof(spec.MusicVolume));
+        if (spec.VoiceVolume is < 0 or > 4 || double.IsNaN(spec.VoiceVolume)) throw new ArgumentOutOfRangeException(nameof(spec.VoiceVolume));
         if (spec.MusicDuckingDb is < -40 or > 0) throw new ArgumentOutOfRangeException(nameof(spec.MusicDuckingDb));
         if (double.IsNaN(spec.MusicStartSeconds) || double.IsInfinity(spec.MusicStartSeconds) || spec.MusicStartSeconds < 0)
             throw new ArgumentOutOfRangeException(nameof(spec.MusicStartSeconds), "A song cannot start before its own beginning.");

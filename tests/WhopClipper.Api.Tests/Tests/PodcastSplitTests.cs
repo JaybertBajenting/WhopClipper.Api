@@ -104,10 +104,13 @@ public sealed class PodcastSplitRenderTests
     {
         var graph = Graph(FfmpegArgumentBuilder.BuildPodcastSplit(Spec(music: Path.Combine(Root, "bed.mp3"))));
 
-        Assert.Contains("[voice0]asplit=2[voice][voicekey]", graph);
-        Assert.Contains("[4:a]atrim=0:7,asetpts=PTS-STARTPTS,volume=0.3[musicbase]", graph);
-        Assert.Contains("[musicbase][voicekey]sidechaincompress=threshold=0.05:ratio=5:attack=20:release=500[musicducked]", graph);
-        Assert.Contains("[voice][musicducked]amix=inputs=2:duration=first:dropout_transition=2,loudnorm=I=-14:TP=-1.5:LRA=11[aout]", graph);
+        // Voice-forward: the voice is normalised first, the music sits under it and ducks while
+        // anyone talks, and only a limiter catches peaks - the sum is not loudnorm'd.
+        Assert.Contains("[voice0]asplit=2[voicemain][voicekey]", graph);
+        Assert.Contains("[voicemain]loudnorm=I=-14:TP=-1.5:LRA=11,volume=1[voicenorm]", graph);
+        Assert.Contains("[4:a]atrim=0:7,asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-2,volume=0.3[musicbase]", graph);
+        Assert.Contains("[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio=5:attack=5:release=300[musicducked]", graph);
+        Assert.Contains("[voicenorm][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]", graph);
     }
 
     /// <summary>
