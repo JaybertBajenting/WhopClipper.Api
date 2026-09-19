@@ -31,7 +31,9 @@ public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 
 /// <summary>A story whose pieces were chosen by hand rather than by the AI - used to recreate a
 /// reference short from the exact moments it was cut from.</summary>
-public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces);
+/// <param name="MusicAssetId">Forces this clip's music bed instead of the campaign's rotation - used to
+/// re-render a clip with a different song, for example to replace one that drowned the speech.</param>
+public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces, Guid? MusicAssetId = null);
 
 /// <param name="Url">Registers the episode on the campaign first when it is not already a source.</param>
 public sealed record ImportStoriesRequest(IReadOnlyList<ImportedStoryDto> Stories, Guid? SourceAssetId = null,
@@ -41,7 +43,7 @@ public sealed record CropRectDto(int X, int Y, int Width, int Height);
 
 /// <summary>One stretch of the podcast camera, in seconds of the downloaded span file.</summary>
 public sealed record TopShotDto(double InSeconds, double DurationSeconds, CropRectDto Crop,
-    IReadOnlyList<CropRectDto>? Blur = null);
+    IReadOnlyList<CropRectDto>? Blur = null, bool Fit = false);
 
 /// <param name="Blur">Logo boxes that could not be cropped away, in bottom-half output pixels.</param>
 public sealed record BrollShotDto(string RelativePath, double InSeconds, double DurationSeconds, CropRectDto Crop,

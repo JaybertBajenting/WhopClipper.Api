@@ -46,6 +46,23 @@ public sealed class PodcastSplitRenderTests
         Assert.Equal("7", list[list.IndexOf("-map") + 5]);
     }
 
+    /// <summary>
+    /// A wide or multi-person camera shot is shown whole - scaled to fit and letterboxed into the top
+    /// half - instead of cropped tight, so the person speaking is never cut off. Chosen after a wide
+    /// shot of the set's cartoon backdrop cropped onto the graphic and cut off the guest.
+    /// </summary>
+    [Fact]
+    public void AWideShotIsLetterboxedWholeInsteadOfCroppedTight()
+    {
+        var graph = Graph(FfmpegArgumentBuilder.BuildPodcastSplit(Spec(top:
+        [
+            new FfmpegTopShot(0, 7, new PixelRect(0, 0, 1920, 1080), Fit: true),
+        ])));
+
+        Assert.Contains("crop=1920:1080:0:0,scale=1080:960:force_original_aspect_ratio=decrease,"
+            + "pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30", graph);
+    }
+
     [Fact]
     public void FootageFillsTheBottomHalfForExactlyTheClipLength()
     {

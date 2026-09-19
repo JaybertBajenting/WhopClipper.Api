@@ -329,6 +329,47 @@ def probe(args):
     return 0
 
 
+def skin_mask(cv2, np, bgr):
+    """Pixels whose colour is human skin, in YCrCb. Measured on the Double Coverage set, a real
+    guest's face is ~0.78 skin by this test while the flat pink caricatures of the hosts painted on
+    the back wall are 0.00 - their colour sits outside the skin range - which is what tells them apart."""
+    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    cr = ycc[:, :, 1]
+    cb = ycc[:, :, 2]
+    return (cr > 133) & (cr < 180) & (cb > 77) & (cb < 127)
+
+
+def face_boxes(cv2, np, cascades, bgr):
+    """Every detected face with its skin fraction, largest first, so callers can tell a real face
+    (skin ~0.78 on this set) from a flat pink wall caricature (skin ~0.00). Rejecting the caricatures
+    stops the crop locking onto the graphic and cutting off the guest in wide shots."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    mask = skin_mask(cv2, np, bgr)
+    boxes = []
+    for cascade, flip in cascades:
+        image = gray[:, ::-1] if flip else gray
+        for (x, y, w, h) in cascade.detectMultiScale(image, scaleFactor=1.15, minNeighbors=6, minSize=(40, 40)):
+            if flip:
+                x = image.shape[1] - x - w
+            if w <= 0 or h <= 0:
+                continue
+            boxes.append((x, y, w, h, float(mask[y:y + h, x:x + w].mean())))
+    return sorted(boxes, key=lambda r: -r[2] * r[3])
+
+
+def skin_focus(cv2, np, bgr, min_area_frac=0.008):
+    """The centre of the largest blob of skin, or None. Used for a wide shot where the cascade found
+    no real face but the guest's skin is still on screen, so the crop follows the person, not the set."""
+    mask = skin_mask(cv2, np, bgr).astype(np.uint8)
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 1:
+        return None
+    idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[idx, cv2.CC_STAT_AREA] < mask.size * min_area_frac:
+        return None
+    return float(centroids[idx][0]), float(centroids[idx][1])
+
+
 def topcrop(args):
     import cv2
     import numpy as np
@@ -381,21 +422,38 @@ def topcrop(args):
     previous_focus = None
     for shot in raw_shots:
         picks = shot["frames"][:: max(1, len(shot["frames"]) // 6)][:6]
-        found = [detect_faces(cascades, cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)) for f in picks]
-        found = [f for f in found if f is not None]
-        if found:
-            focus = (sorted(p[0] for p in found)[len(found) // 2], sorted(p[1] for p in found)[len(found) // 2])
+        frame_h, frame_w = picks[0].shape[:2]
+        # Per pick: the real (skin) faces and whether a big wall caricature is on screen. The caricature
+        # is only large when the camera is wide, so its presence marks a wide shot.
+        detections = [face_boxes(cv2, np, cascades, f) for f in picks]
+        reals_per_pick = [[b for b in d if b[4] >= 0.3] for d in detections]
+        cartoon_pick = [any(b[4] < 0.15 and b[2] * b[3] > 0.03 * frame_w * frame_h for b in d) for d in detections]
+        centres = [(r[0][0] + r[0][2] / 2.0, r[0][1] + r[0][3] / 2.0) for r in reals_per_pick if r]
+        max_real = max((r[0][2] for r in reals_per_pick if r), default=0)
+        multi_person = sum(1 for r in reals_per_pick if len(r) >= 2) > len(picks) // 2
+        wide_graphic = sum(cartoon_pick) > len(picks) // 2
+        small_subject = bool(centres) and max_real < 0.12 * frame_w
+        # A wide or multi-person shot is shown whole (letterboxed) so the speaker is never cut off; a
+        # clean single close-up is cropped tight on the guest, which is the channel's look.
+        fit = multi_person or wide_graphic or small_subject or not centres and sum(cartoon_pick) > 0
+        if fit:
+            rect = area  # the whole frame; the renderer scales it to fit and pads
         else:
-            focus = previous_focus
-        # The measured Double Coverage punch-in and no tighter, with the face a third of the way down so
-        # the top of the head stays in: centring it at 42% cut off a seated guest's forehead.
-        rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0,), height_fraction=args.height_fraction,
-                              keep_focus=True, face_at=0.3)
+            if centres:
+                focus = (sorted(p[0] for p in centres)[len(centres) // 2], sorted(p[1] for p in centres)[len(centres) // 2])
+            else:
+                skins = [s for s in (skin_focus(cv2, np, f) for f in picks) if s is not None]
+                focus = (sorted(p[0] for p in skins)[len(skins) // 2], sorted(p[1] for p in skins)[len(skins) // 2]) if skins else previous_focus
+            # The measured Double Coverage punch-in and no tighter, with the face a third of the way down
+            # so the top of the head stays in: centring it at 42% cut off a seated guest's forehead.
+            rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0,), height_fraction=args.height_fraction,
+                                  keep_focus=True, face_at=0.3)
+            previous_focus = focus if focus is not None else previous_focus
         shots.append({
             "in": round(shot["in"], 3), "duration": round(shot["duration"], 3),
-            "crop": to_source(rect, scale, width, height), "blur": blur_boxes(boxes, rect), "face": bool(found),
+            "crop": to_source(rect, scale, width, height),
+            "blur": [] if fit else blur_boxes(boxes, rect), "face": bool(centres), "fit": bool(fit),
         })
-        previous_focus = focus if found else previous_focus
 
     # Flash frames and consecutive shots that ended up with the same box are joined, which keeps
     # the render graph to one input per real change of picture.

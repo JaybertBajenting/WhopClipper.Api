@@ -21,6 +21,23 @@ public static partial class PodcastSplitEndpoints
             return campaign is null ? Results.NotFound() : Results.Ok(campaign.ReadEditStyle() ?? new CampaignEditStyleDto());
         });
 
+        // The story a podcast-split plan was built from, on the episode clock, so it can be re-imported
+        // and re-rendered (e.g. with a different song) without the AI picking a different moment. The
+        // plan's stored pieces are on the span clock; the episode clock is that plus the saved offset.
+        api.MapGet("/edit-plans/{planId:guid}/story", async (Guid planId, AppDbContext db, CancellationToken ct) =>
+        {
+            var plan = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == planId, ct);
+            if (plan is null) return Results.NotFound();
+            var split = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)?.PodcastSplit;
+            if (split is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
+            var pieces = split.Pieces.Select(p => new StoryPieceDto(
+                Math.Round(p.StartSeconds + split.EpisodeOffsetSeconds, 3),
+                Math.Round(p.EndSeconds + split.EpisodeOffsetSeconds, 3))).ToList();
+            var title = string.IsNullOrWhiteSpace(split.Title)
+                ? System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName) : split.Title;
+            return Results.Ok(new { plan.SourceAssetId, Title = title, Pieces = pieces, plan.MusicAssetId });
+        }).WithTags("Edit style");
+
         campaigns.MapPut("/{id:guid}/edit-style", async (Guid id, CampaignEditStyleDto request, AppDbContext db,
             CancellationToken ct) =>
         {

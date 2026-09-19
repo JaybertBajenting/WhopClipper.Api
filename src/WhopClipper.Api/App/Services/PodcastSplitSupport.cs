@@ -135,7 +135,7 @@ public sealed record BrollPlan(IReadOnlyList<BrollMoment> Moments, IReadOnlyList
 public static class StorySchemas
 {
     public const string Stories = """
-    {"title":"WhopClipperStoriesV1","type":"object","additionalProperties":false,"required":["stories"],"properties":{"stories":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["title","rationale","score","pieces","emphasis"],"properties":{"title":{"type":"string"},"rationale":{"type":"string"},"score":{"type":"number","minimum":0,"maximum":1},"pieces":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["startSeconds","endSeconds"],"properties":{"startSeconds":{"type":"number","minimum":0},"endSeconds":{"type":"number","minimum":0}}}},"emphasis":{"type":"array","maxItems":20,"items":{"type":"string"}}}}}}}
+    {"title":"WhopClipperStoriesV1","type":"object","additionalProperties":false,"required":["stories"],"properties":{"stories":{"type":"array","minItems":1,"maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["title","rationale","score","pieces","emphasis"],"properties":{"title":{"type":"string"},"rationale":{"type":"string"},"score":{"type":"number","minimum":0,"maximum":1},"pieces":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["startSeconds","endSeconds"],"properties":{"startSeconds":{"type":"number","minimum":0},"endSeconds":{"type":"number","minimum":0}}}},"emphasis":{"type":"array","maxItems":20,"items":{"type":"string"}}}}}}}
     """;
 
     public const string Broll = """

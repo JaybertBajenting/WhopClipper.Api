@@ -10,8 +10,10 @@ public readonly record struct PixelRect(int X, int Y, int Width, int Height)
 }
 
 /// <param name="Blur">Logo boxes left inside the crop, in top-half output pixels (1080x960).</param>
+/// <param name="Fit">A wide or multi-person shot shown whole, letterboxed into the top half rather than
+/// cropped tight, so the person speaking is never cut off. Set for wide camera angles.</param>
 public sealed record FfmpegTopShot(double InSeconds, double DurationSeconds, PixelRect Crop,
-    IReadOnlyList<PixelRect>? Blur = null);
+    IReadOnlyList<PixelRect>? Blur = null, bool Fit = false);
 
 /// <param name="Blur">Logo boxes left inside the crop, in bottom-half output pixels (1080x960).</param>
 public sealed record FfmpegBrollShot(string Path, double InSeconds, double DurationSeconds, PixelRect Crop,
@@ -87,11 +89,20 @@ public static partial class FfmpegArgumentBuilder
         for (var index = 0; index < spec.TopShots.Count; index++)
         {
             var shot = spec.TopShots[index];
-            var filters = new List<string>
-            {
-                $"crop={shot.Crop.Width}:{shot.Crop.Height}:{shot.Crop.X}:{shot.Crop.Y}",
-                $"scale={SplitWidth}:{SplitHalf}", "setsar=1", $"fps={fps}"
-            };
+            // A wide shot is shown whole - scaled to fit and padded to the half - so nobody is cut off.
+            // A normal shot crops tight on the guest and fills the half, which is the channel's look.
+            var filters = shot.Fit
+                ? new List<string>
+                {
+                    $"crop={shot.Crop.Width}:{shot.Crop.Height}:{shot.Crop.X}:{shot.Crop.Y}",
+                    $"scale={SplitWidth}:{SplitHalf}:force_original_aspect_ratio=decrease",
+                    $"pad={SplitWidth}:{SplitHalf}:(ow-iw)/2:(oh-ih)/2:color=black", "setsar=1", $"fps={fps}"
+                }
+                : new List<string>
+                {
+                    $"crop={shot.Crop.Width}:{shot.Crop.Height}:{shot.Crop.X}:{shot.Crop.Y}",
+                    $"scale={SplitWidth}:{SplitHalf}", "setsar=1", $"fps={fps}"
+                };
             filters.AddRange(Delogo(shot.Blur));
             filters.Add("setpts=PTS-STARTPTS");
             graph.Add($"[{index}:v]{string.Join(',', filters)}[tv{index}]");

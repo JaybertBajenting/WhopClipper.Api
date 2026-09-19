@@ -28,7 +28,7 @@ public sealed partial class JobExecutionService
     private readonly Dictionary<string, AiProviderAvailability> _aiAvailability = new(StringComparer.OrdinalIgnoreCase);
 
     private sealed record ClipStory(string Title, IReadOnlyList<(double Start, double End)> EpisodePieces,
-        IReadOnlyList<string> Emphasis);
+        IReadOnlyList<string> Emphasis, Guid? MusicAssetId = null);
 
     private sealed record EpisodeWords(IReadOnlyList<TranscriptWord> Words, double DurationSeconds, string Origin);
 
@@ -59,9 +59,9 @@ public sealed partial class JobExecutionService
 
         IReadOnlyList<ClipStory> stories = payload.Stories is { Count: > 0 } imported
             ? imported.Select(x => new ClipStory(x.Title,
-                StoryParser.Merge(x.Pieces.Select(p => (p.StartSeconds, p.EndSeconds))), [])).ToList()
+                StoryParser.Merge(x.Pieces.Select(p => (p.StartSeconds, p.EndSeconds))), [], x.MusicAssetId)).ToList()
             : (await SelectStoriesAsync(payload, campaignId, source, episode, cancellationToken))
-                .Take(Math.Clamp(payload.MaxClips, 1, 10)).ToList();
+                .Take(Math.Clamp(payload.MaxClips, 1, 15)).ToList();
         job.Progress = .12;
         await db.SaveChangesAsync(cancellationToken);
 
@@ -224,7 +224,8 @@ public sealed partial class JobExecutionService
             - title: a short hook in the channel's voice, like a YouTube Shorts title. No dashes.
             - emphasis: at most five words a viewer should notice - a name, a number, the punch word.
             - Nothing that shows the guests or the podcast in a negative light. Follow the approved requirements.
-            Return up to ten stories, strongest first.
+            Return every genuinely strong story, strongest first, up to fifteen - a rich episode has more,
+            a thin one has fewer. Do not pad the list with weak moments to reach a count.
 
             UNTRUSTED_CAMPAIGN_DATA
             """ + Environment.NewLine + JsonSerializer.Serialize(data, JsonDefaults.Serializer) + Environment.NewLine +
@@ -300,8 +301,12 @@ public sealed partial class JobExecutionService
 
         var episodeStart = Math.Max(0, pieces[0].Start + offset);
         // One song per clip, rotating through the library so a batch does not repeat itself, and each
-        // one starting where the folder's segment guide puts its hook.
-        var track = music.Count == 0 ? null : music[index % music.Count];
+        // one starting where the folder's segment guide puts its hook. A story may name its own song
+        // (a re-render that replaces a bed which drowned the speech); that wins over the rotation.
+        var rotationTrack = music.Count == 0 ? null : music[index % music.Count];
+        var track = story.MusicAssetId is { } chosen
+            ? music.FirstOrDefault(x => x.Id == chosen) ?? rotationTrack
+            : rotationTrack;
         return new EditPlan
         {
             CampaignId = campaignId, SourceAssetId = source.Id, Platform = payload.Platform,
@@ -442,12 +447,13 @@ public sealed partial class JobExecutionService
                 var duration = shot.GetProperty("duration").GetDouble();
                 var crop = ClampCrop(ReadRect(shot.GetProperty("crop")), video.Width, video.Height);
                 var blur = shot.TryGetProperty("blur", out var boxes) ? boxes.EnumerateArray().Select(ReadRect).ToList() : [];
+                var fit = shot.TryGetProperty("fit", out var f) && f.ValueKind == JsonValueKind.True;
                 if (duration < 0.06 && shots.Count > 0)
                 {
                     shots[^1] = shots[^1] with { DurationSeconds = shots[^1].DurationSeconds + duration };
                     continue;
                 }
-                shots.Add(new TopShotDto(Math.Round(shot.GetProperty("in").GetDouble() + video.VideoLead, 3), duration, crop, blur));
+                shots.Add(new TopShotDto(Math.Round(shot.GetProperty("in").GetDouble() + video.VideoLead, 3), duration, crop, blur, fit));
             }
         }
 
@@ -787,7 +793,7 @@ public sealed partial class JobExecutionService
 
         var args = FfmpegArgumentBuilder.BuildPodcastSplit(new FfmpegPodcastSplitSpec(spanPath, split.SpanWidth, split.SpanHeight,
             outputPath, plan.FramesPerSecond, plan.Crf,
-            split.TopShots.Select(x => new FfmpegTopShot(x.InSeconds, x.DurationSeconds, ToPixels(x.Crop), x.Blur?.Select(ToPixels).ToList())).ToList(),
+            split.TopShots.Select(x => new FfmpegTopShot(x.InSeconds, x.DurationSeconds, ToPixels(x.Crop), x.Blur?.Select(ToPixels).ToList(), x.Fit)).ToList(),
             broll, subtitlePath, musicPath, plan.MusicVolume, extras.MusicDuckingDb, logo,
             style.LogoRightMarginFraction, style.LogoTopMarginFraction, plan.NormalizeAudio, options.Value.EncoderThreads,
             musicStart));
