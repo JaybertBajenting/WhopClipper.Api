@@ -267,7 +267,9 @@ public sealed partial class JobExecutionService
         }
         else
         {
-            diskSpace.EnsureRoomForBytes((long)((spanEnd - spanStart) * 500_000), story.Title);
+            // A span is only the clip's own section (tens of MB) and is deleted after the render, so it
+            // keeps the small probe reserve rather than the 5 GB source floor meant for whole VODs.
+            diskSpace.EnsureRoomForBytes((long)((spanEnd - spanStart) * 500_000), story.Title, BrollProbeReserveBytes);
             spanPath = await DownloadSectionAsync(source.Url, spanStart, spanEnd, clipDirectory, "span", 1080, true, cancellationToken);
         }
         var video = await ProbeVideoAsync(spanPath, cancellationToken);
