@@ -40,9 +40,11 @@ public static partial class PodcastSplitEndpoints
 
         // Re-render one clip from its stored story, picking up the campaign's current voice/music
         // volumes. This is what the app's "Re-render" button calls after the sliders are adjusted.
-        api.MapPost("/edit-plans/{planId:guid}/rerender", async (Guid planId, AppDbContext db,
-            JobCoordinator coordinator, CancellationToken ct) =>
+        api.MapPost("/edit-plans/{planId:guid}/rerender", async (Guid planId, double? voiceVolume, double? musicVolume,
+            AppDbContext db, JobCoordinator coordinator, CancellationToken ct) =>
         {
+            if (voiceVolume is < 0 or > 4 || musicVolume is < 0 or > 1)
+                return Results.BadRequest(new { error = "Voice volume is 0-4 and music volume is 0-1." });
             var plan = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == planId, ct);
             if (plan is null) return Results.NotFound();
             var split = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)?.PodcastSplit;
@@ -52,7 +54,7 @@ public static partial class PodcastSplitEndpoints
                 Math.Round(p.EndSeconds + split.EpisodeOffsetSeconds, 3))).ToList();
             var title = string.IsNullOrWhiteSpace(split.Title)
                 ? System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName) : split.Title;
-            var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId);
+            var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId, voiceVolume, musicVolume);
             var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.SourcePipeline,
                 new SourcePipelineJobPayload(plan.SourceAssetId, plan.Platform, MaxClips: 1,
                     DeleteSourceWhenDone: false, Mode: AiMode.Auto, EditStyle: EditStyles.PodcastSplit,
@@ -113,14 +115,15 @@ public static partial class PodcastSplitEndpoints
     /// <summary>Null for every clip that is not a podcast split, which keeps the listing unchanged for them.</summary>
     internal static RenderedClipStyleDto? DescribeClip(EditPlan? plan)
     {
-        var split = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)?.PodcastSplit;
+        var extras = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+        var split = extras?.PodcastSplit;
         if (split is null) return null;
         var footage = split.Broll
             .GroupBy(x => x.SourceUrl ?? x.RelativePath, StringComparer.OrdinalIgnoreCase)
             .Select(x => new RenderedClipFootageDto(x.First().Query, x.First().SourceTitle, x.First().SourceUrl))
             .ToList();
         return new RenderedClipStyleDto(EditStyles.PodcastSplit, split.Pieces.Count, split.TopShots.Count,
-            split.Broll.Count, split.Gaps, footage);
+            split.Broll.Count, split.Gaps, footage, extras!.VoiceVolume, extras.MusicVolume);
     }
 
     internal static Dictionary<string, string[]> ValidateStyle(CampaignEditStyleDto style)

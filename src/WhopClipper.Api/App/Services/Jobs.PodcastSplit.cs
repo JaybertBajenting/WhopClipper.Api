@@ -28,7 +28,7 @@ public sealed partial class JobExecutionService
     private readonly Dictionary<string, AiProviderAvailability> _aiAvailability = new(StringComparer.OrdinalIgnoreCase);
 
     private sealed record ClipStory(string Title, IReadOnlyList<(double Start, double End)> EpisodePieces,
-        IReadOnlyList<string> Emphasis, Guid? MusicAssetId = null);
+        IReadOnlyList<string> Emphasis, Guid? MusicAssetId = null, double? VoiceVolume = null, double? MusicVolume = null);
 
     private sealed record EpisodeWords(IReadOnlyList<TranscriptWord> Words, double DurationSeconds, string Origin);
 
@@ -59,7 +59,8 @@ public sealed partial class JobExecutionService
 
         IReadOnlyList<ClipStory> stories = payload.Stories is { Count: > 0 } imported
             ? imported.Select(x => new ClipStory(x.Title,
-                StoryParser.Merge(x.Pieces.Select(p => (p.StartSeconds, p.EndSeconds))), [], x.MusicAssetId)).ToList()
+                StoryParser.Merge(x.Pieces.Select(p => (p.StartSeconds, p.EndSeconds))), [], x.MusicAssetId,
+                x.VoiceVolume, x.MusicVolume)).ToList()
             : (await SelectStoriesAsync(payload, campaignId, source, episode, cancellationToken))
                 .Take(Math.Clamp(payload.MaxClips, 1, 15)).ToList();
         job.Progress = .12;
@@ -323,8 +324,8 @@ public sealed partial class JobExecutionService
             OutputFileName = WorkspaceService.SafeFileName(story.Title, $"story-{index + 1:00}") + ".mp4",
             IsApproved = true,
             ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(EditStyles.PodcastSplit, null, "Seam",
-                style.MusicDuckingDb, [], [], PodcastSplit: split, MusicStartSeconds: track?.SegmentStartSeconds),
-                JsonDefaults.Serializer)
+                style.MusicDuckingDb, [], [], PodcastSplit: split, MusicStartSeconds: track?.SegmentStartSeconds,
+                VoiceVolume: story.VoiceVolume, MusicVolume: story.MusicVolume), JsonDefaults.Serializer)
         };
     }
 
@@ -798,11 +799,11 @@ public sealed partial class JobExecutionService
         var args = FfmpegArgumentBuilder.BuildPodcastSplit(new FfmpegPodcastSplitSpec(spanPath, split.SpanWidth, split.SpanHeight,
             outputPath, plan.FramesPerSecond, plan.Crf,
             split.TopShots.Select(x => new FfmpegTopShot(x.InSeconds, x.DurationSeconds, ToPixels(x.Crop), x.Blur?.Select(ToPixels).ToList(), x.Fit)).ToList(),
-            // Volumes come from the live campaign edit style, so adjusting the sliders and re-rendering
-            // takes effect immediately - even on a clip whose plan was built with the old values.
-            broll, subtitlePath, musicPath, style.MusicVolume, style.MusicDuckingDb, logo,
+            // A clip's own voice/music volumes win; otherwise the campaign default. Both are read at
+            // render time, so adjusting the sliders and re-rendering takes effect immediately.
+            broll, subtitlePath, musicPath, extras.MusicVolume ?? style.MusicVolume, style.MusicDuckingDb, logo,
             style.LogoRightMarginFraction, style.LogoTopMarginFraction, plan.NormalizeAudio, options.Value.EncoderThreads,
-            musicStart, style.VoiceVolume));
+            musicStart, extras.VoiceVolume ?? style.VoiceVolume));
         plan.LastFfmpegArgumentsJson = JsonSerializer.Serialize(args, JsonDefaults.Serializer);
         logger.LogInformation("Render {PlanId} filter graph: {Graph}", plan.Id,
             args.SkipWhile(x => x != "-filter_complex").Skip(1).FirstOrDefault());

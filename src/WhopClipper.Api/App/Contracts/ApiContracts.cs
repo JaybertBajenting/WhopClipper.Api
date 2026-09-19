@@ -121,7 +121,8 @@ public sealed record ZoomPunchDto(double AtSeconds, double DurationSeconds = 0.5
 public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, string? SubtitleStyle,
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects, IReadOnlyList<OverlayDto> Overlays,
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
-    PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null);
+    PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null,
+    double? VoiceVolume = null, double? MusicVolume = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,

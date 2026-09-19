@@ -34,7 +34,10 @@ public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 /// reference short from the exact moments it was cut from.</summary>
 /// <param name="MusicAssetId">Forces this clip's music bed instead of the campaign's rotation - used to
 /// re-render a clip with a different song, for example to replace one that drowned the speech.</param>
-public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces, Guid? MusicAssetId = null);
+/// <param name="VoiceVolume">Per-clip voice gain, overriding the campaign default. Null follows the campaign.</param>
+/// <param name="MusicVolume">Per-clip music gain, overriding the campaign default. Null follows the campaign.</param>
+public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces, Guid? MusicAssetId = null,
+    double? VoiceVolume = null, double? MusicVolume = null);
 
 /// <param name="Url">Registers the episode on the campaign first when it is not already a source.</param>
 public sealed record ImportStoriesRequest(IReadOnlyList<ImportedStoryDto> Stories, Guid? SourceAssetId = null,
@@ -59,7 +62,8 @@ public sealed record ClipWordDto(double Start, double End, string Word);
 
 /// <summary>How a podcast-split clip was put together, so its footage can be checked before posting.</summary>
 public sealed record RenderedClipStyleDto(string Style, int Pieces, int CameraShots, int BrollShots,
-    IReadOnlyList<BrollGapDto> Gaps, IReadOnlyList<RenderedClipFootageDto> Footage);
+    IReadOnlyList<BrollGapDto> Gaps, IReadOnlyList<RenderedClipFootageDto> Footage,
+    double? VoiceVolume = null, double? MusicVolume = null);
 
 public sealed record RenderedClipFootageDto(string Query, string? Title, string? Url);
 
