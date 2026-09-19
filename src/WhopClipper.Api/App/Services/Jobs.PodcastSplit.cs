@@ -369,6 +369,18 @@ public sealed partial class JobExecutionService
             $"Could not download {start:0}-{end:0}s of {url}. {(last?.TimedOut == true ? "The download timed out." : Tail(last?.StandardError))}");
     }
 
+    /// <summary>Length of any media file in seconds, 0 when ffprobe cannot read it. Used for audio-only
+    /// beds, which <see cref="ProbeVideoAsync"/> rejects because they carry no video stream.</summary>
+    private async Task<double> ProbeDurationSecondsAsync(string path, CancellationToken cancellationToken)
+    {
+        var result = await processRunner.RunAsync(new ProcessInvocation(options.Value.FfprobePath,
+            ["-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", path],
+            Path.GetDirectoryName(path)!, Timeout: TimeSpan.FromMinutes(1)), cancellationToken);
+        return result.ExitCode == 0 &&
+            double.TryParse(result.StandardOutput.Trim(), NumberStyles.Float, Invariant, out var seconds)
+                ? seconds : 0;
+    }
+
     private async Task<VideoProbe> ProbeVideoAsync(string path, CancellationToken cancellationToken)
     {
         var result = await processRunner.RunAsync(new ProcessInvocation(options.Value.FfprobePath,
@@ -787,6 +799,19 @@ public sealed partial class JobExecutionService
             // The plan carries the segment it was built with; the library covers plans made before
             // the guide existed, or a guide edited since.
             musicStart = Math.Max(0, extras.MusicStartSeconds ?? track.SegmentStartSeconds ?? 0);
+            // The guide names the hook by its timestamp in the song people know, but the copy in the
+            // folder can be shorter than the release it was taken from. Entering at or past the end
+            // leaves the clip with no bed at all, and a bed is never looped, so back the entry up just
+            // far enough to still play to the last frame.
+            var songSeconds = await ProbeDurationSecondsAsync(musicPath, cancellationToken);
+            if (songSeconds > 0 && musicStart + clipSeconds > songSeconds)
+            {
+                var backedUp = Math.Max(0, songSeconds - clipSeconds);
+                logger.LogInformation(
+                    "Music {File} runs {Song:N1}s, so the {Start:N1}s entry cannot cover a {Clip:N1}s clip; starting at {Backed:N1}s instead.",
+                    Path.GetFileName(musicPath), songSeconds, musicStart, clipSeconds, backedUp);
+                musicStart = backedUp;
+            }
         }
         var logo = await ResolveBrandingLogoAsync(plan.CampaignId, cancellationToken);
         if (logo is not null) logo = logo with { WidthFraction = style.LogoWidthFraction };
