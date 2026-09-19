@@ -759,6 +759,9 @@ public sealed partial class JobExecutionService
         var outputName = WorkspaceService.SafeFileName(Path.GetFileNameWithoutExtension(plan.OutputFileName), "clip");
         var outputPath = Path.Combine(outputDirectory, $"{outputName}-{plan.Id:N}.mp4");
         WorkspaceService.EnsureInside(outputDirectory, outputPath);
+        // Music-free companion for the app's live preview (voice + video, no bed). Sits beside the final
+        // and is skipped by the outputs listing; the preview player mixes the music in on top.
+        var previewPath = Path.Combine(outputDirectory, $"{outputName}-{plan.Id:N}.preview.mp4");
 
         var intermediate = workspace.ResolveRelative(Path.Combine("campaigns", plan.CampaignId.ToString("N"), "intermediate", job.Id.ToString("N")));
         Directory.CreateDirectory(intermediate);
@@ -803,7 +806,7 @@ public sealed partial class JobExecutionService
             // render time, so adjusting the sliders and re-rendering takes effect immediately.
             broll, subtitlePath, musicPath, extras.MusicVolume ?? style.MusicVolume, style.MusicDuckingDb, logo,
             style.LogoRightMarginFraction, style.LogoTopMarginFraction, plan.NormalizeAudio, options.Value.EncoderThreads,
-            musicStart, extras.VoiceVolume ?? style.VoiceVolume));
+            musicStart, extras.VoiceVolume ?? style.VoiceVolume, previewPath));
         plan.LastFfmpegArgumentsJson = JsonSerializer.Serialize(args, JsonDefaults.Serializer);
         logger.LogInformation("Render {PlanId} filter graph: {Graph}", plan.Id,
             args.SkipWhile(x => x != "-filter_complex").Skip(1).FirstOrDefault());

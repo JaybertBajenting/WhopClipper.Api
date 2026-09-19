@@ -47,6 +47,28 @@ public sealed class PodcastSplitRenderTests
     }
 
     /// <summary>
+    /// A music-free companion (video + voice, no bed) is written beside the final so the app can play it
+    /// and mix the music live under the sliders. The preview's audio must carry no music input.
+    /// </summary>
+    [Fact]
+    public void WritesAMusicFreePreviewCompanionBesideTheFinal()
+    {
+        var preview = Path.Combine(Root, "out.preview.mp4");
+        var args = FfmpegArgumentBuilder.BuildPodcastSplit(
+            Spec(music: Path.Combine(Root, "bed.mp3")) with { PreviewOutputPath = preview }).ToList();
+        var graph = args[args.IndexOf("-filter_complex") + 1];
+
+        Assert.Contains("[vout]split=2[voutfinal][voutpreview]", graph);
+        Assert.Contains("[voicenorm]asplit=2[voicemix][voicepreview]", graph);
+        Assert.Contains("[voicemix][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]", graph);
+        // Two outputs: the final (with the music mix) first, then the voice-only preview last.
+        Assert.Equal(preview, args[^1]);
+        Assert.Contains(Path.Combine(Root, "out.mp4"), args);
+        Assert.True(args.IndexOf(Path.Combine(Root, "out.mp4")) < args.IndexOf(preview), "final comes before preview");
+        Assert.Equal(new[] { "-map", "[voutpreview]", "-map", "[voicepreview]" }, args.Skip(args.LastIndexOf("-map") - 2).Take(4));
+    }
+
+    /// <summary>
     /// A wide or multi-person camera shot is shown whole - scaled to fit and letterboxed into the top
     /// half - instead of cropped tight, so the person speaking is never cut off. Chosen after a wide
     /// shot of the set's cartoon backdrop cropped onto the graphic and cut off the guest.

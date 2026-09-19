@@ -28,7 +28,8 @@ public sealed record FfmpegPodcastSplitSpec(string SpanPath, int SpanWidth, int 
     int FramesPerSecond, int Crf, IReadOnlyList<FfmpegTopShot> TopShots, IReadOnlyList<FfmpegBrollShot> Broll,
     string? SubtitlePath = null, string? MusicPath = null, double MusicVolume = 0.3, double MusicDuckingDb = -10,
     FfmpegLogoOverlay? Logo = null, double LogoRightMarginFraction = 0.074, double LogoTopMarginFraction = 0.071,
-    bool NormalizeAudio = true, int EncoderThreads = 0, double MusicStartSeconds = 0, double VoiceVolume = 1.0);
+    bool NormalizeAudio = true, int EncoderThreads = 0, double MusicStartSeconds = 0, double VoiceVolume = 1.0,
+    string? PreviewOutputPath = null);
 
 public static partial class FfmpegArgumentBuilder
 {
@@ -159,6 +160,17 @@ public static partial class FfmpegArgumentBuilder
                       $"H*{spec.LogoTopMarginFraction.ToString("0.####", invariant)}:format=auto,{deliveryFormat}[vout]");
         }
 
+        // A music-free companion (video + voice, no bed) is written beside the final so the app can play
+        // it and mix the music live under the sliders, without a re-render each time. Only worth it when
+        // there is music to strip; without music the final is already the preview.
+        var wantPreview = !string.IsNullOrWhiteSpace(spec.PreviewOutputPath) && musicInput is not null;
+        var videoOut = "vout";
+        if (wantPreview)
+        {
+            graph.Add("[vout]split=2[voutfinal][voutpreview]");
+            videoOut = "voutfinal";
+        }
+
         var loudness = spec.NormalizeAudio ? "loudnorm=I=-14:TP=-1.5:LRA=11" : "anull";
         if (musicInput is null)
             graph.Add($"[voice0]{loudness}[aout]");
@@ -173,19 +185,31 @@ public static partial class FfmpegArgumentBuilder
             // Voice normalised to a consistent level, then the user's voice gain. Both voice and music
             // gains are controlled from the app's sliders so the balance is dialled in, not guessed.
             graph.Add($"[voicemain]{loudness},volume={Number(spec.VoiceVolume)}[voicenorm]");
+            // The preview's audio is this voice, no music: split it off so the same voice also feeds the mix.
+            var voiceForMix = "voicenorm";
+            if (wantPreview)
+            {
+                graph.Add("[voicenorm]asplit=2[voicemix][voicepreview]");
+                voiceForMix = "voicemix";
+            }
             // Normalise the music to the same target as the voice, THEN set it a fixed amount under with
             // MusicVolume - so a loud, hot-mastered track cannot beat a quietly recorded voice. At 0.2
             // that is about 14 dB under before ducking; ducking drops it further while anyone talks.
             var musicLevel = spec.NormalizeAudio ? "loudnorm=I=-14:TP=-2," : string.Empty;
             graph.Add($"[{musicInput.Value}:a]atrim=0:{Number(total)},asetpts=PTS-STARTPTS,{musicLevel}volume={Number(spec.MusicVolume)}[musicbase]");
             graph.Add($"[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio={ratio}:attack=5:release=300[musicducked]");
-            graph.Add("[voicenorm][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]");
+            graph.Add($"[{voiceForMix}][musicducked]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.9[aout]");
         }
 
-        args.AddRange(["-filter_complex", string.Join(';', graph), "-map", "[vout]", "-map", "[aout]",
+        args.AddRange(["-filter_complex", string.Join(';', graph), "-map", $"[{videoOut}]", "-map", "[aout]",
             "-t", Number(total), "-c:v", "libx264", "-preset", "medium", "-crf", spec.Crf.ToString(invariant)]);
         if (spec.EncoderThreads > 0) args.AddRange(["-threads", spec.EncoderThreads.ToString(invariant)]);
         args.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", spec.OutputPath]);
+        if (wantPreview)
+            // The companion: same video, voice only. veryfast - it is only for in-app preview, never uploaded.
+            args.AddRange(["-map", "[voutpreview]", "-map", "[voicepreview]", "-t", Number(total),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", spec.Crf.ToString(invariant),
+                "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", spec.PreviewOutputPath!]);
         return args;
     }
 

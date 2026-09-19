@@ -38,6 +38,32 @@ public static partial class PodcastSplitEndpoints
             return Results.Ok(new { plan.SourceAssetId, Title = title, Pieces = pieces, plan.MusicAssetId });
         }).WithTags("Edit style");
 
+        // What the app's live preview needs for one clip: the music-free companion video, the song and
+        // where it starts, and the clip's current voice/music levels (its own override, else campaign
+        // default). The player plays the companion and mixes the song on top under the sliders.
+        api.MapGet("/edit-plans/{planId:guid}/preview", async (Guid planId, AppDbContext db,
+            WorkspaceService workspace, CancellationToken ct) =>
+        {
+            var plan = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == planId, ct);
+            if (plan is null) return Results.NotFound();
+            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+            if (extras?.PodcastSplit is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
+            var campaign = await db.Campaigns.AsNoTracking().SingleOrDefaultAsync(x => x.Id == plan.CampaignId, ct);
+            var style = campaign?.ReadEditStyle() ?? new CampaignEditStyleDto();
+            var name = WorkspaceService.SafeFileName(System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName), "clip");
+            var previewAbs = workspace.ResolveRelative(System.IO.Path.Combine("campaigns", plan.CampaignId.ToString("N"),
+                "output", plan.Platform.ToString().ToLowerInvariant(), $"{name}-{plan.Id:N}.preview.mp4"));
+            return Results.Ok(new
+            {
+                campaignId = plan.CampaignId,
+                previewRelativePath = System.IO.File.Exists(previewAbs) ? workspace.ToRelative(previewAbs) : null,
+                musicAssetId = plan.MusicAssetId,
+                musicStartSeconds = extras.MusicStartSeconds ?? 0,
+                voiceVolume = extras.VoiceVolume ?? style.VoiceVolume,
+                musicVolume = extras.MusicVolume ?? style.MusicVolume,
+            });
+        }).WithTags("Edit style");
+
         // Re-render one clip from its stored story, picking up the campaign's current voice/music
         // volumes. This is what the app's "Re-render" button calls after the sliders are adjusted.
         api.MapPost("/edit-plans/{planId:guid}/rerender", async (Guid planId, double? voiceVolume, double? musicVolume,

@@ -862,6 +862,8 @@ public static class ApiEndpoints
 
             var clips = Directory.EnumerateFiles(outputRoot, "*", SearchOption.AllDirectories)
                 .Where(x => RenderedClipExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
+                // The music-free preview companion sits beside the final; it is for the in-app player, not a clip.
+                .Where(x => !x.EndsWith(".preview.mp4", StringComparison.OrdinalIgnoreCase))
                 .Select(path =>
                 {
                     var info = new FileInfo(path);
@@ -1182,6 +1184,23 @@ public static class ApiEndpoints
             if (!string.IsNullOrWhiteSpace(search)) query = query.Where(x => x.FileName.ToLower().Contains(search.ToLower()));
             if (kind.HasValue) query = query.Where(x => x.Kind == kind); if (favorite.HasValue) query = query.Where(x => x.IsFavorite == favorite);
             return Results.Ok((await query.OrderBy(x => x.FileName).ToListAsync(ct)).Select(x => x.ToDto()));
+        });
+        // Streams a music/sfx file with range support, so the app's live preview can play a song under
+        // the sliders. Serves only a file that is still inside its indexed location folder.
+        media.MapGet("/assets/{id:guid}/file", async (Guid id, AppDbContext db, CancellationToken ct) =>
+        {
+            var asset = await db.MediaLibraryAssets.AsNoTracking().Include(x => x.Location)
+                .SingleOrDefaultAsync(x => x.Id == id, ct);
+            if (asset is null) return Results.NotFound();
+            var full = Path.GetFullPath(asset.FullPath);
+            if (!full.StartsWith(Path.GetFullPath(asset.Location.Path), StringComparison.OrdinalIgnoreCase) || !File.Exists(full))
+                return Results.NotFound();
+            var contentType = Path.GetExtension(full).ToLowerInvariant() switch
+            {
+                ".mp3" => "audio/mpeg", ".m4a" or ".aac" => "audio/mp4", ".wav" => "audio/wav",
+                ".ogg" => "audio/ogg", ".flac" => "audio/flac", _ => "application/octet-stream"
+            };
+            return Results.File(full, contentType, Path.GetFileName(full), enableRangeProcessing: true);
         });
         media.MapPut("/assets/{id:guid}", async (Guid id, UpdateMediaAssetRequest request, AppDbContext db, CancellationToken ct) =>
         {
