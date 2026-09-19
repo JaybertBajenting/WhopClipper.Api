@@ -430,12 +430,13 @@ def topcrop(args):
         cartoon_pick = [any(b[4] < 0.15 and b[2] * b[3] > 0.03 * frame_w * frame_h for b in d) for d in detections]
         centres = [(r[0][0] + r[0][2] / 2.0, r[0][1] + r[0][3] / 2.0) for r in reals_per_pick if r]
         max_real = max((r[0][2] for r in reals_per_pick if r), default=0)
-        multi_person = sum(1 for r in reals_per_pick if len(r) >= 2) > len(picks) // 2
-        wide_graphic = sum(cartoon_pick) > len(picks) // 2
-        small_subject = bool(centres) and max_real < 0.12 * frame_w
-        # A wide or multi-person shot is shown whole (letterboxed) so the speaker is never cut off; a
-        # clean single close-up is cropped tight on the guest, which is the channel's look.
-        fit = multi_person or wide_graphic or small_subject or not centres and sum(cartoon_pick) > 0
+        # Letterbox the whole frame ONLY for a genuinely wide shot - the guest's face is tiny or there is
+        # no real face at all - so nobody is cut off. A normal close-up gets a tight crop even though the
+        # cartoon caricatures are painted on the back wall behind the guest; the skin filter keeps that
+        # crop on the person, not the wall. Triggering on the mere presence of the wall art letterboxed
+        # almost every shot and shrank the guest between black bars, which is the bug this replaces.
+        wide_shot = not centres or max_real < 0.085 * frame_w
+        fit = wide_shot and (not centres or sum(cartoon_pick) > 0)
         if fit:
             rect = area  # the whole frame; the renderer scales it to fit and pads
         else:
