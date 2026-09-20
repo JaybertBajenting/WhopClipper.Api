@@ -80,7 +80,10 @@ public static partial class PodcastSplitEndpoints
                 Math.Round(p.EndSeconds + split.EpisodeOffsetSeconds, 3))).ToList();
             var title = string.IsNullOrWhiteSpace(split.Title)
                 ? System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName) : split.Title;
-            var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId, voiceVolume, musicVolume);
+            // This clip replaces the one being re-rendered, so the old file is retired once the new one
+            // renders - otherwise every tweak left another copy of the same moment in the list.
+            var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId, voiceVolume, musicVolume,
+                SupersedesEditPlanId: plan.Id);
             var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.SourcePipeline,
                 new SourcePipelineJobPayload(plan.SourceAssetId, plan.Platform, MaxClips: 1,
                     DeleteSourceWhenDone: false, Mode: AiMode.Auto, EditStyle: EditStyles.PodcastSplit,

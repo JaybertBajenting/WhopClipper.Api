@@ -28,7 +28,8 @@ public sealed partial class JobExecutionService
     private readonly Dictionary<string, AiProviderAvailability> _aiAvailability = new(StringComparer.OrdinalIgnoreCase);
 
     private sealed record ClipStory(string Title, IReadOnlyList<(double Start, double End)> EpisodePieces,
-        IReadOnlyList<string> Emphasis, Guid? MusicAssetId = null, double? VoiceVolume = null, double? MusicVolume = null);
+        IReadOnlyList<string> Emphasis, Guid? MusicAssetId = null, double? VoiceVolume = null, double? MusicVolume = null,
+        Guid? SupersedesEditPlanId = null);
 
     private sealed record EpisodeWords(IReadOnlyList<TranscriptWord> Words, double DurationSeconds, string Origin);
 
@@ -60,7 +61,7 @@ public sealed partial class JobExecutionService
         IReadOnlyList<ClipStory> stories = payload.Stories is { Count: > 0 } imported
             ? imported.Select(x => new ClipStory(x.Title,
                 StoryParser.Merge(x.Pieces.Select(p => (p.StartSeconds, p.EndSeconds))), [], x.MusicAssetId,
-                x.VoiceVolume, x.MusicVolume)).ToList()
+                x.VoiceVolume, x.MusicVolume, x.SupersedesEditPlanId)).ToList()
             : (await SelectStoriesAsync(payload, campaignId, source, episode, cancellationToken))
                 .Take(Math.Clamp(payload.MaxClips, 1, 15)).ToList();
         job.Progress = .12;
@@ -98,12 +99,15 @@ public sealed partial class JobExecutionService
                 job.PayloadJson = JsonSerializer.Serialize(new RenderJobPayload(plan.Id), JsonDefaults.Serializer);
                 job.ResultJson = null;
                 await RenderAsync(job, cancellationToken);
+                // Only now that the new cut exists is it safe to drop the one it replaces: a re-render that
+                // failed above leaves the old clip untouched rather than losing both.
+                var retired = await RetireSupersededPlanAsync(story.SupersedesEditPlanId, plan.Id, cancellationToken);
                 var split = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)?.PodcastSplit;
                 clips.Add(new
                 {
                     title = story.Title, editPlanId = plan.Id, render = JsonDefaults.ParseElement(job.ResultJson),
                     pieces = split?.Pieces.Count, cameraShots = split?.TopShots.Count, brollShots = split?.Broll.Count,
-                    gaps = split?.Gaps,
+                    gaps = split?.Gaps, replaced = retired,
                 });
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -367,6 +371,45 @@ public sealed partial class JobExecutionService
         }
         throw new InvalidOperationException(
             $"Could not download {start:0}-{end:0}s of {url}. {(last?.TimedOut == true ? "The download timed out." : Tail(last?.StandardError))}");
+    }
+
+    /// <summary>
+    /// Deletes the cut a freshly rendered clip replaces, so a re-render supersedes the old file instead of
+    /// leaving two versions of the same moment in the list. Call only after the new render has succeeded.
+    /// The clips list is a scan of the output folder, so removing the files is what retires the clip; the
+    /// plan row stays because job history points at it. Never throws: losing the old file is not worth
+    /// failing a clip that rendered fine.
+    /// </summary>
+    private async Task<string?> RetireSupersededPlanAsync(Guid? supersededId, Guid replacementId,
+        CancellationToken cancellationToken)
+    {
+        if (supersededId is not { } oldId || oldId == replacementId) return null;
+        try
+        {
+            var old = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == oldId, cancellationToken);
+            if (old is null) return null;
+            var directory = workspace.ResolveRelative(Path.Combine("campaigns", old.CampaignId.ToString("N"),
+                "output", old.Platform.ToString().ToLowerInvariant()));
+            var name = WorkspaceService.SafeFileName(Path.GetFileNameWithoutExtension(old.OutputFileName), "clip");
+            var removed = 0;
+            foreach (var suffix in new[] { ".mp4", ".preview.mp4" })
+            {
+                var path = Path.Combine(directory, $"{name}-{old.Id:N}{suffix}");
+                WorkspaceService.EnsureInside(directory, path);
+                if (!File.Exists(path)) continue;
+                File.Delete(path);
+                removed++;
+            }
+            if (removed == 0) return null;
+            logger.LogInformation("Re-render {New} replaced clip {Old}; removed {Count} superseded file(s).",
+                replacementId, oldId, removed);
+            return old.OutputFileName;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Could not retire superseded clip {Old} after re-render {New}.", oldId, replacementId);
+            return null;
+        }
     }
 
     /// <summary>Length of any media file in seconds, 0 when ffprobe cannot read it. Used for audio-only

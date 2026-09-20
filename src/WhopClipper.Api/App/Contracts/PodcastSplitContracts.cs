@@ -36,8 +36,10 @@ public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 /// re-render a clip with a different song, for example to replace one that drowned the speech.</param>
 /// <param name="VoiceVolume">Per-clip voice gain, overriding the campaign default. Null follows the campaign.</param>
 /// <param name="MusicVolume">Per-clip music gain, overriding the campaign default. Null follows the campaign.</param>
+/// <param name="SupersedesEditPlanId">The cut this one replaces. Retired only once this clip renders, so a
+/// failed re-render still leaves the old clip in place.</param>
 public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces, Guid? MusicAssetId = null,
-    double? VoiceVolume = null, double? MusicVolume = null);
+    double? VoiceVolume = null, double? MusicVolume = null, Guid? SupersedesEditPlanId = null);
 
 /// <param name="Url">Registers the episode on the campaign first when it is not already a source.</param>
 public sealed record ImportStoriesRequest(IReadOnlyList<ImportedStoryDto> Stories, Guid? SourceAssetId = null,
