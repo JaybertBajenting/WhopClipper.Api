@@ -29,7 +29,7 @@ public sealed partial class JobExecutionService
 
     private sealed record ClipStory(string Title, IReadOnlyList<(double Start, double End)> EpisodePieces,
         IReadOnlyList<string> Emphasis, Guid? MusicAssetId = null, double? VoiceVolume = null, double? MusicVolume = null,
-        Guid? SupersedesEditPlanId = null);
+        Guid? SupersedesEditPlanId = null, string Caption = "");
 
     private sealed record EpisodeWords(IReadOnlyList<TranscriptWord> Words, double DurationSeconds, string Origin);
 
@@ -61,7 +61,7 @@ public sealed partial class JobExecutionService
         IReadOnlyList<ClipStory> stories = payload.Stories is { Count: > 0 } imported
             ? imported.Select(x => new ClipStory(x.Title,
                 StoryParser.Merge(x.Pieces.Select(p => (p.StartSeconds, p.EndSeconds))), [], x.MusicAssetId,
-                x.VoiceVolume, x.MusicVolume, x.SupersedesEditPlanId)).ToList()
+                x.VoiceVolume, x.MusicVolume, x.SupersedesEditPlanId, x.Caption)).ToList()
             : (await SelectStoriesAsync(payload, campaignId, source, episode, cancellationToken))
                 .Take(Math.Clamp(payload.MaxClips, 1, 15)).ToList();
         job.Progress = .12;
@@ -230,8 +230,27 @@ public sealed partial class JobExecutionService
             - End on the punchline or payoff line, never mid-thought.
             - Pieces are transcript times in seconds, in the order they are spoken. Each transcript line runs until the
               next line's timestamp.
-            - title: a short hook in the channel's voice, like a YouTube Shorts title. No dashes.
             - emphasis: at most five words a viewer should notice - a name, a number, the punch word.
+
+            title and caption are measured from the reference channel's own posts. Copy that pattern exactly:
+            - title: 4 to 9 words, naming the person it is about, ending with ONE emoji. Sentence case, not Title
+              Case. Say the specific thing - the amount of money, the opponent, the number - and withhold the
+              payoff so the viewer taps. No hashtags, no dashes, no quotes around the whole line. Pick the emoji
+              for the sport or the reaction: boxing and MMA get a glove, NFL a football, MLB a baseball, NBA a
+              basketball, golf a golf flag; otherwise a face that matches the beat.
+            - caption: ONE sentence, 12 to 25 words, and NOT the title written again. Name the person who tells
+              the story - usually the guest or host speaking - then the detail the title held back, ending with an
+              emoji. About a third of the time finish with a short question to the viewer.
+            - Real posts from this channel, as the pattern to match:
+              title "What Nate Diaz did with his first $15K" + glove emoji
+              caption "Urijah Faber reveals how Nate Diaz tried to spend his first $15K after winning Ultimate Fighter"
+              title "Cris Carter's Shedeur Sanders conspiracy" + eyes emoji
+              caption "Cris Carter on why the Browns might be burying Shedeur Sanders... what's your take?"
+              title "The time Ray Lewis LEVELED Cris Carter" + collision emoji
+              caption "Cris Carter tells the story of how Ray Lewis delivered one of the hardest hits of his NFL career"
+              title "Antonio Gates ranks NFL's top 3 tight ends" + football emoji
+              caption "NFL hall of famer Antonio Gates ranks the league's top 3 tight ends, do you agree?"
+            - A word may be ALL CAPS in the title for emphasis, at most one per title, as in LEVELED above.
             - Nothing that shows the guests or the podcast in a negative light. Follow the approved requirements.
             Return every genuinely strong story, strongest first, up to fifteen - a rich episode has more,
             a thin one has fewer. Do not pad the list with weak moments to reach a count.
@@ -245,7 +264,7 @@ public sealed partial class JobExecutionService
         var stories = StoryParser.ParseStories(element, episode.DurationSeconds);
         if (stories.Count == 0)
             throw new InvalidOperationException("The AI returned no story that fits 10-60 seconds from within ten minutes of the episode.");
-        return stories.Select(x => new ClipStory(x.Title, x.Pieces, x.Emphasis)).ToList();
+        return stories.Select(x => new ClipStory(x.Title, x.Pieces, x.Emphasis, Caption: x.Caption)).ToList();
     }
 
     private async Task<EditPlan> BuildPodcastSplitPlanAsync(SourcePipelineJobPayload payload, Guid campaignId,
@@ -331,7 +350,8 @@ public sealed partial class JobExecutionService
             IsApproved = true,
             ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(EditStyles.PodcastSplit, null, "Seam",
                 style.MusicDuckingDb, [], [], PodcastSplit: split, MusicStartSeconds: track?.SegmentStartSeconds,
-                VoiceVolume: story.VoiceVolume, MusicVolume: story.MusicVolume), JsonDefaults.Serializer)
+                VoiceVolume: story.VoiceVolume, MusicVolume: story.MusicVolume,
+                Caption: string.IsNullOrWhiteSpace(story.Caption) ? null : story.Caption), JsonDefaults.Serializer)
         };
     }
 

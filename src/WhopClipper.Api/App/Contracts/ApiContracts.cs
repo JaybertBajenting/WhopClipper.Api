@@ -122,7 +122,7 @@ public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, s
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects, IReadOnlyList<OverlayDto> Overlays,
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
     PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null,
-    double? VoiceVolume = null, double? MusicVolume = null);
+    double? VoiceVolume = null, double? MusicVolume = null, string? Caption = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,

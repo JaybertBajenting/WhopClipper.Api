@@ -22,12 +22,17 @@ public static partial class ClipCaptionComposer
     public static ClipPublishCopy Compose(EditPlan? plan, PlatformProfile? profile, string fileName)
     {
         var title = TitleFor(plan, fileName);
-        var builder = new StringBuilder(title);
+        var extras = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+
+        // The reference channel's caption is its own sentence - who told the story and what the payoff
+        // was - never the title typed again, which is what a viewer already read. When a clip was
+        // written with one, it opens the caption and the title is not repeated above it.
+        var written = Coalesce(extras?.Caption);
+        var builder = new StringBuilder(written ?? title);
 
         var template = profile?.CaptionTemplate?.Trim();
         if (!string.IsNullOrEmpty(template)) builder.AppendLine().AppendLine().Append(template);
 
-        var extras = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
         var cta = Coalesce(extras?.CtaOverlayText, profile?.CallToAction);
         if (cta is not null) builder.AppendLine().AppendLine().Append(cta);
 
@@ -37,11 +42,27 @@ public static partial class ClipCaptionComposer
             builder.AppendLine().AppendLine().Append(disclosure);
 
         var mentions = profile is null ? [] : JsonDefaults.Parse(profile.RequiredMentionsJson, Array.Empty<string>());
+        // A clip written in the reference channel's voice carries only the tags the brief demands. That
+        // channel posts no hashtags at all, so the invented reach tags - the platform tag and names
+        // lifted out of the hook - would be the one thing marking these posts as not theirs.
         var tags = mentions.Select(x => x.Trim()).Where(x => x.Length > 0)
-            .Concat(HashtagsFor(plan, profile, title)).ToList();
+            .Concat(written is null ? HashtagsFor(plan, profile, title) : RequiredTagsFor(profile)).ToList();
         if (tags.Count > 0) builder.AppendLine().AppendLine().Append(string.Join(' ', tags));
 
         return new ClipPublishCopy(title, builder.ToString().Trim());
+    }
+
+    /// <summary>
+    /// Only the tags the campaign makes a payout condition, in the casing the brief wrote them in.
+    /// Used for clips that carry their own caption, where matching the channel's voice matters more
+    /// than the extra reach a pile of tags buys.
+    /// </summary>
+    internal static IReadOnlyList<string> RequiredTagsFor(PlatformProfile? profile)
+    {
+        if (profile is null) return [];
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return JsonDefaults.Parse(profile.RequiredHashtagsJson, Array.Empty<string>())
+            .Select(x => Normalize(x, false)).OfType<string>().Where(seen.Add).ToList();
     }
 
     /// <summary>Total tags on one post. Past a dozen it reads as spam and platforms discount them.</summary>
@@ -141,6 +162,12 @@ public static partial class ClipCaptionComposer
         var extras = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
         var hook = extras?.Overlays?.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.Text))?.Text;
         if (!string.IsNullOrWhiteSpace(hook)) return Trim(hook.Trim().Trim('"', '“', '”'));
+
+        // A podcast-split clip has no hook card, so its title is the story it was cut from. Take it from
+        // the plan rather than the file name: the name is a slug, and slugging drops the trailing emoji
+        // and the apostrophes the reference channel's titles are built on.
+        if (extras?.PodcastSplit?.Title is { Length: > 0 } storyTitle)
+            return Trim(storyTitle.Trim().Trim('"', '“', '”'));
 
         var stem = Path.GetFileNameWithoutExtension(plan?.OutputFileName ?? fileName);
         // "<slug>-<32 hex job id>" - drop the id, then make the slug readable again.

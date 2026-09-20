@@ -38,8 +38,10 @@ public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 /// <param name="MusicVolume">Per-clip music gain, overriding the campaign default. Null follows the campaign.</param>
 /// <param name="SupersedesEditPlanId">The cut this one replaces. Retired only once this clip renders, so a
 /// failed re-render still leaves the old clip in place.</param>
+/// <param name="Caption">The post's own sentence. Carried through a re-render so a clip does not lose
+/// the caption it was written with and fall back to repeating its title.</param>
 public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces, Guid? MusicAssetId = null,
-    double? VoiceVolume = null, double? MusicVolume = null, Guid? SupersedesEditPlanId = null);
+    double? VoiceVolume = null, double? MusicVolume = null, Guid? SupersedesEditPlanId = null, string Caption = "");
 
 /// <param name="Url">Registers the episode on the campaign first when it is not already a source.</param>
 public sealed record ImportStoriesRequest(IReadOnlyList<ImportedStoryDto> Stories, Guid? SourceAssetId = null,
@@ -83,3 +85,6 @@ public sealed record PodcastSplitPlanDto(string SpanRelativePath, int SpanWidth,
 /// <summary>Point one clip at a specific bed. Null <paramref name="MusicStartSeconds"/> falls back to the
 /// asset's own segment start from the folder guide, so each song still enters at its marked hook.</summary>
 public sealed record SetPlanMusicRequest(Guid? MusicAssetId, double? MusicStartSeconds);
+
+/// <summary>Rewrite the title and caption a finished clip is uploaded with.</summary>
+public sealed record SetPlanCopyRequest(string? Title, string? Caption);

@@ -73,7 +73,8 @@ public static partial class PodcastSplitEndpoints
                 return Results.BadRequest(new { error = "Voice volume is 0-4 and music volume is 0-1." });
             var plan = await db.EditPlans.AsNoTracking().SingleOrDefaultAsync(x => x.Id == planId, ct);
             if (plan is null) return Results.NotFound();
-            var split = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)?.PodcastSplit;
+            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+            var split = extras?.PodcastSplit;
             if (split is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
             var pieces = split.Pieces.Select(p => new StoryPieceDto(
                 Math.Round(p.StartSeconds + split.EpisodeOffsetSeconds, 3),
@@ -83,12 +84,33 @@ public static partial class PodcastSplitEndpoints
             // This clip replaces the one being re-rendered, so the old file is retired once the new one
             // renders - otherwise every tweak left another copy of the same moment in the list.
             var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId, voiceVolume, musicVolume,
-                SupersedesEditPlanId: plan.Id);
+                SupersedesEditPlanId: plan.Id, Caption: extras?.Caption ?? string.Empty);
             var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.SourcePipeline,
                 new SourcePipelineJobPayload(plan.SourceAssetId, plan.Platform, MaxClips: 1,
                     DeleteSourceWhenDone: false, Mode: AiMode.Auto, EditStyle: EditStyles.PodcastSplit,
                     Stories: new[] { story }), ct);
             return Results.Accepted("/api/jobs", job.ToDto());
+        }).WithTags("Edit style");
+
+        // Rewrite one clip's title and caption. For a podcast split these are metadata - the words on
+        // screen are the seam captions, not the title - so this needs no re-render. The file keeps the
+        // name it was rendered under; the title shown and copied comes from the plan.
+        api.MapPut("/edit-plans/{planId:guid}/copy", async (Guid planId, SetPlanCopyRequest request,
+            AppDbContext db, CancellationToken ct) =>
+        {
+            var title = request.Title?.Trim() ?? string.Empty;
+            var caption = request.Caption?.Trim() ?? string.Empty;
+            if (title.Length is 0 or > 200) return Results.BadRequest(new { error = "Title is 1-200 characters." });
+            if (caption.Length > 2200) return Results.BadRequest(new { error = "Caption is at most 2200 characters." });
+            var plan = await db.EditPlans.SingleOrDefaultAsync(x => x.Id == planId, ct);
+            if (plan is null) return Results.NotFound();
+            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+            if (extras?.PodcastSplit is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
+            plan.ExtraSettingsJson = JsonSerializer.Serialize(
+                extras with { PodcastSplit = extras.PodcastSplit with { Title = title }, Caption = caption },
+                JsonDefaults.Serializer);
+            await db.SaveChangesAsync(ct);
+            return Results.Ok(new { title, caption });
         }).WithTags("Edit style");
 
         // Point one clip at a specific bed without re-rendering it. Updates the plan's music id and the

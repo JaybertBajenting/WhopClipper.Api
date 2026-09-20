@@ -32,6 +32,50 @@ public sealed class ClipCaptionComposerTests
         CallToAction = cta,
     };
 
+    /// <summary>A podcast-split plan: no hook card, a story title, and the caption written with it.</summary>
+    private static EditPlan PodcastPlan(string title, string caption) => new()
+    {
+        Platform = PlatformKind.TikTok,
+        OutputFileName = "story-01.mp4",
+        ExtraSettingsJson = JsonSerializer.Serialize(new EditPlanExtrasDto(
+            "Seam", null, "Seam", -14, [], [],
+            PodcastSplit: new PodcastSplitPlanDto("span.mp4", 1920, 1080, [], [], [], [], [], [], 0, title),
+            Caption: caption), JsonDefaults.Serializer),
+    };
+
+    /// <summary>
+    /// The reference channel's title carries a trailing emoji and apostrophes; the file name is a slug
+    /// that drops both, so the title has to come off the plan.
+    /// </summary>
+    [Fact]
+    public void KeepsTheStoryTitleRatherThanTheSluggedFileName()
+    {
+        var copy = ClipCaptionComposer.Compose(
+            PodcastPlan("Teofimo's warning for Ryan Garcia 😳", "Teofimo Lopez vs Ryan Garcia next? 👀"),
+            Profile(), "story-01-abc.mp4");
+        Assert.Equal("Teofimo's warning for Ryan Garcia 😳", copy.Title);
+    }
+
+    /// <summary>
+    /// That channel's caption is its own sentence and carries no hashtags of its own, so a clip written
+    /// with one must not repeat its title, and must not pick up the invented reach tags.
+    /// </summary>
+    [Fact]
+    public void UsesTheWrittenCaptionAndOnlyTheRequiredHashtag()
+    {
+        var copy = ClipCaptionComposer.Compose(
+            PodcastPlan("The time Ray Lewis LEVELED Cris Carter 💥",
+                "Cris Carter tells the story of how Ray Lewis delivered one of the hardest hits of his NFL career 😳"),
+            Profile(hashtags: ["#DoubleCoverage"]), "x.mp4");
+
+        Assert.StartsWith("Cris Carter tells the story", copy.Caption);
+        Assert.Contains("#DoubleCoverage", copy.Caption);
+        Assert.DoesNotContain("#fyp", copy.Caption);
+        Assert.DoesNotContain("#raylewis", copy.Caption);
+        // The title is the hook the viewer already read; repeating it above the caption is the tell.
+        Assert.DoesNotContain("LEVELED", copy.Caption);
+    }
+
     [Fact]
     public void TakesTheTitleFromTheHookBurnedOntoTheClip()
     {

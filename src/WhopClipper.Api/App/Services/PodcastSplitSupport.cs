@@ -123,7 +123,9 @@ public static class PieceSnapper
     }
 }
 
-public sealed record CondensedStory(string Title, string Rationale, double Score,
+/// <param name="Caption">The post's own sentence, which is not the title again: on the reference
+/// channel the title is the hook and the caption names who is telling it and what the payoff was.</param>
+public sealed record CondensedStory(string Title, string Caption, string Rationale, double Score,
     IReadOnlyList<(double Start, double End)> Pieces, IReadOnlyList<string> Emphasis)
 {
     public double Seconds => Pieces.Sum(x => x.End - x.Start);
@@ -135,7 +137,7 @@ public sealed record BrollPlan(IReadOnlyList<BrollMoment> Moments, IReadOnlyList
 public static class StorySchemas
 {
     public const string Stories = """
-    {"title":"WhopClipperStoriesV1","type":"object","additionalProperties":false,"required":["stories"],"properties":{"stories":{"type":"array","minItems":1,"maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["title","rationale","score","pieces","emphasis"],"properties":{"title":{"type":"string"},"rationale":{"type":"string"},"score":{"type":"number","minimum":0,"maximum":1},"pieces":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["startSeconds","endSeconds"],"properties":{"startSeconds":{"type":"number","minimum":0},"endSeconds":{"type":"number","minimum":0}}}},"emphasis":{"type":"array","maxItems":20,"items":{"type":"string"}}}}}}}
+    {"title":"WhopClipperStoriesV1","type":"object","additionalProperties":false,"required":["stories"],"properties":{"stories":{"type":"array","minItems":1,"maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["title","caption","rationale","score","pieces","emphasis"],"properties":{"title":{"type":"string"},"caption":{"type":"string"},"rationale":{"type":"string"},"score":{"type":"number","minimum":0,"maximum":1},"pieces":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["startSeconds","endSeconds"],"properties":{"startSeconds":{"type":"number","minimum":0},"endSeconds":{"type":"number","minimum":0}}}},"emphasis":{"type":"array","maxItems":20,"items":{"type":"string"}}}}}}}
     """;
 
     public const string Broll = """
@@ -177,7 +179,10 @@ public static class StoryParser
             if (merged[^1].End - merged[0].Start > MaximumSpanSeconds) continue;
 
             var score = TryNumber(item, "score", out var value) ? Math.Clamp(value, 0, 1) : 0;
-            result.Add(new CondensedStory(AiOutputParser.CleanHookText(title), ReadString(item, "rationale") ?? string.Empty,
+            // The caption keeps its own punctuation and emoji: CleanHookText is for text burned on the
+            // video, where a stray quote or dash matters, not for a line pasted into an upload form.
+            result.Add(new CondensedStory(AiOutputParser.CleanHookText(title),
+                (ReadString(item, "caption") ?? string.Empty).Trim(), ReadString(item, "rationale") ?? string.Empty,
                 score, merged, ReadStrings(item, "emphasis")));
         }
         return result.OrderByDescending(x => x.Score).ToList();
