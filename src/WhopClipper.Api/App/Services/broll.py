@@ -427,33 +427,28 @@ def topcrop(args):
         # is only large when the camera is wide, so its presence marks a wide shot.
         detections = [face_boxes(cv2, np, cascades, f) for f in picks]
         reals_per_pick = [[b for b in d if b[4] >= 0.3] for d in detections]
-        cartoon_pick = [any(b[4] < 0.15 and b[2] * b[3] > 0.03 * frame_w * frame_h for b in d) for d in detections]
         centres = [(r[0][0] + r[0][2] / 2.0, r[0][1] + r[0][3] / 2.0) for r in reals_per_pick if r]
-        max_real = max((r[0][2] for r in reals_per_pick if r), default=0)
-        # Letterbox the whole frame ONLY for a genuinely wide shot - the guest's face is tiny or there is
-        # no real face at all - so nobody is cut off. A normal close-up gets a tight crop even though the
-        # cartoon caricatures are painted on the back wall behind the guest; the skin filter keeps that
-        # crop on the person, not the wall. Triggering on the mere presence of the wall art letterboxed
-        # almost every shot and shrank the guest between black bars, which is the bug this replaces.
-        wide_shot = not centres or max_real < 0.085 * frame_w
-        fit = wide_shot and (not centres or sum(cartoon_pick) > 0)
-        if fit:
-            rect = area  # the whole frame; the renderer scales it to fit and pads
+        # The camera half is ALWAYS cropped to fill, never letterboxed. Scaling a 16:9 angle to fit this
+        # 1080x960 window leaves black bands above and below the host, which reads as a broken video on a
+        # phone, and the reference channel never does it. Earlier attempts letterboxed "wide" shots so
+        # nobody got cut off, but a podcast two-shot puts every face under a tenth of the frame width, so
+        # that fired on almost every shot. Losing the edges of the desk beats bars through the middle.
+        if centres:
+            focus = (sorted(p[0] for p in centres)[len(centres) // 2], sorted(p[1] for p in centres)[len(centres) // 2])
         else:
-            if centres:
-                focus = (sorted(p[0] for p in centres)[len(centres) // 2], sorted(p[1] for p in centres)[len(centres) // 2])
-            else:
-                skins = [s for s in (skin_focus(cv2, np, f) for f in picks) if s is not None]
-                focus = (sorted(p[0] for p in skins)[len(skins) // 2], sorted(p[1] for p in skins)[len(skins) // 2]) if skins else previous_focus
-            # The measured Double Coverage punch-in and no tighter, with the face a third of the way down
-            # so the top of the head stays in: centring it at 42% cut off a seated guest's forehead.
-            rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0,), height_fraction=args.height_fraction,
-                                  keep_focus=True, face_at=0.3)
-            previous_focus = focus if focus is not None else previous_focus
+            # No skin-backed face: follow the largest skin blob, else hold the last shot's focus, so the
+            # crop stays on the person rather than snapping to the caricatures painted on the back wall.
+            skins = [s for s in (skin_focus(cv2, np, f) for f in picks) if s is not None]
+            focus = (sorted(p[0] for p in skins)[len(skins) // 2], sorted(p[1] for p in skins)[len(skins) // 2]) if skins else previous_focus
+        # The measured Double Coverage punch-in and no tighter, with the face a third of the way down
+        # so the top of the head stays in: centring it at 42% cut off a seated guest's forehead.
+        rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0,), height_fraction=args.height_fraction,
+                              keep_focus=True, face_at=0.3)
+        previous_focus = focus if focus is not None else previous_focus
         shots.append({
             "in": round(shot["in"], 3), "duration": round(shot["duration"], 3),
             "crop": to_source(rect, scale, width, height),
-            "blur": [] if fit else blur_boxes(boxes, rect), "face": bool(centres), "fit": bool(fit),
+            "blur": blur_boxes(boxes, rect), "face": bool(centres), "fit": False,
         })
 
     # Flash frames and consecutive shots that ended up with the same box are joined, which keeps
