@@ -160,6 +160,11 @@ public static partial class ClipCaptionComposer
     internal static string TitleFor(EditPlan? plan, string fileName)
     {
         var extras = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
+        // A title written for the upload form wins over everything else. It is the line that goes
+        // BELOW the video, which is not the hook burned into the picture and does not have to match
+        // it - the hook is what a scroller sees, this is what the post is called.
+        if (extras?.Title is { Length: > 0 } chosen) return Trim(chosen.Trim());
+
         var hook = extras?.Overlays?.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.Text))?.Text;
         if (!string.IsNullOrWhiteSpace(hook)) return Trim(hook.Trim().Trim('"', '“', '”'));
 

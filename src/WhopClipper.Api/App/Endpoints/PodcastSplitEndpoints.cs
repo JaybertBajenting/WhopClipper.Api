@@ -92,9 +92,10 @@ public static partial class PodcastSplitEndpoints
             return Results.Accepted("/api/jobs", job.ToDto());
         }).WithTags("Edit style");
 
-        // Rewrite one clip's title and caption. For a podcast split these are metadata - the words on
-        // screen are the seam captions, not the title - so this needs no re-render. The file keeps the
-        // name it was rendered under; the title shown and copied comes from the plan.
+        // Rewrite the title and caption a finished clip is uploaded with - the lines that go below the
+        // video, not the hook burned into the picture, so this needs no re-render and works for any
+        // clip. A podcast split also gets its story title updated, so a later re-render keeps the
+        // rewritten name instead of reverting to the one the AI first picked.
         api.MapPut("/edit-plans/{planId:guid}/copy", async (Guid planId, SetPlanCopyRequest request,
             AppDbContext db, CancellationToken ct) =>
         {
@@ -104,10 +105,15 @@ public static partial class PodcastSplitEndpoints
             if (caption.Length > 2200) return Results.BadRequest(new { error = "Caption is at most 2200 characters." });
             var plan = await db.EditPlans.SingleOrDefaultAsync(x => x.Id == planId, ct);
             if (plan is null) return Results.NotFound();
-            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
-            if (extras?.PodcastSplit is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
+            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)
+                ?? new EditPlanExtrasDto("SmartCrop", null, null, -12, [], []);
             plan.ExtraSettingsJson = JsonSerializer.Serialize(
-                extras with { PodcastSplit = extras.PodcastSplit with { Title = title }, Caption = caption },
+                extras with
+                {
+                    Title = title,
+                    Caption = caption,
+                    PodcastSplit = extras.PodcastSplit is null ? null : extras.PodcastSplit with { Title = title },
+                },
                 JsonDefaults.Serializer);
             await db.SaveChangesAsync(ct);
             return Results.Ok(new { title, caption });
