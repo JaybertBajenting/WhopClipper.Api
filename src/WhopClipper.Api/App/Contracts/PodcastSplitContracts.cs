@@ -12,7 +12,10 @@ public static class EditStyles
 {
     public const string Streamer = "Streamer";
     public const string PodcastSplit = "PodcastSplit";
-    public static bool IsKnown(string? value) => value is Streamer or PodcastSplit;
+    /// <summary>The @mambafx.luxury edit: a narrator sets the story up over a fast montage, then the vlog moment
+    /// plays in a window under a meme title, ending on a desaturated freeze with a skull.</summary>
+    public const string NarratedLuxury = "NarratedLuxury";
+    public static bool IsKnown(string? value) => value is Streamer or PodcastSplit or NarratedLuxury;
 }
 
 /// <summary>
@@ -22,11 +25,17 @@ public static class EditStyles
 /// </summary>
 /// <param name="MusicVolume">Level of the bed before ducking. The reference shorts keep music
 /// audible in the pauses, 0-9 dB under the speech.</param>
+/// <param name="CameraSeats">Who sits where on an episode's wide couch shot, left to right, keyed by the
+/// YouTube video id. The camera half holds on the seat of whoever tells the story. Without it a couch shot
+/// holds on the person seen most, which put Jingle Jared on screen through Mike Majlak's own stories.</param>
+/// <param name="SoundLocationId">The sound-effect folder a narrated clip takes its bell and camera shutter from.
+/// Without it, any enabled sound-effect folder is searched, the newest first.</param>
 public sealed record CampaignEditStyleDto(string Style = EditStyles.Streamer, double MusicVolume = 0.2,
     double MusicDuckingDb = -14, string CaptionFont = "Segoe UI Black", int CaptionFontSize = 84,
     double LogoWidthFraction = 0.2, double LogoRightMarginFraction = 0.074, double LogoTopMarginFraction = 0.071,
     double BrollShotSeconds = 2.2, Guid? MusicLocationId = null, IReadOnlyList<string>? ExcludedMusic = null,
-    double VoiceVolume = 1.0);
+    double VoiceVolume = 1.0, IReadOnlyDictionary<string, IReadOnlyList<string>>? CameraSeats = null,
+    bool SkullEnding = true, bool SoundEffects = true, Guid? SoundLocationId = null);
 
 public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 
@@ -40,8 +49,12 @@ public sealed record StoryPieceDto(double StartSeconds, double EndSeconds);
 /// failed re-render still leaves the old clip in place.</param>
 /// <param name="Caption">The post's own sentence. Carried through a re-render so a clip does not lose
 /// the caption it was written with and fall back to repeating its title.</param>
+/// <param name="Teller">Who tells the story, by name, so the camera half holds on their seat
+/// (<see cref="CampaignEditStyleDto.CameraSeats"/>).</param>
 public sealed record ImportedStoryDto(string Title, IReadOnlyList<StoryPieceDto> Pieces, Guid? MusicAssetId = null,
-    double? VoiceVolume = null, double? MusicVolume = null, Guid? SupersedesEditPlanId = null, string Caption = "");
+    double? VoiceVolume = null, double? MusicVolume = null, Guid? SupersedesEditPlanId = null, string Caption = "",
+    double? MusicStartSeconds = null, IReadOnlyList<BrollShotDto>? ReviewedBroll = null,
+    IReadOnlyList<string>? Emphasis = null, string? Teller = null);
 
 /// <param name="Url">Registers the episode on the campaign first when it is not already a source.</param>
 public sealed record ImportStoriesRequest(IReadOnlyList<ImportedStoryDto> Stories, Guid? SourceAssetId = null,
@@ -54,9 +67,11 @@ public sealed record TopShotDto(double InSeconds, double DurationSeconds, CropRe
     IReadOnlyList<CropRectDto>? Blur = null, bool Fit = false);
 
 /// <param name="Blur">Logo boxes that could not be cropped away, in bottom-half output pixels.</param>
+/// <param name="FootageId">For a shot placed by hand in the B-roll editor: the footage it was cut from, and where in
+/// that footage it starts. The editor shows which parts of a video are already used.</param>
 public sealed record BrollShotDto(string RelativePath, double InSeconds, double DurationSeconds, CropRectDto Crop,
     int SourceWidth, int SourceHeight, IReadOnlyList<CropRectDto>? Blur, string Query,
-    string? SourceUrl = null, string? SourceTitle = null);
+    string? SourceUrl = null, string? SourceTitle = null, Guid? FootageId = null, double? FootageInSeconds = null);
 
 /// <summary>A moment where no usable footage was found. Reported, never silently filled with the
 /// wrong shot.</summary>

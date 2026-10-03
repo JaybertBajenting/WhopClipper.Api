@@ -13,11 +13,21 @@ public sealed class AppOptions
     public string FfprobePath { get; set; } = "ffprobe";
     public string ClaudePath { get; set; } = "claude";
     public string CodexPath { get; set; } = "codex";
+    /// <summary>rclone, which "Move to Google Drive" uploads through. Empty or "rclone" also looks in
+    /// WinGet's Links folder, where `winget install Rclone.Rclone` puts it.</summary>
+    public string RclonePath { get; set; } = "rclone";
+    /// <summary>The rclone remote and folder finished clips move to; each campaign gets a subfolder. The
+    /// YtPipeline app already configured the "gdrive" remote on this PC.</summary>
+    public string DriveRemote { get; set; } = "gdrive:WhopClipper";
     public bool AutoMigrate { get; set; } = true;
     public int ProcessTimeoutMinutes { get; set; } = 30;
     public int MaxCapturedLogCharacters { get; set; } = 200_000;
     public AiMode DefaultAiMode { get; set; } = AiMode.Compare;
     public int MaxConcurrentMediaJobs { get; set; } = 1;
+    /// <summary>Re-run the database's Queued/Running jobs at startup. A second instance started beside the
+    /// desktop app (to try a change against real data) must set this false, or it runs the app's own
+    /// queue in parallel with it.</summary>
+    public bool RestoreQueuedJobs { get; set; } = true;
     public bool RequireEditApproval { get; set; } = true;
     public string PreferredVideoQuality { get; set; } = "Best";
     /// <summary>Browser whose cookies yt-dlp should reuse, e.g. "firefox" or "brave". Empty disables it.</summary>
@@ -28,6 +38,11 @@ public sealed class AppOptions
     public string? JsRuntime { get; set; }
     /// <summary>Python used for faster-whisper transcription. Empty falls back to "python" on PATH.</summary>
     public string? PythonPath { get; set; }
+    /// <summary>
+    /// Lets the narrated style read its narration with the Windows built-in voice when no ElevenLabs key is saved. Off
+    /// by default: it sounds robotic, and exists so the style can be tested before a key is entered.
+    /// </summary>
+    public bool AllowWindowsVoice { get; set; }
     /// <summary>
     /// Caps x264 encoder threads. Each thread holds its own frame buffers, so on a machine with
     /// little free memory a vertical 1080x1920 encode fails at encoder open with nothing but an

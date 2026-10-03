@@ -13,7 +13,14 @@ namespace WhopClipper.Api.App.Services;
 
 public sealed record SourceJobPayload(Guid SourceAssetId, bool Refresh = false, string? Quality = null);
 public sealed record AiJobPayload(Guid AnalysisRunId, Guid SourceAssetId, AiMode Mode, PlatformKind Platform, string? Transcript);
-public sealed record RenderJobPayload(Guid EditPlanId);
+public sealed record RenderJobPayload(Guid EditPlanId, Guid? MusicRemixFromPlanId = null);
+/// <param name="Manual">Footage Matthew picked in the B-roll editor. When set, no AI plans or searches anything:
+/// these shots, in order, fill the marked shots exactly.</param>
+public sealed record BrollRepairJobPayload(Guid EditPlanId, double StartSeconds, double EndSeconds,
+    string? Note = null, AiMode Mode = AiMode.Compare, IReadOnlyList<ManualBrollShot>? Manual = null);
+/// <param name="Framing">Where the 1080x960 window sits across a wide frame: 0 left edge, 0.5 centre, 1 right edge.</param>
+public sealed record ManualBrollShot(Guid FootageId, double InSeconds, double DurationSeconds, double Framing = 0.5);
+public sealed record FootageDownloadJobPayload(Guid EditPlanId, Guid FootageId);
 public sealed record ReferenceJobPayload(Guid ReferenceVideoId, bool Refresh = false);
 public sealed record TranscribeJobPayload(Guid SourceAssetId, bool Refresh = false);
 public sealed record ValidateJobPayload(string OutputRelativePath, double ExpectedMinDuration, double ExpectedMaxDuration, int Width, int Height);
@@ -36,16 +43,51 @@ public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind P
 
 public sealed class JobQueue
 {
-    private readonly Channel<Guid> _channel = Channel.CreateBounded<Guid>(new BoundedChannelOptions(100)
+    // Unbounded: every job is already persisted before it is queued, so a cap protects nothing. At 100 it
+    // made every new job - a "Re-render" click included - hang until a queued clip finished, about ten
+    // minutes, once a 130-clip re-do was waiting.
+    private readonly Channel<Guid> _channel = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
     {
-        FullMode = BoundedChannelFullMode.Wait,
+        SingleReader = false,
+        SingleWriter = false
+    });
+    // The B-roll editor's own jobs: a pasted link's download and a hand-placed preview. They take seconds and someone
+    // is sitting in the editor waiting for them, so they have their own consumers. In the single media lane, two
+    // downloads Matthew pasted sat "Downloading..." for an hour behind a nine-clip episode run.
+    private readonly Channel<Guid> _editor = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
+    {
+        SingleReader = false,
+        SingleWriter = false
+    });
+    // "Move campaign to Drive": minutes to hours of network, no CPU. In the media lane it would wait behind a clip run
+    // and hold renders up behind itself; in the editor lane it would take one of the two seats someone is waiting on.
+    private readonly Channel<Guid> _uploads = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
+    {
         SingleReader = false,
         SingleWriter = false
     });
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _running = new();
 
+    /// <summary>How many editor jobs run at once, beside the media jobs.</summary>
+    public const int EditorConsumers = 2;
+
     public ValueTask EnqueueAsync(Guid id, CancellationToken cancellationToken = default) => _channel.Writer.WriteAsync(id, cancellationToken);
+    /// <summary>Queues a job in the lane its kind belongs to.</summary>
+    public ValueTask EnqueueAsync(Guid id, JobKind kind, string payloadJson) =>
+        (kind is JobKind.DriveUpload or JobKind.DriveReturn ? _uploads : IsEditorJob(kind, payloadJson) ? _editor : _channel)
+        .Writer.WriteAsync(id, CancellationToken.None);
     public IAsyncEnumerable<Guid> ReadAllAsync(CancellationToken cancellationToken) => _channel.Reader.ReadAllAsync(cancellationToken);
+    public IAsyncEnumerable<Guid> ReadEditorAsync(CancellationToken cancellationToken) => _editor.Reader.ReadAllAsync(cancellationToken);
+    public IAsyncEnumerable<Guid> ReadUploadsAsync(CancellationToken cancellationToken) => _uploads.Reader.ReadAllAsync(cancellationToken);
+
+    /// <summary>A footage download, or a B-roll edit placed by hand. An AI repair searches and downloads many
+    /// candidates, so it stays in the media lane with everything else heavy.</summary>
+    public static bool IsEditorJob(JobKind kind, string payloadJson) => kind switch
+    {
+        JobKind.FootageDownload => true,
+        JobKind.BrollRepair => JsonDefaults.Parse<BrollRepairJobPayload?>(payloadJson, null)?.Manual is { Count: > 0 },
+        _ => false
+    };
     public CancellationToken Register(Guid id, CancellationToken hostToken)
     {
         var source = CancellationTokenSource.CreateLinkedTokenSource(hostToken);
@@ -70,7 +112,7 @@ public sealed class JobCoordinator(AppDbContext db, JobQueue queue)
         };
         db.Jobs.Add(job);
         await db.SaveChangesAsync(cancellationToken);
-        await queue.EnqueueAsync(job.Id, CancellationToken.None);
+        await queue.EnqueueAsync(job.Id, job.Kind, job.PayloadJson);
         return job;
     }
 
@@ -85,7 +127,7 @@ public sealed class JobCoordinator(AppDbContext db, JobQueue queue)
         };
         db.Jobs.Add(job);
         await db.SaveChangesAsync(cancellationToken);
-        await queue.EnqueueAsync(job.Id, CancellationToken.None);
+        await queue.EnqueueAsync(job.Id, job.Kind, job.PayloadJson);
         return job;
     }
 }
@@ -98,16 +140,22 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
         try
         {
             var consumers = Enumerable.Range(0, Math.Clamp(options.Value.MaxConcurrentMediaJobs, 1, 8))
-                .Select(_ => ConsumeAsync(stoppingToken)).ToArray();
-            await RequeuePersistedJobs(stoppingToken);
+                .Select(_ => ConsumeAsync(queue.ReadAllAsync(stoppingToken), stoppingToken))
+                .Concat(Enumerable.Range(0, JobQueue.EditorConsumers)
+                    .Select(_ => ConsumeAsync(queue.ReadEditorAsync(stoppingToken), stoppingToken)))
+                // One upload at a time: they share one connection and one rclone gate anyway.
+                .Append(ConsumeAsync(queue.ReadUploadsAsync(stoppingToken), stoppingToken))
+                .ToArray();
+            if (options.Value.RestoreQueuedJobs) await RequeuePersistedJobs(stoppingToken);
+            else logger.LogWarning("RestoreQueuedJobs is off: this instance runs only the jobs it queues itself.");
             await Task.WhenAll(consumers);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
     }
 
-    private async Task ConsumeAsync(CancellationToken stoppingToken)
+    private async Task ConsumeAsync(IAsyncEnumerable<Guid> lane, CancellationToken stoppingToken)
     {
-        await foreach (var jobId in queue.ReadAllAsync(stoppingToken))
+        await foreach (var jobId in lane)
         {
             var jobToken = queue.Register(jobId, stoppingToken);
             try
@@ -127,9 +175,9 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = await db.Jobs.Where(x => x.Status == JobStatus.Queued || x.Status == JobStatus.Running)
-                .Select(x => x.Id).ToListAsync(cancellationToken);
-            foreach (var id in ids) await queue.EnqueueAsync(id, cancellationToken);
+            var jobs = await db.Jobs.Where(x => x.Status == JobStatus.Queued || x.Status == JobStatus.Running)
+                .OrderBy(x => x.CreatedAt).Select(x => new { x.Id, x.Kind, x.PayloadJson }).ToListAsync(cancellationToken);
+            foreach (var job in jobs) await queue.EnqueueAsync(job.Id, job.Kind, job.PayloadJson);
         }
         catch (Exception ex) { logger.LogWarning(ex, "Could not restore queued jobs; the database may not be ready."); }
     }
@@ -138,7 +186,8 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
 public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
     SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist, DiskSpaceGuard diskSpace,
-    GoogleDriveClient drive, ILogger<JobExecutionService> logger)
+    GoogleDriveClient drive, VoiceOverSettingsStore voiceSettings, ElevenLabsClient elevenLabs,
+    DriveArchive driveArchive, ILogger<JobExecutionService> logger)
 {
     public async Task ExecuteAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -160,6 +209,10 @@ public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner 
                 case JobKind.ReferenceAnalysis: await AnalyzeReferenceAsync(job, cancellationToken); break;
                 case JobKind.Transcribe: await TranscribeAsync(job, cancellationToken); break;
                 case JobKind.SourcePipeline: await RunSourcePipelineAsync(job, cancellationToken); break;
+                case JobKind.BrollRepair: await PrepareBrollRepairAsync(job, cancellationToken); break;
+                case JobKind.FootageDownload: await DownloadFootageAsync(job, cancellationToken); break;
+                case JobKind.DriveUpload: await UploadCampaignToDriveAsync(job, cancellationToken); break;
+                case JobKind.DriveReturn: await BringCampaignBackFromDriveAsync(job, cancellationToken); break;
                 default: throw new InvalidOperationException($"Unsupported job kind {job.Kind}.");
             }
             job.Status = JobStatus.Completed;
@@ -234,6 +287,11 @@ public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner 
         if (await ResolveEditStyleAsync(campaignId, payload.EditStyle, cancellationToken) is { Style: EditStyles.PodcastSplit } podcastStyle)
         {
             await RunPodcastSplitPipelineAsync(job, payload, campaignId, source, podcastStyle, cancellationToken);
+            return;
+        }
+        if (await ResolveEditStyleAsync(campaignId, payload.EditStyle, cancellationToken) is { Style: EditStyles.NarratedLuxury } narratedStyle)
+        {
+            await RunNarratedPipelineAsync(job, payload, campaignId, source, narratedStyle, cancellationToken);
             return;
         }
 
@@ -403,7 +461,7 @@ public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner 
         var directory = workspace.CampaignDirectory(source.CampaignId);
         var inspectArguments = new List<string>([.. CookieArguments(), .. JsRuntimeArguments()])
         {
-            "--print", "%(.{id,title,uploader,channel,duration,thumbnail,webpage_url})j", "--no-playlist",
+            "--print", "%(.{id,title,uploader,channel,duration,thumbnail,webpage_url,upload_date,timestamp})j", "--no-playlist",
             "--skip-download", "--no-warnings", source.Url
         };
         var result = await processRunner.RunAsync(new ProcessInvocation(options.Value.YtDlpPath,
@@ -416,7 +474,8 @@ public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner 
         source.Uploader = GetString(root, "uploader") ?? GetString(root, "channel");
         source.DurationSeconds = root.TryGetProperty("duration", out var duration) && duration.TryGetDouble(out var seconds) ? seconds : null;
         source.ThumbnailUrl = GetString(root, "thumbnail");
-        source.MetadataJson = result.StandardOutput;
+        // Marked as looked up even when the site gives no date, so the date filler does not ask again.
+        source.MetadataJson = SourceDates.WithUploadDate(result.StandardOutput, GetString(root, SourceDates.UploadDateKey));
         job.ResultJson = JsonSerializer.Serialize(source.ToDto(), JsonDefaults.Serializer);
     }
 
@@ -818,9 +877,16 @@ public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner 
             throw new InvalidOperationException("The edit plan must be approved before rendering.");
         // A podcast-split plan renders from its own downloaded span, not from the source video,
         // which is never downloaded whole for this style.
+        if (IsNarratedPlan(plan))
+        {
+            await RenderNarratedAsync(job, plan, cancellationToken);
+            return;
+        }
         if (IsPodcastSplitPlan(plan))
         {
-            await RenderPodcastSplitAsync(job, plan, cancellationToken);
+            if (payload.MusicRemixFromPlanId is { } originalId)
+                await RemixPodcastAsync(job, plan, originalId, cancellationToken);
+            else await RenderPodcastSplitAsync(job, plan, cancellationToken);
             return;
         }
         var source = await db.SourceAssets.SingleAsync(x => x.Id == plan.SourceAssetId, cancellationToken);

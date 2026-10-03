@@ -3,7 +3,8 @@ namespace WhopClipper.Api.App.Domain;
 public enum CampaignStatus { Draft, Ready, Processing, NeedsReview, Completed, Archived }
 public enum PlatformKind { TikTok, InstagramReels, YouTubeShorts, X }
 public enum JobStatus { Queued, Running, Completed, Failed, Cancelled }
-public enum JobKind { InspectSource, Download, AiAnalysis, Render, Validate, ReferenceAnalysis, Transcribe, SourcePipeline }
+public enum JobKind { InspectSource, Download, AiAnalysis, Render, Validate, ReferenceAnalysis, Transcribe, SourcePipeline, BrollRepair,
+    FootageDownload, DriveUpload, DriveReturn }
 public enum AiMode { Claude, Codex, Auto, Compare }
 public enum MediaAssetKind { Music, SoundEffect }
 // Html is appended rather than inserted: these are stored as integers, so an earlier position
@@ -24,7 +25,11 @@ public enum PublishStatus
     RequiresManualAction,
     NeedsAttention,
     Failed,
-    Cancelled
+    Cancelled,
+    /// <summary>Uploaded private to YouTube with a publishAt; YouTube itself makes it public at the slot.</summary>
+    Scheduled,
+    /// <summary>Taken off the schedule: deleted from YouTube, or cancelled before it was uploaded.</summary>
+    Removed
 }
 
 public sealed class Campaign
@@ -347,4 +352,12 @@ public sealed class PublishJob
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? PublishedAt { get; set; }
+    /// <summary>The clip this attempt publishes, so the gallery can show its slot.</summary>
+    public Guid? EditPlanId { get; set; }
+    /// <summary>The daily slot at which YouTube makes the video public. Null for an immediate upload.</summary>
+    public DateTimeOffset? ScheduledPublishAt { get; set; }
+    /// <summary>A queued scheduled upload waits until this time (its slot is near, or the quota reset).</summary>
+    public DateTimeOffset? NextAttemptAt { get; set; }
+    /// <summary>The go-public time the phone notification is currently scheduled for, if any.</summary>
+    public DateTimeOffset? NotificationScheduledFor { get; set; }
 }

@@ -70,11 +70,9 @@ public static partial class FfmpegArgumentBuilder
         if (!string.IsNullOrWhiteSpace(spec.MusicPath))
         {
             musicInput = nextInput++;
-            // The hook of a track is usually a minute or two in, so the folder's guide says where to
-            // start it; from there the song simply keeps playing. The loop is only a safety net for a
-            // song that ends before the clip does.
-            if (spec.MusicStartSeconds > 0) args.AddRange(["-ss", Number(spec.MusicStartSeconds)]);
-            args.AddRange(["-stream_loop", "-1", "-t", Number(total), "-i", spec.MusicPath]);
+            // Trim the looped timeline once in the filter graph. Input seeking combined with looping
+            // can skip the entry again at a loop boundary; the selected entry must stay exact.
+            args.AddRange(["-stream_loop", "-1", "-t", Number(spec.MusicStartSeconds + total), "-i", spec.MusicPath]);
         }
 
         int? logoInput = null;
@@ -173,7 +171,7 @@ public static partial class FfmpegArgumentBuilder
 
         var loudness = spec.NormalizeAudio ? "loudnorm=I=-14:TP=-1.5:LRA=11" : "anull";
         if (musicInput is null)
-            graph.Add($"[voice0]{loudness}[aout]");
+            graph.Add($"[voice0]{loudness},volume={Number(spec.VoiceVolume)}[aout]");
         else
         {
             // Voice-forward mix. The voice is normalised to a loud, consistent target FIRST; the music
@@ -196,7 +194,7 @@ public static partial class FfmpegArgumentBuilder
             // MusicVolume - so a loud, hot-mastered track cannot beat a quietly recorded voice. At 0.2
             // that is about 14 dB under before ducking; ducking drops it further while anyone talks.
             var musicLevel = spec.NormalizeAudio ? "loudnorm=I=-14:TP=-2," : string.Empty;
-            graph.Add($"[{musicInput.Value}:a]atrim=0:{Number(total)},asetpts=PTS-STARTPTS,{musicLevel}volume={Number(spec.MusicVolume)}[musicbase]");
+            graph.Add($"[{musicInput.Value}:a]atrim=start={Number(spec.MusicStartSeconds)}:duration={Number(total)},asetpts=PTS-STARTPTS,{musicLevel}volume={Number(spec.MusicVolume)}[musicbase]");
             graph.Add($"[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio={ratio}:attack=5:release=300[musicducked]");
             // normalize=0 stops amix from dividing every input by the input count, which otherwise drops
             // the whole mix ~5 dB. The voice keeps its loudnorm level; the ducked music (measured

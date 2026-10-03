@@ -9,9 +9,10 @@ Two modes, both run on files already on disk:
       {"width","height","still","motion","shots":[{"in","duration"}],
        "crop":{"x","y","w","h"},"blur":[{"x","y","w","h"}],"logoBoxes":N}
 
-  broll.py topcrop <media> <output.json> --pieces a:b,c:d [--height-fraction 0.79]
-      Frames the podcast camera for the top half. Each piece is split at camera cuts and every shot
-      gets a fixed crop on the guest's face, moved so sponsor bugs fall outside it. Writes
+  broll.py topcrop <media> <output.json> --pieces a:b,c:d [--height-fraction 0.79] [--seat 0 --seats 2]
+      Frames the podcast camera for the top half. Each piece is split at camera cuts and each camera
+      angle gets one fixed crop, top edge kept: on the teller's seat when --seat is given, else on the
+      person seen most. Writes
       {"width","height","shots":[{"in","duration","crop":{...},"blur":[...],"face":bool}]}
 
 Crop boxes are in source pixels. Blur boxes are in output pixels of the 1080x960 half frame, for
@@ -23,6 +24,8 @@ crop loses nothing the viewer wanted; blurring is only the fallback when the bug
 """
 import argparse
 import json
+import math
+import os
 import sys
 
 TARGET_ASPECT = 1080.0 / 960.0
@@ -211,10 +214,13 @@ def intersection(a, b):
     return max(0.0, x1 - x0) * max(0.0, y1 - y0)
 
 
-def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_fraction=1.0, keep_focus=False, face_at=0.42):
+def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_fraction=1.0, keep_focus=False, face_at=0.42,
+                top_edge=False):
     """Tries crops across the picture and a few punch-ins, and keeps the one that leaves the logos
     out while staying closest to the subject. Overlap dominates the score: any logo pixel left in
-    costs more than moving off-centre."""
+    costs more than moving off-centre. top_edge keeps the frame's top edge, as the reference channel's
+    camera half always does: a crop that slid down to a seated guest's face on a wide shot brought the
+    episode's DraftKings bug in from the bottom corner, which the overlay detector had missed."""
     cx, cy, cw, ch = area
     fx, fy = focus if focus is not None else (cx + cw / 2.0, cy + ch / 2.0)
     best = None
@@ -227,8 +233,11 @@ def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_f
         # The subject's own position first, then sweeps across the frame.
         xs = [min(max(cx, fx - crop_w / 2.0), cx + cw - crop_w)]
         xs += [cx + (cw - crop_w) * k / 16.0 for k in range(17)]
-        ys = [min(max(cy, fy - face_at * crop_h), cy + ch - crop_h)]
-        ys += [cy + (ch - crop_h) * k / 4.0 for k in range(5)]
+        if top_edge:
+            ys = [cy]
+        else:
+            ys = [min(max(cy, fy - face_at * crop_h), cy + ch - crop_h)]
+            ys += [cy + (ch - crop_h) * k / 4.0 for k in range(5)]
         for x in xs:
             for y in ys:
                 rect = (x, y, crop_w, crop_h)
@@ -244,7 +253,7 @@ def choose_crop(boxes, area, focus=None, zooms=(1.0, 1.12, 1.25, 1.35), height_f
                     best = (score, rect, overlap)
     if best is None:
         # A face so close to the frame edge that no crop can centre it: frame it as well as possible.
-        return choose_crop(boxes, area, focus, zooms, height_fraction, keep_focus=False, face_at=face_at)
+        return choose_crop(boxes, area, focus, zooms, height_fraction, keep_focus=False, face_at=face_at, top_edge=top_edge)
     return best[1], best[2]
 
 
@@ -317,10 +326,53 @@ def probe(args):
                 if usable_end - usable_start >= args.min_shot:
                     shots.append({"in": round(usable_start, 3), "duration": round(usable_end - usable_start, 3)})
 
+    # Review the same short intervals the renderer can consume, not an arbitrary frame from a
+    # long search result. Each strip shows the cropped beginning, middle and ending of ONE take.
+    review_shots = []
+    for shot in shots:
+        count = max(1, math.ceil(shot["duration"] / 2.2))
+        length = shot["duration"] / count
+        if length < 0.5:
+            continue
+        for part in range(count):
+            review_shots.append({"in": round(shot["in"] + part * length, 3),
+                                 "duration": round(length, 3)})
+    review_shots = review_shots[:15]
+    source_crop = to_source(rect, scale, width, height)
+    sheets = []
+    review_capture, _, _, _, _ = open_capture(cv2, args.media)
+    measured_shots = []
+    for shot in review_shots:
+        thumbnails = []
+        for fraction in (0.05, 0.5, 0.95):
+            review_capture.set(cv2.CAP_PROP_POS_MSEC, (shot["in"] + shot["duration"] * fraction) * 1000)
+            ok, frame = review_capture.read()
+            if not ok:
+                break
+            x, y, w, h = (source_crop[k] for k in ("x", "y", "w", "h"))
+            thumbnails.append(cv2.resize(frame[y:y+h, x:x+w], (288, 256)))
+        if len(thumbnails) != 3:
+            continue
+        index = len(measured_shots)
+        strip = np.zeros((288, 864, 3), dtype=np.uint8)
+        for column, thumbnail in enumerate(thumbnails):
+            strip[32:, column*288:(column+1)*288] = thumbnail
+        cv2.putText(strip, f"SHOT {index} | {shot['in']:.3f}-{shot['in']+shot['duration']:.3f}s | start / middle / end",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        measured_shots.append((shot, strip))
+    review_capture.release()
+    for first in range(0, len(measured_shots), 5):
+        sheet_path = os.path.abspath(args.output + f".review-{first // 5 + 1}.jpg")
+        if not cv2.imwrite(sheet_path, np.vstack([s[1] for s in measured_shots[first:first+5]]),
+                           [cv2.IMWRITE_JPEG_QUALITY, 90]):
+            raise SystemExit("Could not save B-roll visual review frames.")
+        sheets.append(sheet_path)
+
     payload = {
         "width": width, "height": height, "still": bool(still), "motion": round(motion, 2),
         "darkShare": round(dark_share, 2),
-        "shots": shots, "crop": to_source(rect, scale, width, height), "blur": blur_boxes(boxes, rect),
+        "shots": [s[0] for s in measured_shots], "crop": source_crop, "blur": blur_boxes(boxes, rect),
+        "reviewSheets": sheets,
         "logoBoxes": len(boxes),
     }
     with open(args.output, "w", encoding="utf-8") as handle:
@@ -368,6 +420,77 @@ def skin_focus(cv2, np, bgr, min_area_frac=0.008):
     if stats[idx, cv2.CC_STAT_AREA] < mask.size * min_area_frac:
         return None
     return float(centroids[idx][0]), float(centroids[idx][1])
+
+
+def group_angles(np, means, threshold=25.0):
+    """Shots from one camera angle look alike on average; a different angle does not."""
+    groups, representatives = [], []
+    for index, mean in enumerate(means):
+        for group, representative in zip(groups, representatives):
+            if float(np.mean(np.abs(mean - representative))) <= threshold:
+                group.append(index)
+                break
+        else:
+            groups.append([index])
+            representatives.append(mean)
+    return groups
+
+
+def angle_focus(cv2, np, cascades, shots, seat=None, seats=None, log=None):
+    """Where to hold the crop for one whole camera angle, or None when no real face is seen.
+
+    The reference channel keeps one fixed punch-in on whoever is telling the story. Taking the largest face
+    in each shot instead swung the crop between seated guests on a two-shot: Mike Majlak's own story cut to
+    Jingle Jared for 1.6 s. Picking the talker by mouth movement was measured on six sections whose talker
+    was known from the transcript, and it was wrong too often (at best 3 of 4, margins under 0.2): one guest
+    simply moves more whether or not he is talking. So the talker's seat comes from outside: the story names
+    its teller and the campaign records who sits where on each episode's wide shot (`seat` of `seats`, left
+    to right). Without that, the person seen most on the angle holds it, which at least never flips."""
+    detections = []
+    for s, shot in enumerate(shots):
+        for f, frame in enumerate(shot["frames"]):
+            for (x, y, w, h, skin) in face_boxes(cv2, np, cascades, frame):
+                if skin >= 0.3:
+                    detections.append((s, f, x + w / 2.0, (x, y, w, h)))
+    if not detections:
+        return None
+    width = shots[0]["frames"][0].shape[1]
+    frame_count = sum(len(shot["frames"]) for shot in shots)
+    # People by seat: split the sorted face centres wherever there is a wide empty gap.
+    detections.sort(key=lambda d: d[2])
+    people = [[detections[0]]]
+    for detection in detections[1:]:
+        if detection[2] - people[-1][-1][2] > 0.1 * width:
+            people.append([])
+        people[-1].append(detection)
+    # A person has to be on screen for a fair share of the angle, not a one-frame false detection.
+    people = [p for p in people if len({(d[0], d[1]) for d in p}) >= max(3, 0.2 * frame_count)]
+    if not people:
+        return None
+
+    def centre(person):
+        x, y, w, h = np.median(np.array([d[3] for d in person], dtype=np.float32), axis=0)
+        return float(x + w / 2.0), float(y + h / 2.0)
+
+    people.sort(key=lambda p: centre(p)[0])
+    # A host's own close-up has one person in the middle; a couch shot has people off to the sides, even when
+    # only one of them faces the camera.
+    couch = len(people) >= 2 or abs(centre(people[0])[0] / width - 0.5) > 0.15
+    if seat is not None and seats and seats >= 2 and couch:
+        if len(people) == seats:
+            chosen = centre(people[seat])
+        else:
+            # Someone is turned away and never detected: place the seat by where it sits on the couch.
+            expected = (seat + 0.5) / seats * width
+            nearest = min(people, key=lambda p: abs(centre(p)[0] - expected))
+            x, y = centre(nearest)
+            chosen = (x, y) if abs(x - expected) < 0.2 * width else (expected, y)
+        if log:
+            log("couch angle: %d people at x=%s, teller seat %d of %d -> x=%.0f"
+                % (len(people), [round(centre(p)[0]) for p in people], seat, seats, chosen[0]))
+        return chosen
+    most_seen = max(people, key=lambda p: len({(d[0], d[1]) for d in p}))
+    return centre(most_seen)
 
 
 def topcrop(args):
@@ -418,9 +541,17 @@ def topcrop(args):
     boxes, _ = overlay_boxes(cv2, np, overlay_frames, spans_cuts=distinct, locked=True)
     area = (0, 0, ANALYSIS_WIDTH, int(round(ANALYSIS_WIDTH * height / max(1, width))))
 
+    # One focus per camera angle, held for every shot from that angle: the teller's seat on a couch shot.
+    held = {}
+    for group in group_angles(np, means):
+        focus = angle_focus(cv2, np, cascades, [raw_shots[i] for i in group], seat=args.seat, seats=args.seats,
+                            log=lambda message: print(message, file=sys.stderr))
+        for index in group:
+            held[index] = focus
+
     shots = []
     previous_focus = None
-    for shot in raw_shots:
+    for index, shot in enumerate(raw_shots):
         picks = shot["frames"][:: max(1, len(shot["frames"]) // 6)][:6]
         frame_h, frame_w = picks[0].shape[:2]
         # Per pick: the real (skin) faces and whether a big wall caricature is on screen. The caricature
@@ -428,6 +559,8 @@ def topcrop(args):
         detections = [face_boxes(cv2, np, cascades, f) for f in picks]
         reals_per_pick = [[b for b in d if b[4] >= 0.3] for d in detections]
         centres = [(r[0][0] + r[0][2] / 2.0, r[0][1] + r[0][3] / 2.0) for r in reals_per_pick if r]
+        if held.get(index) is not None:
+            centres = [held[index]]
         # The camera half is ALWAYS cropped to fill, never letterboxed. Scaling a 16:9 angle to fit this
         # 1080x960 window leaves black bands above and below the host, which reads as a broken video on a
         # phone, and the reference channel never does it. Earlier attempts letterboxed "wide" shots so
@@ -440,10 +573,10 @@ def topcrop(args):
             # crop stays on the person rather than snapping to the caricatures painted on the back wall.
             skins = [s for s in (skin_focus(cv2, np, f) for f in picks) if s is not None]
             focus = (sorted(p[0] for p in skins)[len(skins) // 2], sorted(p[1] for p in skins)[len(skins) // 2]) if skins else previous_focus
-        # The measured Double Coverage punch-in and no tighter, with the face a third of the way down
-        # so the top of the head stays in: centring it at 42% cut off a seated guest's forehead.
+        # The measured Double Coverage punch-in and no tighter: the top 79% of the frame, top edge kept, x on
+        # the guest. The episode's sponsor bugs sit in the bottom corners, below that window.
         rect, _ = choose_crop(boxes, area, focus=focus, zooms=(1.0,), height_fraction=args.height_fraction,
-                              keep_focus=True, face_at=0.3)
+                              keep_focus=True, face_at=0.3, top_edge=True)
         previous_focus = focus if focus is not None else previous_focus
         shots.append({
             "in": round(shot["in"], 3), "duration": round(shot["duration"], 3),
@@ -479,6 +612,9 @@ def main() -> int:
     parser.add_argument("--min-shot", type=float, default=1.0)
     parser.add_argument("--pieces", default="")
     parser.add_argument("--height-fraction", type=float, default=0.79)
+    # The story teller's seat on the episode's couch shot, counted from the left, and how many seats there are.
+    parser.add_argument("--seat", type=int, default=None)
+    parser.add_argument("--seats", type=int, default=None)
     args = parser.parse_args()
     return probe(args) if args.mode == "probe" else topcrop(args)
 

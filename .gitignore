@@ -9,3 +9,7 @@ appsettings.Production.json
 appsettings.Local.json
 workspace/
 logs/
+
+# Python bytecode written when the helper scripts run.
+__pycache__/
+*.pyc

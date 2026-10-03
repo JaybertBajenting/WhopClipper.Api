@@ -13,6 +13,8 @@ public static partial class PodcastSplitEndpoints
 {
     public static void Map(RouteGroupBuilder api)
     {
+        MapBrollRepair(api);
+        MapBrollEditor(api);
         var campaigns = api.MapGroup("/campaigns").WithTags("Edit style");
 
         campaigns.MapGet("/{id:guid}/edit-style", async (Guid id, AppDbContext db, CancellationToken ct) =>
@@ -38,9 +40,8 @@ public static partial class PodcastSplitEndpoints
             return Results.Ok(new { plan.SourceAssetId, Title = title, Pieces = pieces, plan.MusicAssetId });
         }).WithTags("Edit style");
 
-        // What the app's live preview needs for one clip: the music-free companion video, the song and
-        // where it starts, and the clip's current voice/music levels (its own override, else campaign
-        // default). The player plays the companion and mixes the song on top under the sliders.
+        // Settings for the next render. Playback and download both use the finished MP4, because a
+        // browser mix of a raw song cannot reproduce FFmpeg's normalisation and speech ducking.
         api.MapGet("/edit-plans/{planId:guid}/preview", async (Guid planId, AppDbContext db,
             WorkspaceService workspace, CancellationToken ct) =>
         {
@@ -50,6 +51,8 @@ public static partial class PodcastSplitEndpoints
             if (extras?.PodcastSplit is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
             var campaign = await db.Campaigns.AsNoTracking().SingleOrDefaultAsync(x => x.Id == plan.CampaignId, ct);
             var style = campaign?.ReadEditStyle() ?? new CampaignEditStyleDto();
+            var track = plan.MusicAssetId is { } musicId
+                ? await db.MediaLibraryAssets.AsNoTracking().SingleOrDefaultAsync(x => x.Id == musicId, ct) : null;
             var name = WorkspaceService.SafeFileName(System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName), "clip");
             var previewAbs = workspace.ResolveRelative(System.IO.Path.Combine("campaigns", plan.CampaignId.ToString("N"),
                 "output", plan.Platform.ToString().ToLowerInvariant(), $"{name}-{plan.Id:N}.preview.mp4"));
@@ -58,16 +61,19 @@ public static partial class PodcastSplitEndpoints
                 campaignId = plan.CampaignId,
                 previewRelativePath = System.IO.File.Exists(previewAbs) ? workspace.ToRelative(previewAbs) : null,
                 musicAssetId = plan.MusicAssetId,
-                musicStartSeconds = extras.MusicStartSeconds ?? 0,
+                musicStartSeconds = PodcastMusic.ResolveStart(extras.MusicStartSeconds, track?.SegmentStartSeconds),
                 voiceVolume = extras.VoiceVolume ?? style.VoiceVolume,
                 musicVolume = extras.MusicVolume ?? style.MusicVolume,
+                musicNeedsRender = extras.MusicNeedsRender || PodcastMusic.DiffersFromRenderedFile(
+                    plan.LastFfmpegArgumentsJson, track?.FullPath,
+                    PodcastMusic.ResolveStart(extras.MusicStartSeconds, track?.SegmentStartSeconds)),
             });
         }).WithTags("Edit style");
 
         // Re-render one clip from its stored story, picking up the campaign's current voice/music
         // volumes. This is what the app's "Re-render" button calls after the sliders are adjusted.
         api.MapPost("/edit-plans/{planId:guid}/rerender", async (Guid planId, double? voiceVolume, double? musicVolume,
-            AppDbContext db, JobCoordinator coordinator, CancellationToken ct) =>
+            AppDbContext db, JobCoordinator coordinator, WorkspaceService workspace, CancellationToken ct) =>
         {
             if (voiceVolume is < 0 or > 4 || musicVolume is < 0 or > 1)
                 return Results.BadRequest(new { error = "Voice volume is 0-4 and music volume is 0-1." });
@@ -76,19 +82,24 @@ public static partial class PodcastSplitEndpoints
             var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
             var split = extras?.PodcastSplit;
             if (split is null) return Results.BadRequest(new { error = "This plan is not a podcast split." });
-            var pieces = split.Pieces.Select(p => new StoryPieceDto(
-                Math.Round(p.StartSeconds + split.EpisodeOffsetSeconds, 3),
-                Math.Round(p.EndSeconds + split.EpisodeOffsetSeconds, 3))).ToList();
-            var title = string.IsNullOrWhiteSpace(split.Title)
-                ? System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName) : split.Title;
-            // This clip replaces the one being re-rendered, so the old file is retired once the new one
-            // renders - otherwise every tweak left another copy of the same moment in the list.
-            var story = new ImportedStoryDto(title, pieces, plan.MusicAssetId, voiceVolume, musicVolume,
-                SupersedesEditPlanId: plan.Id, Caption: extras?.Caption ?? string.Empty);
-            var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.SourcePipeline,
-                new SourcePipelineJobPayload(plan.SourceAssetId, plan.Platform, MaxClips: 1,
-                    DeleteSourceWhenDone: false, Mode: AiMode.Auto, EditStyle: EditStyles.PodcastSplit,
-                    Stories: new[] { story }), ct);
+            var directory = workspace.ResolveRelative(System.IO.Path.Combine("campaigns", plan.CampaignId.ToString("N"),
+                "output", plan.Platform.ToString().ToLowerInvariant()));
+            var name = WorkspaceService.SafeFileName(System.IO.Path.GetFileNameWithoutExtension(plan.OutputFileName), "clip");
+            var originalPath = System.IO.Path.Combine(directory, $"{name}-{plan.Id:N}.mp4");
+            var voicePath = System.IO.Path.Combine(directory, $"{name}-{plan.Id:N}.preview.mp4");
+            if (!System.IO.File.Exists(originalPath) || (!System.IO.File.Exists(voicePath) && PodcastMusic.HasRenderedMusic(plan.LastFfmpegArgumentsJson)))
+                return Results.Conflict(new { error = "The saved voice track needed for a music-only edit is missing. Rebuild this highlight from its source before changing the mix." });
+            var campaign = await db.Campaigns.AsNoTracking().SingleAsync(x => x.Id == plan.CampaignId, ct);
+            var style = campaign.ReadEditStyle() ?? new CampaignEditStyleDto();
+            var desiredVoice = voiceVolume ?? extras!.VoiceVolume ?? style.VoiceVolume;
+            if (PodcastMusic.RenderedVoiceVolume(plan.LastFfmpegArgumentsJson, extras!.VoiceVolume ?? 1) <= 0 && desiredVoice > 0)
+                return Results.Conflict(new { error = "This clip's saved voice track is muted. Rebuild it from its source to restore speech." });
+            var replacement = CloneForMusicRemix(plan, extras!, desiredVoice,
+                musicVolume ?? extras!.MusicVolume ?? style.MusicVolume);
+            db.EditPlans.Add(replacement);
+            await db.SaveChangesAsync(ct);
+            var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.Render,
+                new RenderJobPayload(replacement.Id, plan.Id), ct);
             return Results.Accepted("/api/jobs", job.ToDto());
         }).WithTags("Edit style");
 
@@ -135,12 +146,16 @@ public static partial class PodcastSplitEndpoints
                 var asset = await db.MediaLibraryAssets.AsNoTracking()
                     .SingleOrDefaultAsync(x => x.Id == assetId && x.Kind == MediaAssetKind.Music, ct);
                 if (asset is null) return Results.BadRequest(new { error = "No such music asset." });
-                start ??= asset.SegmentStartSeconds ?? 0;
+                try { start = PodcastMusic.ResolveStart(start, asset.SegmentStartSeconds, asset.DurationSeconds); }
+                catch (ArgumentOutOfRangeException error) { return Results.BadRequest(new { error = error.Message }); }
             }
             else start = null;
-            if (start is < 0) return Results.BadRequest(new { error = "Music start cannot be negative." });
+            var changed = plan.MusicAssetId != request.MusicAssetId || extras.MusicStartSeconds != start;
             plan.MusicAssetId = request.MusicAssetId;
-            plan.ExtraSettingsJson = JsonSerializer.Serialize(extras with { MusicStartSeconds = start }, JsonDefaults.Serializer);
+            plan.ExtraSettingsJson = JsonSerializer.Serialize(extras with
+            {
+                MusicStartSeconds = start, MusicNeedsRender = extras.MusicNeedsRender || changed,
+            }, JsonDefaults.Serializer);
             await db.SaveChangesAsync(ct);
             return Results.Ok(new { plan.MusicAssetId, musicStartSeconds = start });
         }).WithTags("Edit style");
@@ -153,6 +168,9 @@ public static partial class PodcastSplitEndpoints
             if (request.MusicLocationId is { } locationId && !await db.MediaLibraryLocations
                     .AnyAsync(x => x.Id == locationId && x.Kind == MediaAssetKind.Music, ct))
                 errors["musicLocationId"] = ["That music folder is not in the media library."];
+            if (request.SoundLocationId is { } soundLocationId && !await db.MediaLibraryLocations
+                    .AnyAsync(x => x.Id == soundLocationId && x.Kind == MediaAssetKind.SoundEffect, ct))
+                errors["soundLocationId"] = ["That sound-effect folder is not in the media library."];
             if (errors.Count > 0) return Results.ValidationProblem(errors);
             var campaign = await db.Campaigns.SingleOrDefaultAsync(x => x.Id == id, ct);
             if (campaign is null) return Results.NotFound();
@@ -196,6 +214,20 @@ public static partial class PodcastSplitEndpoints
     }
 
     /// <summary>Null for every clip that is not a podcast split, which keeps the listing unchanged for them.</summary>
+    internal static EditPlan CloneForMusicRemix(EditPlan original, EditPlanExtrasDto extras, double voice, double music) => new()
+    {
+        CampaignId = original.CampaignId, SourceAssetId = original.SourceAssetId, Platform = original.Platform,
+        StartSeconds = original.StartSeconds, EndSeconds = original.EndSeconds, Width = original.Width,
+        Height = original.Height, FramesPerSecond = original.FramesPerSecond, Crf = original.Crf,
+        NormalizeAudio = original.NormalizeAudio, BurnSubtitles = original.BurnSubtitles,
+        SubtitleRelativePath = original.SubtitleRelativePath, MusicAssetId = original.MusicAssetId,
+        MusicVolume = music, OutputFileName = original.OutputFileName, IsApproved = true,
+        ExtraSettingsJson = JsonSerializer.Serialize(extras with
+        {
+            VoiceVolume = voice, MusicVolume = music, MusicNeedsRender = true,
+        }, JsonDefaults.Serializer),
+    };
+
     internal static RenderedClipStyleDto? DescribeClip(EditPlan? plan)
     {
         var extras = plan is null ? null : JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null);
@@ -212,7 +244,7 @@ public static partial class PodcastSplitEndpoints
     internal static Dictionary<string, string[]> ValidateStyle(CampaignEditStyleDto style)
     {
         var errors = new Dictionary<string, string[]>();
-        if (!EditStyles.IsKnown(style.Style)) errors["style"] = [$"Style must be {EditStyles.Streamer} or {EditStyles.PodcastSplit}."];
+        if (!EditStyles.IsKnown(style.Style)) errors["style"] = [$"Style must be {EditStyles.Streamer}, {EditStyles.PodcastSplit} or {EditStyles.NarratedLuxury}."];
         if (style.MusicVolume is < 0 or > 1) errors["musicVolume"] = ["Music volume must be between 0 and 1."];
         if (style.VoiceVolume is < 0 or > 4) errors["voiceVolume"] = ["Voice volume must be between 0 and 4."];
         if (style.MusicDuckingDb is < -40 or > 0) errors["musicDuckingDb"] = ["Ducking must be between -40 and 0 dB."];
@@ -250,6 +282,11 @@ public static partial class PodcastSplitEndpoints
                 if (story.Pieces.Max(x => x.EndSeconds) - story.Pieces.Min(x => x.StartSeconds) > 900)
                     problems.Add("Pieces must come from within 15 minutes of each other; that is the most one download covers.");
             }
+            if (story.ReviewedBroll is { } reviewed && (reviewed.Count is < 1 or > 40 ||
+                reviewed.Any(x => x is null || x.Crop is null || !double.IsFinite(x.InSeconds) ||
+                    !double.IsFinite(x.DurationSeconds) || x.InSeconds < 0 || x.DurationSeconds < .5 ||
+                    string.IsNullOrWhiteSpace(x.RelativePath) || string.IsNullOrWhiteSpace(x.SourceUrl))))
+                problems.Add("Reviewed B-roll needs 1-40 attributed local shots of at least half a second.");
             if (problems.Count > 0) errors[$"stories[{index}]"] = problems.ToArray();
         }
         return errors;

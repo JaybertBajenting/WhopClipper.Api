@@ -24,6 +24,9 @@ public static class ApiEndpoints
         MapMediaLibrary(api);
         MapSettings(api);
         PublishingEndpoints.Map(api);
+        YouTubeScheduleEndpoints.Map(api);
+        VoiceOverEndpoints.Map(api);
+        NarratedEndpoints.Map(api);
         PodcastSplitEndpoints.Map(api);
         return app;
     }
@@ -248,7 +251,7 @@ public static class ApiEndpoints
         });
 
         campaigns.MapGet("/{id:guid}/sources", async (Guid id, AppDbContext db, CancellationToken ct) =>
-            Results.Ok((await db.SourceAssets.AsNoTracking().Where(x => x.CampaignId == id).OrderByDescending(x => x.CreatedAt).ToListAsync(ct)).Select(x => x.ToDto())));
+            Results.Ok(SourceDates.NewestFirst(await db.SourceAssets.AsNoTracking().Where(x => x.CampaignId == id).ToListAsync(ct)).Select(x => x.ToDto())));
 
         campaigns.MapPost("/{id:guid}/sources", async (Guid id, AddSourceRequest request, IValidator<AddSourceRequest> validator,
             AppDbContext db, CancellationToken ct) =>
@@ -859,6 +862,14 @@ public static class ApiEndpoints
             // Loaded once for the whole listing: the caption's required hashtags live on the
             // platform profile, and uploading by hand without them gets a clip rejected.
             var profiles = await db.PlatformProfiles.AsNoTracking().Where(x => x.CampaignId == id).ToListAsync(ct);
+            // Each clip says which video it was cut from and when that video came out; the list is newest video first.
+            var sources = (await db.SourceAssets.AsNoTracking().Where(x => x.CampaignId == id)
+                    .Select(x => new { x.Id, x.Title, x.Url, x.MetadataJson }).ToListAsync(ct))
+                .ToDictionary(x => x.Id, x => (Title: x.Title ?? x.Url, Day: SourceDates.PublishedOn(x.MetadataJson)));
+            RenderedClipDto WithSource(RenderedClipDto clip, EditPlan? plan) =>
+                plan is not null && sources.TryGetValue(plan.SourceAssetId, out var source)
+                    ? clip with { SourceTitle = source.Title, SourcePublishedOn = source.Day }
+                    : clip;
 
             var clips = Directory.EnumerateFiles(outputRoot, "*", SearchOption.AllDirectories)
                 .Where(x => RenderedClipExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))
@@ -873,13 +884,26 @@ public static class ApiEndpoints
                     var plan = MatchPlanForOutput(plans, stem);
                     var profile = plan is null ? null : profiles.FirstOrDefault(x => x.Platform == plan.Platform);
                     var copy = ClipCaptionComposer.Compose(plan, profile, info.Name);
-                    return new RenderedClipDto(workspace.ToRelative(path), info.Name, platform, info.Length,
+                    return WithSource(new RenderedClipDto(workspace.ToRelative(path), info.Name, platform, info.Length,
                         new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero), plan?.Id, plan?.StartSeconds, plan?.EndSeconds,
-                        copy.Title, copy.Caption, PodcastSplitEndpoints.DescribeClip(plan));
+                        copy.Title, copy.Caption, PodcastSplitEndpoints.DescribeClip(plan)), plan);
                 })
-                .OrderByDescending(x => x.CreatedAt)
                 .ToList();
-            return Results.Ok(clips);
+            // Clips moved to Google Drive: their video is gone from this PC, but the move record beside where it
+            // was keeps them in the gallery, shown by their thumbnail, until they are brought back.
+            foreach (var record in Directory.EnumerateFiles(outputRoot, "*" + DriveArchive.RecordSuffix, SearchOption.AllDirectories))
+            {
+                var clipPath = record[..^DriveArchive.RecordSuffix.Length] + ".mp4";
+                if (File.Exists(clipPath) || DriveArchive.Read(clipPath) is not { } moved) continue;
+                var plan = MatchPlanForOutput(plans, Path.GetFileNameWithoutExtension(clipPath));
+                var profile = plan is null ? null : profiles.FirstOrDefault(x => x.Platform == plan.Platform);
+                var copy = ClipCaptionComposer.Compose(plan, profile, Path.GetFileName(clipPath));
+                clips.Add(WithSource(new RenderedClipDto(workspace.ToRelative(clipPath), Path.GetFileName(clipPath),
+                    Path.GetFileName(Path.GetDirectoryName(clipPath)) ?? string.Empty, moved.Bytes, moved.RenderedAt,
+                    plan?.Id, plan?.StartSeconds, plan?.EndSeconds, copy.Title, copy.Caption,
+                    PodcastSplitEndpoints.DescribeClip(plan), new RenderedClipDriveDto(moved.Remote, moved.MovedAt, moved.Bytes)), plan));
+            }
+            return Results.Ok(NewestSourceFirst(clips));
         });
 
         // Streamed with range support so the player can seek without downloading the whole file.
@@ -919,6 +943,119 @@ public static class ApiEndpoints
                 loggerFactory.CreateLogger("RevealOutput").LogWarning(ex, "Could not open the output folder.");
                 return Results.Ok(new { revealed = false, folder = Path.GetDirectoryName(full) });
             }
+        });
+
+        // Deleting a clip from the gallery sends the clip and its music-free preview to the Recycle Bin,
+        // so a wrong click can be undone from Windows. A clip on the YouTube schedule still has to be
+        // uploaded from this file, so it must be taken off YouTube first.
+        campaigns.MapDelete("/{id:guid}/outputs", async (Guid id, string path, AppDbContext db,
+            WorkspaceService workspace, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            if (!TryResolveCampaignOutput(workspace, id, path, out var full)) return Results.NotFound();
+            if (await IsOnYouTubeScheduleAsync(db, workspace, id, full, ct))
+                return Results.Conflict(new { message = "This clip is on the YouTube schedule. Take it off YouTube first, then delete it." });
+
+            var preview = Path.ChangeExtension(full, null) + ".preview.mp4";
+            try
+            {
+                foreach (var file in new[] { full, preview }.Where(File.Exists))
+                    SendToRecycleBin(file, workspace.ResolveRelative(Path.Combine("campaigns", id.ToString("N"), "intermediate", "deleted-clips")));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                loggerFactory.CreateLogger("DeleteOutput").LogWarning(ex, "Could not delete clip {Path}.", full);
+                return Results.Problem("The clip could not be deleted. It may be open in another program.", statusCode: 409);
+            }
+            return Results.NoContent();
+        });
+
+        // Move to Google Drive and back (DriveArchive): one clip per request, so "Move all" in the app can send them
+        // one after another and report each. A clip waiting to go up on YouTube still needs its file.
+        campaigns.MapPost("/{id:guid}/outputs/drive", async (Guid id, string path, AppDbContext db,
+            WorkspaceService workspace, DriveArchive drive, CancellationToken ct) =>
+        {
+            var campaign = await db.Campaigns.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+            if (campaign is null || !TryResolveCampaignOutput(workspace, id, path, out var full)) return Results.NotFound();
+            if (await IsOnYouTubeScheduleAsync(db, workspace, id, full, ct))
+                return Results.Conflict(new { message = "This clip is on the YouTube schedule and its upload needs the file. Move it once it has gone up." });
+            try
+            {
+                var moved = await drive.MoveOutAsync(campaign.Name, full, ct);
+                return Results.Ok(new RenderedClipDriveDto(moved.Remote, moved.MovedAt, moved.Bytes));
+            }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { message = ex.Message }); }
+        });
+
+        campaigns.MapPost("/{id:guid}/outputs/drive/return", async (Guid id, string path, AppDbContext db,
+            WorkspaceService workspace, DriveArchive drive, CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            if (!TryResolveMovedOutput(workspace, id, path, out var full)) return Results.NotFound();
+            try { await drive.BringBackAsync(full, ct); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { message = ex.Message }); }
+            return Results.NoContent();
+        });
+
+        // The thumbnail a moved clip keeps, shown in place of its video.
+        campaigns.MapGet("/{id:guid}/outputs/poster", async (Guid id, string path, AppDbContext db,
+            WorkspaceService workspace, CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            if (!TryResolveMovedOutput(workspace, id, path, out var full)) return Results.NotFound();
+            var poster = DriveArchive.PosterPath(full);
+            return File.Exists(poster) ? Results.File(poster, "image/jpeg") : Results.NotFound();
+        });
+
+        // "Move campaign to Drive": every source video and finished clip of the campaign, as one background job so
+        // it carries on when the page is closed. Each file is removed from this PC once it is checked in Drive.
+        campaigns.MapGet("/{id:guid}/drive/upload", async (Guid id, AppDbContext db, WorkspaceService workspace,
+            DriveArchive drive, CancellationToken ct) =>
+        {
+            var campaign = await db.Campaigns.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+            return campaign is null ? Results.NotFound() : Results.Ok(DescribeDriveUpload(workspace, drive, campaign));
+        });
+
+        campaigns.MapPost("/{id:guid}/drive/upload", async (Guid id, AppDbContext db, WorkspaceService workspace,
+            DriveArchive drive, JobCoordinator coordinator, CancellationToken ct) =>
+        {
+            var campaign = await db.Campaigns.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+            if (campaign is null) return Results.NotFound();
+            if (await IsDriveJobRunningAsync(db, id, ct))
+                return Results.Conflict(new { message = "This campaign is already being moved to or from Google Drive." });
+            var found = DescribeDriveUpload(workspace, drive, campaign);
+            if (found.Sources + found.Clips == 0)
+                return Results.Conflict(new
+                {
+                    message = found.StillWriting > 0
+                        ? "The only videos here are still being written. Try again when the render or download has finished."
+                        : "This campaign has no source videos or finished clips left on this PC to move."
+                });
+            var job = await coordinator.CreateAsync(id, JobKind.DriveUpload, new DriveUploadJobPayload(), ct);
+            return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto(campaign.Name));
+        });
+
+        // "Bring campaign back from Drive": every clip and source video the campaign moved there, as one background
+        // job. The copies in Drive stay.
+        campaigns.MapGet("/{id:guid}/drive/return", async (Guid id, AppDbContext db, WorkspaceService workspace,
+            DiskSpaceGuard disk, CancellationToken ct) =>
+        {
+            if (!await db.Campaigns.AnyAsync(x => x.Id == id, ct)) return Results.NotFound();
+            return Results.Ok(DescribeDriveReturn(workspace, disk, id));
+        });
+
+        campaigns.MapPost("/{id:guid}/drive/return", async (Guid id, AppDbContext db, WorkspaceService workspace,
+            DiskSpaceGuard disk, JobCoordinator coordinator, CancellationToken ct) =>
+        {
+            var campaign = await db.Campaigns.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+            if (campaign is null) return Results.NotFound();
+            if (await IsDriveJobRunningAsync(db, id, ct))
+                return Results.Conflict(new { message = "This campaign is already being moved to or from Google Drive." });
+            var found = DescribeDriveReturn(workspace, disk, id);
+            if (found.Sources + found.Clips == 0)
+                return Results.Conflict(new { message = "Nothing of this campaign is in Google Drive; everything is already on this PC." });
+            var job = await coordinator.CreateAsync(id, JobKind.DriveReturn, new DriveReturnJobPayload(), ct);
+            return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto(campaign.Name));
         });
 
         campaigns.MapPost("/{id:guid}/exports", async (Guid id, AppDbContext db, WorkspaceService workspace, CancellationToken ct) =>
@@ -1394,6 +1531,87 @@ public static class ApiEndpoints
     }
 
     private static readonly string[] RenderedClipExtensions = [".mp4", ".m4v", ".webm", ".mov"];
+
+    /// <summary>
+    /// Clips from the newest source video first, and within one video the newest render first. Clips whose source
+    /// date is not known yet come after, newest render first, as the whole list used to be.
+    /// </summary>
+    internal static List<RenderedClipDto> NewestSourceFirst(IEnumerable<RenderedClipDto> clips) => clips
+        .OrderByDescending(x => x.SourcePublishedOn.HasValue).ThenByDescending(x => x.SourcePublishedOn)
+        .ThenByDescending(x => x.CreatedAt).ToList();
+
+    /// <summary>A move to or from Drive for this campaign is waiting or running: two at once would trip over each other.</summary>
+    private static Task<bool> IsDriveJobRunningAsync(AppDbContext db, Guid campaignId, CancellationToken ct) =>
+        db.Jobs.AnyAsync(x => x.CampaignId == campaignId && (x.Kind == JobKind.DriveUpload || x.Kind == JobKind.DriveReturn) &&
+                              (x.Status == JobStatus.Queued || x.Status == JobStatus.Running), ct);
+
+    private static CampaignDriveReturnDto DescribeDriveReturn(WorkspaceService workspace, DiskSpaceGuard disk, Guid campaignId)
+    {
+        var files = CampaignDriveReturn.Find(workspace.ResolveRelative(Path.Combine("campaigns", campaignId.ToString("N"))));
+        var sources = files.Where(x => x.Group == "source").ToList();
+        var clips = files.Where(x => x.Group == "clip").ToList();
+        return new CampaignDriveReturnDto(sources.Count, sources.Sum(x => x.Bytes), clips.Count, clips.Sum(x => x.Bytes), disk.Available);
+    }
+
+    private static CampaignDriveUploadDto DescribeDriveUpload(WorkspaceService workspace, DriveArchive drive, Campaign campaign)
+    {
+        var remote = drive.RemoteFor(campaign.Name);
+        var found = CampaignDriveFiles.Find(workspace.ResolveRelative(Path.Combine("campaigns", campaign.Id.ToString("N"))),
+            remote, DateTime.UtcNow);
+        var sources = found.Files.Where(x => x.Group == "source").ToList();
+        var clips = found.Files.Where(x => x.Group == "clip").ToList();
+        return new CampaignDriveUploadDto(remote, sources.Count, sources.Sum(x => x.Bytes), clips.Count, clips.Sum(x => x.Bytes),
+            found.AlreadyMoved, found.StillWriting);
+    }
+
+    /// <summary>Publish states that still hold a YouTube slot for a clip or need its file to upload.</summary>
+    private static readonly PublishStatus[] ScheduledOrUploading =
+        [PublishStatus.Queued, PublishStatus.Validating, PublishStatus.Uploading, PublishStatus.Processing,
+         PublishStatus.Scheduled, PublishStatus.NeedsAttention];
+
+    /// <summary>True while a YouTube upload still needs this clip's file.</summary>
+    private static async Task<bool> IsOnYouTubeScheduleAsync(AppDbContext db, WorkspaceService workspace, Guid campaignId,
+        string fullPath, CancellationToken ct)
+    {
+        var normalized = workspace.ToRelative(fullPath).Replace('\\', '/');
+        var scheduled = await db.PublishJobs.AsNoTracking()
+            .Where(x => x.CampaignId == campaignId && ScheduledOrUploading.Contains(x.Status))
+            .Select(x => x.OutputRelativePath)
+            .ToListAsync(ct);
+        return scheduled.Any(x => string.Equals(x.Replace('\\', '/'), normalized, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>Like <see cref="TryResolveCampaignOutput"/> for a clip whose video was moved to Google Drive: the
+    /// clip file is gone, and its move record must be there instead.</summary>
+    private static bool TryResolveMovedOutput(WorkspaceService workspace, Guid campaignId, string relativePath,
+        out string fullPath)
+    {
+        fullPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath)) return false;
+        try
+        {
+            var outputRoot = workspace.ResolveRelative(Path.Combine("campaigns", campaignId.ToString("N"), "output"));
+            var candidate = workspace.ResolveRelative(relativePath);
+            WorkspaceService.EnsureInside(outputRoot, candidate);
+            if (!RenderedClipExtensions.Contains(Path.GetExtension(candidate), StringComparer.OrdinalIgnoreCase)) return false;
+            if (!File.Exists(DriveArchive.RecordPath(candidate))) return false;
+            fullPath = candidate;
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The Windows Recycle Bin, so a deleted clip can be restored. Anywhere the bin is not
+    /// available the file moves to <paramref name="fallbackFolder"/> instead of being erased.</summary>
+    private static void SendToRecycleBin(string fullPath, string fallbackFolder)
+    {
+        if (OperatingSystem.IsWindows() && RecycleBin.TrySend(fullPath)) return;
+        Directory.CreateDirectory(fallbackFolder);
+        File.Move(fullPath, Path.Combine(fallbackFolder, Path.GetFileName(fullPath)), overwrite: true);
+    }
 
     /// <summary>Resolves a client-supplied path and confirms it names a real file inside this
     /// campaign's output folder, so no other part of the workspace can be read through it.</summary>

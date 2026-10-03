@@ -130,14 +130,14 @@ public sealed class PodcastSplitRenderTests
         // anyone talks, and only a limiter catches peaks - the sum is not loudnorm'd.
         Assert.Contains("[voice0]asplit=2[voicemain][voicekey]", graph);
         Assert.Contains("[voicemain]loudnorm=I=-14:TP=-1.5:LRA=11,volume=1[voicenorm]", graph);
-        Assert.Contains("[4:a]atrim=0:7,asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-2,volume=0.3[musicbase]", graph);
+        Assert.Contains("[4:a]atrim=start=0:duration=7,asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-2,volume=0.3[musicbase]", graph);
         Assert.Contains("[musicbase][voicekey]sidechaincompress=threshold=0.02:ratio=5:attack=5:release=300[musicducked]", graph);
         Assert.Contains("[voicenorm][musicducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]", graph);
     }
 
     /// <summary>
     /// The usable hook of a track is often minutes in - the guide puts one song's at 2:11 - so the
-    /// song is seeked before it is read. Starting every bed at 0:00 would lay the intro under the clip.
+    /// song is trimmed on its looped timeline. Starting every bed at 0:00 would lay the intro under the clip.
     /// </summary>
     [Fact]
     public void MusicStartsWhereTheSegmentGuideMarksIt()
@@ -148,7 +148,8 @@ public sealed class PodcastSplitRenderTests
 
         var input = args.LastIndexOf("-i");
         Assert.Equal(song, args[input + 1]);
-        Assert.Equal(["-ss", "131", "-stream_loop", "-1", "-t", "7", "-i", song], args.Skip(input - 6).Take(8).ToArray());
+        Assert.Equal(["-stream_loop", "-1", "-t", "138", "-i", song], args.Skip(input - 4).Take(6).ToArray());
+        Assert.Contains("[4:a]atrim=start=131:duration=7,asetpts=PTS-STARTPTS", Graph(args));
     }
 
     /// <summary>A track the guide does not mention plays from its beginning, exactly as before.</summary>
@@ -353,11 +354,19 @@ public sealed class PodcastSplitSupportTests
         Assert.Equal(new[] { "crazy" }, story.Emphasis);
     }
 
+    [Theory]
+    [InlineData(100, 130, true)]   // the same moment again
+    [InlineData(120, 150, true)]   // two thirds of it already clipped
+    [InlineData(126, 156, false)]  // a new story that only shares a lead-in sentence
+    [InlineData(300, 330, false)]  // elsewhere in the episode
+    public void ASecondPassSkipsMomentsThatAlreadyHaveAShort(double start, double end, bool taken) =>
+        Assert.Equal(taken, StoryParser.OverlapsClipped([(start, end)], [(100d, 130d), (500d, 520d)]));
+
     [Fact]
     public void BrollTimelineCoversTheClipExactlyAndChangesOnTheWords()
     {
         var slots = BrollTimeline.Plan(
-            [new BrollMoment(0, 2, "a"), new BrollMoment(5, 7, "b"), new BrollMoment(5.3, 6, "c"), new BrollMoment(12, 14, "d")],
+            [new BrollMoment(0, 5, "a"), new BrollMoment(5, 12, "b"), new BrollMoment(12, 20, "d")],
             20, 2.2);
 
         Assert.Equal(20, slots.Sum(x => x.DurationSeconds), 6);
@@ -366,6 +375,16 @@ public sealed class PodcastSplitSupportTests
         Assert.Equal(new[] { "a", "b", "d" }, slots.Select(x => x.Query).Distinct());
         Assert.Contains(slots, x => x.Query == "b" && Math.Abs(x.AtSeconds - 5) < 1e-6);
         Assert.All(slots, x => Assert.InRange(x.DurationSeconds, 1.5, 3.5));
+    }
+
+    [Fact]
+    public void TimelineDoesNotExtendIntoAnUnplannedSubjectOrDiscardAShortSubjectChange()
+    {
+        var slots = BrollTimeline.Plan([new(0, 3, "Gaethje"), new(5, 5.3, "Poirier"), new(5.3, 8, "Gaethje")], 10);
+        Assert.Equal(6, slots.Sum(x => x.DurationSeconds), 6);
+        Assert.Contains(slots, x => x.Query == "Poirier" && x.AtSeconds == 5 && Math.Abs(x.DurationSeconds - 0.3) < 0.000001);
+        Assert.DoesNotContain(slots, x => x.AtSeconds < 5 && x.AtSeconds + x.DurationSeconds > 3.000001);
+        Assert.DoesNotContain(slots, x => x.AtSeconds + x.DurationSeconds > 8.000001);
     }
 
     [Fact]
@@ -431,42 +450,111 @@ public sealed class PodcastSplitSupportTests
     [InlineData("Teofimo Lopez knockout highlights", "Mike Tyson knockout highlights")]
     [InlineData("Kobe Bryant game winner Bucks 2009", "Bucks highlights 2009")]
     [InlineData("Teofimo Lopez vs Richard Commey knockout", "Teofimo Lopez vs Josh Taylor knockout")]
+    [InlineData("Justin Gaethje MMA training", "Mike Tyson boxing training")]
+    [InlineData("Justin Gaethje vs Dustin Poirier 2023", "Justin Gaethje vs Tony Ferguson 2020")]
+    [InlineData("luxury car dealership b roll", "Luxury handbag b roll")]
+    [InlineData("Justin Gaethje golf", "Justin Gaethje UFC knockout highlights")]
+    [InlineData("Dana White press conference", "Dana Scully press conference")]
     public void SharedFootageWordsNeverSubstituteForTheRequestedPersonOrEvent(string query, string wrongTitle)
     {
         var wrong = new BrollSearchEntry("aaaaaaaaaaa", wrongTitle, 300, "Sports", null, 0);
         Assert.Empty(BrollCandidates.Rank([wrong], query));
     }
 
-    /// <summary>
-    /// Plans describe the action, but videos are titled after people. Nine of nine Teofimo stories lost
-    /// their footage to queries like these, so a search that comes back short is retried on the names.
-    /// </summary>
     [Theory]
-    [InlineData("Teofimo Lopez taking body punches fight highlights", "Teofimo Lopez highlights")]
-    [InlineData("Rolando Romero overhand right boxing highlights", "Rolando Romero highlights")]
-    [InlineData("Kobe Bryant game winner vs Bucks 2009", "Kobe Bryant Bucks 2009 highlights")]
-    public void ADescribedSearchFallsBackToTheNamesInIt(string query, string expected)
+    // The reference channel shows the person, not the exact action: a described action no longer hides
+    // the person's own footage, which is what emptied five of six Gaethje stories.
+    [InlineData("Teofimo Lopez pull counter defensive boxing highlights", "8 MINUTES OF TEOFIMO LOPEZ HIGHLIGHTS")]
+    [InlineData("Justin Gaethje parents mother father UFC fight night behind the scenes", "Justin Gaethje UFC 324 Embedded")]
+    // Titles often drop a first name.
+    [InlineData("Justin Gaethje vs Dustin Poirier", "Gaethje vs Poirier 2 | FULL FIGHT")]
+    [InlineData("Justin Gaethje golf", "UFC 274 - The Din Diaries | Golfing With Justin Gaethje")]
+    // An official music video is real footage: the reference used "Ric Flair Drip" for Ric Flair's story.
+    [InlineData("Ric Flair Drip", "Offset & Metro Boomin - Ric Flair Drip (Official Music Video)")]
+    public void TheNamedSubjectsFootageIsFoundWithoutTheDescriptiveWords(string query, string title)
     {
-        Assert.Equal(expected, BrollCandidates.Simplify(query));
-    }
-
-    [Theory]
-    [InlineData("luxury car dealership b roll")] // Already generic: there is nothing to strip.
-    [InlineData("counting cash closeup")] // No name to search for.
-    [InlineData("Teofimo Lopez highlights")] // Already the names alone.
-    public void AQueryWithNothingToStripIsNotRetried(string query)
-    {
-        Assert.Null(BrollCandidates.Simplify(query));
+        var entry = new BrollSearchEntry("bbbbbbbbbbb", title, 480, "Sports", null, 0);
+        Assert.Equal("bbbbbbbbbbb", Assert.Single(BrollCandidates.Rank([entry], query)).Id);
     }
 
     [Fact]
-    public void TheNamesAloneMatchTheFootageTheDescribedQueryMissed()
+    public void ContextAfterANameRanksButDoesNotHideTheFightItself()
     {
-        var entry = new BrollSearchEntry("bbbbbbbbbbb", "8 MINUTES OF TEOFIMO LOPEZ HIGHLIGHTS", 480, "Boxing", null, 0);
-        const string described = "Teofimo Lopez pull counter defensive boxing highlights";
+        // Real results for "Justin Gaethje White House fight", 2026-09-26.
+        var entries = new[]
+        {
+            new BrollSearchEntry("aaaaaaaaaaa", "Justin Gaethje previews and headlines UFC White House Card vs Ilia Topuria", 416, "UFC on Paramount+", null, 0),
+            new BrollSearchEntry("bbbbbbbbbbb", "Justin Gaethje legendary white house walkout", 410, "A & A sports", null, 1),
+            new BrollSearchEntry("ccccccccccc", "Justin Gaethje Vs Ilia Topuria FULL FIGHT", 1759, "JKD", null, 2),
+            new BrollSearchEntry("ddddddddddd", "Ilia Topuria Hunts Down Justin Gaethje | AI Cinematic Short", 59, "Cage Culture", null, 3),
+            new BrollSearchEntry("eeeeeeeeeee", "Israel Adesanya Reacts to UFC White House Card", 703, "FREESTYLEBENDER", null, 4),
+        };
+        var ranked = BrollCandidates.Rank(entries, "Justin Gaethje White House fight", 5).Select(x => x.Id).ToList();
 
-        Assert.Empty(BrollCandidates.Rank([entry], described));
-        Assert.Single(BrollCandidates.Rank([entry], BrollCandidates.Simplify(described)!));
+        Assert.Equal("bbbbbbbbbbb", ranked[0]);
+        Assert.Contains("ccccccccccc", ranked);
+        Assert.DoesNotContain("ddddddddddd", ranked); // AI-generated video is banned by the brief.
+        Assert.DoesNotContain("eeeeeeeeeee", ranked);
+    }
+
+    [Fact]
+    public void AnOfficialHighlightOutranksSomeoneElseTalkingAboutTheSubject()
+    {
+        var entries = new[]
+        {
+            new BrollSearchEntry("aaaaaaaaaaa", "Justin Gaethje fight breakdown and predictions podcast", 900, "MMA Talk", null, 0),
+            new BrollSearchEntry("bbbbbbbbbbb", "Justin Gaethje fan made tribute", 300, "Fan", null, 1),
+            new BrollSearchEntry("ccccccccccc", "Top Finishes: Justin Gaethje", 600, "UFC", null, 2),
+        };
+        var ranked = BrollCandidates.Rank(entries, "Justin Gaethje highlights", 3).Select(x => x.Id).ToList();
+        Assert.Equal("ccccccccccc", ranked[0]);
+        Assert.Equal("aaaaaaaaaaa", ranked[^1]);
+    }
+
+    [Theory]
+    [InlineData("Justin Gaethje UFC octagon fight highlights", "Justin Gaethje")]
+    [InlineData("Justin Gaethje vs Dustin Poirier 2023 knockout", "Justin Gaethje Dustin Poirier")]
+    [InlineData("private jet b roll", null)]
+    [InlineData("Justin Gaethje", null)]
+    public void ASecondSearchKeepsOnlyTheNames(string query, string? expected) =>
+        Assert.Equal(expected, BrollCandidates.Simplify(query));
+
+    [Fact]
+    public void VenueDescriptionDoesNotHideARealNamedWalkoutResult()
+    {
+        var entries = new[]
+        {
+            new BrollSearchEntry("aaaaaaaaaaa", "Justin Gaethje iconic walkout at UFC 324", 471, "TNT Fight Sports", null, 0),
+            new BrollSearchEntry("bbbbbbbbbbb", "Justin Gaethje walkout song", 300, "Release - Topic", null, 1),
+            new BrollSearchEntry("ccccccccccc", "Other fighter UFC arena walkout", 300, "Sports", null, 2),
+        };
+        var ranked = BrollCandidates.Rank(entries, "Justin Gaethje UFC arena walkout footage");
+        Assert.Equal(new[] { "aaaaaaaaaaa" }, ranked.Select(x => x.Id));
+    }
+
+    [Fact]
+    public void WalkoutSearchCanDiscoverCorrectPersonWhenTitleSaysWalkToCage()
+    {
+        var entries = new[]
+        {
+            new BrollSearchEntry("aaaaaaaaaaa", "Justin Gaethje UFC at the White House walk to the cage", 240, "Event fan", null, 0),
+            new BrollSearchEntry("bbbbbbbbbbb", "Mike Tyson UFC arena walkout", 240, "Event fan", null, 1),
+        };
+        Assert.Equal(new[] { "aaaaaaaaaaa" }, BrollCandidates.Rank(entries,
+            "Justin Gaethje UFC arena walkout footage").Select(x => x.Id));
+    }
+
+    [Fact]
+    public void WalkoutSongsAndStillImageEditsDoNotDisplaceEventFootage()
+    {
+        var entries = new[]
+        {
+            new BrollSearchEntry("aaaaaaaaaaa", "Justin Gaethje UFC White House Walkout Song", 173, "Fan", null, 0),
+            new BrollSearchEntry("bbbbbbbbbbb", "Johnny Cash UFC Justin Gaethje Walkout Edition", 224, "Fan", null, 1),
+            new BrollSearchEntry("ccccccccccc", "Justin Gaethje iconic walkout at UFC324", 471, "TNT Fight Sports", null, 2),
+        };
+        Assert.Equal(new[] { "ccccccccccc" }, BrollCandidates.Rank(entries,
+            "Justin Gaethje UFC arena walkout footage").Select(x => x.Id));
     }
 
     [Theory]
@@ -480,6 +568,48 @@ public sealed class PodcastSplitSupportTests
             emphasis = Array.Empty<string>()
         });
         Assert.Null(StoryParser.ParseBrollPlan(root, 10));
+    }
+
+    [Fact]
+    public void APlanNamesItsPrimarySubjectOrFallsBackOnTheOneItShowsLongest()
+    {
+        using var named = JsonDocument.Parse("""
+            {"primarySubject":"Michael Jordan","primaryQuery":"Michael Jordan Lawrence Taylor golf","moments":[
+              {"startSeconds":0,"endSeconds":4,"query":"Lawrence Taylor highlights","subject":"Lawrence Taylor"},
+              {"startSeconds":4,"endSeconds":10,"query":"Michael Jordan Lawrence Taylor golf","subject":"MJ and LT"}
+            ],"emphasis":[]}
+            """);
+        using var unnamed = JsonDocument.Parse("""
+            {"moments":[
+              {"startSeconds":0,"endSeconds":3,"query":"Ryan Garcia highlights","subject":"Ryan Garcia"},
+              {"startSeconds":3,"endSeconds":10,"query":"Teofimo Lopez highlights","subject":"Teofimo Lopez"}
+            ],"emphasis":[]}
+            """);
+
+        var plan = StoryParser.ParseBrollPlan(named.RootElement, 10)!;
+        var fallback = StoryParser.ParseBrollPlan(unnamed.RootElement, 10)!;
+
+        Assert.Equal(("Michael Jordan", "Michael Jordan Lawrence Taylor golf"), (plan.PrimarySubject, plan.PrimaryQuery));
+        Assert.Equal(("Teofimo Lopez", "Teofimo Lopez highlights"), (fallback.PrimarySubject, fallback.PrimaryQuery));
+    }
+
+    [Fact]
+    public void APlanStartingAtTheFirstWordIsRoundingNotAHole()
+    {
+        // The "Why Gaethje enjoys UFC trips" plan began 0.1 s in and was rejected whole.
+        using var root = JsonDocument.Parse("""
+            {"moments":[
+              {"startSeconds":0.1,"endSeconds":8.4,"query":"Justin Gaethje highlights"},
+              {"startSeconds":8.4,"endSeconds":11.9,"query":"golf b roll"},
+              {"startSeconds":12.0,"endSeconds":21.36,"query":"Justin Gaethje highlights"}
+            ],"emphasis":[]}
+            """);
+
+        var plan = StoryParser.ParseBrollPlan(root.RootElement, 21.36);
+
+        Assert.NotNull(plan);
+        Assert.Equal(0, plan!.Moments[0].StartSeconds);
+        Assert.Equal(21.36, plan.Moments[^1].EndSeconds, 6);
     }
 
     [Fact]
@@ -525,18 +655,29 @@ public sealed class BrollCleanAllocatorTests
             allocation.Gaps.Sum(x => x.DurationSeconds), clipSeconds: 2));
     }
 
-    /// <summary>
-    /// Gaps nothing could be found for hold the neighbouring shot instead of losing the clip, which is
-    /// what Matthew asked for after whole stories failed on short gaps. The limit is a third of the clip:
-    /// a talk-show moment with a few unmatched seconds renders, but a clip that is mostly unmatched fails.
-    /// </summary>
     [Fact]
-    public void FootageGapsUpToAThirdOfTheClipAreHeldButMoreFails()
+    public void AnUnmatchedSubjectCannotBorrowEvenAShortStretchFromItsNeighbour()
     {
-        BrollCleanAllocator.RequireComplete(shotCount: 8, gapSeconds: 4, clipSeconds: 30);
-        BrollCleanAllocator.RequireComplete(shotCount: 8, gapSeconds: 10, clipSeconds: 30);
-
+        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(8, 0.1, 30));
+        Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(8, 4, 30));
         Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(8, 13, 30));
+    }
+
+    [Fact]
+    public void ASmallShortageCanRepeatAnApprovedIntervalWithoutReadingBeyondIt()
+    {
+        var stretches = BrollCleanAllocator.RepeatWithinMoment([new(0, 7, 2)], 3);
+        var allocation = BrollCleanAllocator.Allocate([new(0, 3, 0, "Justin Gaethje MMA training")], stretches);
+        Assert.Empty(allocation.Gaps);
+        Assert.Equal(3, allocation.Takes.Sum(x => x.DurationSeconds), 6);
+        Assert.All(allocation.Takes, x => Assert.True(x.InSeconds >= 7 && x.InSeconds + x.DurationSeconds <= 9.000001));
+    }
+
+    [Fact]
+    public void AWholeMissingMomentOrMostlyRepeatedMomentStillNeedsFootage()
+    {
+        Assert.Empty(BrollCleanAllocator.RepeatWithinMoment([], 3));
+        Assert.Single(BrollCleanAllocator.RepeatWithinMoment([new(0, 7, 0.5)], 3));
     }
 
     [Fact]
@@ -570,5 +711,107 @@ public sealed class BrollCleanAllocatorTests
     {
         Assert.Throws<InvalidOperationException>(() => BrollCleanAllocator.RequireComplete(0, 0, 20));
         BrollCleanAllocator.RequireComplete(1, 0, 20);
+    }
+
+    [Fact]
+    public void MomentsAboutTheSameSubjectShareOneSearchAndThePrimarySearchesLast()
+    {
+        var plan = new BrollPlan(
+        [
+            new BrollMoment(0, 4, "Justin Gaethje highlights", "Justin Gaethje"),
+            new BrollMoment(4, 6, "Dustin Poirier highlights", "Dustin Poirier"),
+            new BrollMoment(6, 10, "Justin  Gaethje Highlights", "Justin Gaethje"),
+            new BrollMoment(10, 12, "White House South Lawn", "White House"),
+        ], [], "Justin Gaethje", "Justin Gaethje highlights");
+
+        var pools = BrollPools.Build(plan);
+
+        Assert.Equal(3, pools.Count);
+        Assert.True(pools[^1].Primary);
+        Assert.Equal(8, pools[^1].SecondsNeeded, 6);
+        // The primary pool stands behind every other subject, so it is sized for the whole clip.
+        Assert.True(BrollPools.Target(pools[^1], 12) >= 12);
+        Assert.True(BrollPools.Target(pools[0], 12) < 12);
+    }
+
+    [Fact]
+    public void APrimaryNamedOnlyAsTheFallbackStillGetsItsOwnSearch()
+    {
+        var plan = new BrollPlan([new BrollMoment(0, 5, "Ryan Garcia highlights", "Ryan Garcia")], [],
+            "Teofimo Lopez", "Teofimo Lopez highlights");
+        var pools = BrollPools.Build(plan);
+        Assert.Equal(new[] { "ryan garcia highlights", "teofimo lopez highlights" }, pools.Select(x => x.Key));
+        Assert.Equal(0, pools[1].SecondsNeeded);
+    }
+
+    [Fact]
+    public void ASecondMentionOfASubjectContinuesItsFootageInsteadOfRepeatingIt()
+    {
+        var queue = new BrollFootageQueue([new BrollCleanStretch(0, 10, 3), new BrollCleanStretch(1, 20, 3)]);
+        var takes = new List<BrollCleanTake>();
+
+        Assert.Null(queue.Fill(new BrollSlot(0, 2, 0, "a"), takes));
+        Assert.Null(queue.Fill(new BrollSlot(8, 2, 2, "a"), takes, "Justin Gaethje highlights"));
+        var rest = queue.Fill(new BrollSlot(12, 3, 4, "a"), takes);
+
+        Assert.Equal(new[] { 10d, 12d, 20d, 21d }, takes.Select(x => Math.Round(x.InSeconds, 6)));
+        Assert.Equal("Justin Gaethje highlights", takes[1].Query);
+        Assert.NotNull(rest);
+        Assert.Equal(1, rest!.DurationSeconds, 6);
+        Assert.Equal(0, queue.RemainingSeconds, 6);
+    }
+
+    [Fact]
+    public void AContinuousTakeCutsForwardAtTheReferencesRhythm()
+    {
+        // The Gaethje White House walkout: one gimbal take, probed as touching 2.17 s review pieces.
+        var pieces = Enumerable.Range(0, 9).Select(i => new BrollCleanStretch(i, 0.5 + i * 2.169, 2.169)).ToList();
+        var queue = new BrollFootageQueue(pieces, cutAfterSeconds: 2.0);
+        var perSlot = new List<List<BrollCleanTake>>();
+        for (var slot = 0; slot < 4; slot++)
+        {
+            var takes = new List<BrollCleanTake>();
+            Assert.Null(queue.Fill(new BrollSlot(slot * 2.2, 2.2, 0, "a"), takes));
+            perSlot.Add(takes);
+        }
+
+        for (var slot = 1; slot < 4; slot++)
+        {
+            var previous = perSlot[slot - 1][^1];
+            // Every slot starts visibly later in the take than the last one ended: a cut, not a splice.
+            Assert.True(perSlot[slot][0].InSeconds - (previous.InSeconds + previous.DurationSeconds) >= 0.5);
+        }
+    }
+
+    [Fact]
+    public void FootageThatAlreadyCutsIsNotSkipped()
+    {
+        var queue = new BrollFootageQueue([new BrollCleanStretch(0, 0, 2.2), new BrollCleanStretch(1, 10, 2.2)],
+            cutAfterSeconds: 2.0);
+        var takes = new List<BrollCleanTake>();
+        Assert.Null(queue.Fill(new BrollSlot(0, 2.2, 0, "a"), takes));
+        Assert.Null(queue.Fill(new BrollSlot(2.2, 2.2, 0, "a"), takes));
+        Assert.Equal(new[] { 0d, 10d }, takes.Select(x => x.InSeconds));
+    }
+
+    [Fact]
+    public void OneParaphrasedQuoteDoesNotThrowAwayTheWholePlan()
+    {
+        TranscriptWord[] words = [new(0, 0.5, "Gaethje"), new(0.5, 1, "hits"), new(1, 1.5, "hard"),
+            new(2, 2.5, "Poirier"), new(2.5, 3, "went"), new(3, 3.5, "down"), new(4, 4.5, "crazy"), new(4.5, 5, "night")];
+        BrollMoment Moment(double start, double end, string quote) =>
+            new(start, end, "Justin Gaethje highlights", "Justin Gaethje", "Gaethje fighting in the octagon", quote);
+
+        var mostlyRight = new BrollPlan([Moment(0, 2, "Gaethje hits hard"), Moment(2, 4, "Poirier went down"),
+            Moment(4, 5, "a crazy night")], []);
+        var mostlyWrong = new BrollPlan([Moment(0, 2, "Gaethje punches"), Moment(2, 4, "Poirier fell"),
+            Moment(4, 5, "crazy night")], []);
+
+        Assert.True(BrollVisualReview.IsGrounded(mostlyRight, words));
+        Assert.False(BrollVisualReview.IsGrounded(mostlyWrong, words));
+        Assert.False(BrollVisualReview.IsGrounded(mostlyRight with
+        {
+            Moments = [.. mostlyRight.Moments.Take(2), mostlyRight.Moments[2] with { Subject = "" }],
+        }, words));
     }
 }

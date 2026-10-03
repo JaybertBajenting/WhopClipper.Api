@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using FluentValidation;
 using WhopClipper.Api.App.Domain;
+using WhopClipper.Api.App.Services;
 
 namespace WhopClipper.Api.App.Contracts;
 
@@ -67,9 +68,21 @@ public sealed record LocalSourceScanDto(int Attached, int Added, int AlreadyKnow
 /// <param name="Title">What the clip is about - the hook burned onto it.</param>
 /// <param name="Caption">Ready to paste into an upload form, with the campaign's required
 /// hashtags and mentions already in it. A missing required hashtag gets a clip rejected.</param>
+/// <param name="Drive">Set when the clip's video has been moved to Google Drive: it stays listed, with its
+/// thumbnail, until it is brought back.</param>
 public sealed record RenderedClipDto(string RelativePath, string FileName, string Platform, long SizeBytes,
     DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds,
-    string Title = "", string Caption = "", RenderedClipStyleDto? Style = null);
+    string Title = "", string Caption = "", RenderedClipStyleDto? Style = null, RenderedClipDriveDto? Drive = null,
+    string? SourceTitle = null, DateOnly? SourcePublishedOn = null);
+public sealed record RenderedClipDriveDto(string Remote, DateTimeOffset MovedAt, long Bytes);
+/// <summary>What "Move campaign to Drive" would move for a campaign, counted on this PC before anything is sent.</summary>
+/// <param name="ClipBytes">What the clips free on this PC, their music-free previews included.</param>
+/// <param name="AlreadyMoved">Clips moved to Drive earlier, whose video is no longer here.</param>
+/// <param name="StillWriting">Files a render or download is still writing; they wait for the next run.</param>
+public sealed record CampaignDriveUploadDto(string Remote, int Sources, long SourceBytes, int Clips, long ClipBytes,
+    int AlreadyMoved, int StillWriting);
+/// <summary>What "Bring campaign back from Drive" would fetch, and the room this PC has for it.</summary>
+public sealed record CampaignDriveReturnDto(int Sources, long SourceBytes, int Clips, long ClipBytes, long FreeBytes);
 public sealed record AddSourceRequest(string Url);
 public sealed record InspectSourceRequest(string Url);
 public sealed record StartDownloadRequest(Guid SourceAssetId, string? Quality = null, bool Refresh = false);
@@ -100,7 +113,9 @@ public sealed record SourceAssetDto(Guid Id, string Url, string? Title, string? 
     /// <summary>Confirmed to be a single video, so it can be handed to the pipeline. A known
     /// duration proves it; so does a video content type, which is all Drive reports before the
     /// file is on disk. Without the second test a Drive source could never be processed.</summary>
-    bool IsVideo = false, long? FileSizeBytes = null);
+    bool IsVideo = false, long? FileSizeBytes = null,
+    /// <summary>The day the video was published where it came from; null until looked up, or for a local file.</summary>
+    DateOnly? PublishedOn = null);
 public sealed record StartAiAnalysisRequest(Guid SourceAssetId, AiMode? Mode = null, PlatformKind Platform = PlatformKind.TikTok,
     string? Transcript = null);
 public sealed record SoundEffectPlacementDto(Guid AssetId, double AtSeconds, double GainDb = -6);
@@ -123,7 +138,7 @@ public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, s
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
     PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null,
     double? VoiceVolume = null, double? MusicVolume = null, string? Caption = null,
-    string? Title = null);
+    string? Title = null, bool MusicNeedsRender = false, NarratedPlanDto? Narrated = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,
@@ -342,7 +357,7 @@ public static class ApiMappings
             x.IsApproved, x.CreatedAt, x.ApprovedAt, x.Items.Select(i => new RequirementItemDto(i.Id, i.Category, i.Key,
                 i.Value, i.SourceText, i.Confidence, i.NeedsReview)).ToList())).ToList(),
         value.PlatformProfiles.OrderBy(x => x.Platform).Select(ToDto).ToList(),
-        value.Sources.OrderByDescending(x => x.CreatedAt).Select(ToDto).ToList(),
+        SourceDates.NewestFirst(value.Sources).Select(ToDto).ToList(),
         value.Documents.OrderBy(x => x.UploadedAt).Select(ToDto).ToList(),
         value.ReferenceVideos.OrderByDescending(x => x.IsPrimary).ThenBy(x => x.CreatedAt).Select(ToDto).ToList(),
         value.ReadBranding(), value.ReadEditStyle());
@@ -376,7 +391,7 @@ public static class ApiMappings
         value.DownloadedAt, string.IsNullOrWhiteSpace(value.Url),
         !string.IsNullOrWhiteSpace(value.WordTranscriptRelativePath),
         value.DurationSeconds is > 0 || MetadataSaysVideo(value.MetadataJson),
-        MetadataSize(value.MetadataJson));
+        MetadataSize(value.MetadataJson), SourceDates.PublishedOn(value.MetadataJson));
 
     private static bool MetadataSaysVideo(string? metadataJson) =>
         ReadMetadata(metadataJson, "contentType")?.GetString()?

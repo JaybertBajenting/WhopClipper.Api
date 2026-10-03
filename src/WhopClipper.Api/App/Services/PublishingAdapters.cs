@@ -9,8 +9,9 @@ using WhopClipper.Api.App.Domain;
 
 namespace WhopClipper.Api.App.Services;
 
+/// <param name="PublishAt">YouTube only: upload private and let YouTube make it public at this time.</param>
 public sealed record PlatformPublishRequest(Guid JobId, string FilePath, string Title, string Caption,
-    string Privacy, bool ShareToFeed, bool DryRun);
+    string Privacy, bool ShareToFeed, bool DryRun, DateTimeOffset? PublishAt = null);
 public sealed record PlatformPublishResult(string ExternalId, string? ExternalUrl, string ResultCode = "Published");
 public sealed record InstagramPreparedResult(string ContainerId);
 
@@ -44,10 +45,15 @@ public sealed class YouTubePublisher(IHttpClientFactory clients, IOptions<Publis
         var client = clients.CreateClient("PublishingExternal");
         var endpoint = QueryHelpers.AddQueryString(options.Value.YouTubeUploadEndpoint,
             new Dictionary<string, string?> { ["uploadType"] = "resumable", ["part"] = "snippet,status" });
+        // A scheduled upload stays private until publishAt; YouTube flips it public on its own, so
+        // the slot is met even when this machine is off.
+        object status = request.PublishAt is { } publishAt
+            ? new { privacyStatus = "private", publishAt = FormatPublishAt(publishAt), selfDeclaredMadeForKids = false }
+            : new { privacyStatus = request.Privacy };
         var metadata = JsonSerializer.Serialize(new
         {
             snippet = new { title = request.Title, description = request.Caption, categoryId = "22" },
-            status = new { privacyStatus = request.Privacy }
+            status
         }, JsonDefaults.Serializer);
         using var initiate = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
@@ -76,6 +82,58 @@ public sealed class YouTubePublisher(IHttpClientFactory clients, IOptions<Publis
         if (string.IsNullOrWhiteSpace(id)) throw new PublishingApiException("YouTube accepted the upload but returned no video ID.");
         progress.Report(1);
         return new(id, $"https://youtu.be/{Uri.EscapeDataString(id)}");
+    }
+
+    internal static string FormatPublishAt(DateTimeOffset value) =>
+        value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Moves a scheduled (still private, never published) video to a new go-public time. videos.update
+    /// replaces the whole status part, so the current status is read first and only publishAt changes.
+    /// Needs the youtube scope; youtube.upload alone cannot update.
+    /// </summary>
+    public async Task RescheduleAsync(string videoId, DateTimeOffset publishAt, Dictionary<string, string> credentials,
+        CancellationToken cancellationToken)
+    {
+        var token = await GetValidAccessTokenAsync(credentials, cancellationToken);
+        var client = clients.CreateClient("PublishingExternal");
+        using var read = new HttpRequestMessage(HttpMethod.Get, QueryHelpers.AddQueryString(
+            $"{options.Value.YouTubeApiEndpoint.TrimEnd('/')}/videos", new Dictionary<string, string?> { ["part"] = "status", ["id"] = videoId }));
+        read.Headers.Authorization = new("Bearer", token);
+        using var current = await client.SendAsync(read, cancellationToken);
+        if (!current.IsSuccessStatusCode) throw await SafeFailureAsync("YouTube could not read the scheduled video", current, cancellationToken);
+        var root = System.Text.Json.Nodes.JsonNode.Parse(await current.Content.ReadAsStringAsync(cancellationToken));
+        var status = root?["items"]?.AsArray().FirstOrDefault()?["status"]?.AsObject()
+            ?? throw new PublishingApiException("YouTube no longer has this video. It may have been deleted in YouTube Studio.");
+        if (!string.Equals(status["privacyStatus"]?.GetValue<string>(), "private", StringComparison.OrdinalIgnoreCase))
+            throw new PublishingApiException("This video is already public, so its go-public time cannot change.");
+        var updated = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (key, value) in status)
+            if (key is "privacyStatus" or "embeddable" or "license" or "publicStatsViewable" or "selfDeclaredMadeForKids" or "containsSyntheticMedia")
+                updated[key] = value?.DeepClone();
+        updated["privacyStatus"] = "private";
+        updated["publishAt"] = FormatPublishAt(publishAt);
+        using var write = new HttpRequestMessage(HttpMethod.Put, QueryHelpers.AddQueryString(
+            $"{options.Value.YouTubeApiEndpoint.TrimEnd('/')}/videos", new Dictionary<string, string?> { ["part"] = "status" }))
+        {
+            Content = new StringContent(new System.Text.Json.Nodes.JsonObject { ["id"] = videoId, ["status"] = updated }.ToJsonString(),
+                Encoding.UTF8, "application/json")
+        };
+        write.Headers.Authorization = new("Bearer", token);
+        using var response = await client.SendAsync(write, cancellationToken);
+        if (!response.IsSuccessStatusCode) throw await SafeFailureAsync("YouTube could not move the scheduled video", response, cancellationToken);
+    }
+
+    /// <summary>Deletes an uploaded video. A video already gone counts as deleted.</summary>
+    public async Task DeleteVideoAsync(string videoId, Dictionary<string, string> credentials, CancellationToken cancellationToken)
+    {
+        var token = await GetValidAccessTokenAsync(credentials, cancellationToken);
+        using var request = new HttpRequestMessage(HttpMethod.Delete, QueryHelpers.AddQueryString(
+            $"{options.Value.YouTubeApiEndpoint.TrimEnd('/')}/videos", new Dictionary<string, string?> { ["id"] = videoId }));
+        request.Headers.Authorization = new("Bearer", token);
+        using var response = await clients.CreateClient("PublishingExternal").SendAsync(request, cancellationToken);
+        if (response.StatusCode == HttpStatusCode.NotFound) return;
+        if (!response.IsSuccessStatusCode) throw await SafeFailureAsync("YouTube could not delete the video", response, cancellationToken);
     }
 
     public async Task<(bool Valid, string? AccountIdentifier, string? Error)> VerifyAsync(
@@ -314,6 +372,13 @@ internal sealed class ProgressStreamContent : HttpContent
 public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<PublishingApiOptions> options,
     YouTubeOAuthStateStore states, PlatformConnectionService connections)
 {
+    public const string UploadScope = "https://www.googleapis.com/auth/youtube.upload";
+    public const string ManageScope = "https://www.googleapis.com/auth/youtube";
+
+    /// <summary>Scheduling moves and deletes videos, which the upload-only scope cannot do.</summary>
+    public static bool CanManageSchedule(IEnumerable<string> grantedScopes) =>
+        grantedScopes.Contains(ManageScope, StringComparer.Ordinal);
+
     public async Task<OAuthStartResponse> StartAsync(string redirectUri, CancellationToken cancellationToken)
     {
         if (!Uri.TryCreate(redirectUri, UriKind.Absolute, out var callback) || callback.Scheme != Uri.UriSchemeHttp ||
@@ -327,7 +392,9 @@ public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<Pub
         var url = QueryHelpers.AddQueryString(options.Value.GoogleAuthorizationEndpoint, new Dictionary<string, string?>
         {
             ["client_id"] = clientId, ["redirect_uri"] = redirectUri, ["response_type"] = "code",
-            ["scope"] = "https://www.googleapis.com/auth/youtube.upload", ["access_type"] = "offline",
+            // Upload, plus the youtube scope that moving a scheduled video to another slot and taking
+            // one off (videos.update / videos.delete) require.
+            ["scope"] = $"{UploadScope} {ManageScope}", ["access_type"] = "offline",
             ["prompt"] = "consent", ["state"] = state.State, ["code_challenge"] = state.CodeChallenge,
             ["code_challenge_method"] = "S256"
         });
@@ -360,11 +427,9 @@ public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<Pub
         credentials["expiresAt"] = expires.ToString("O");
         var grantedScopes = json.RootElement.TryGetProperty("scope", out var scopeNode) ? scopeNode.GetString() : null;
         if (!string.IsNullOrWhiteSpace(grantedScopes) && !grantedScopes.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            .Contains("https://www.googleapis.com/auth/youtube.upload", StringComparer.Ordinal))
+            .Any(x => x is UploadScope or ManageScope))
             throw new PublishingApiException("Google did not grant the required YouTube upload scope.");
-        credentials["grantedScopes"] = string.IsNullOrWhiteSpace(grantedScopes)
-            ? "https://www.googleapis.com/auth/youtube.upload"
-            : grantedScopes;
+        credentials["grantedScopes"] = string.IsNullOrWhiteSpace(grantedScopes) ? UploadScope : grantedScopes;
         await connections.SaveCredentialSetAsync(PlatformKind.YouTubeShorts, credentials, expires, cancellationToken);
         _ = await connections.VerifyAsync(PlatformKind.YouTubeShorts, cancellationToken);
     }

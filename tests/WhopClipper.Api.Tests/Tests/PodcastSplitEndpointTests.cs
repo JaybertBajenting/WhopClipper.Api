@@ -59,6 +59,42 @@ public sealed class PodcastSplitEndpointTests
     }
 
     [Fact]
+    public void ReviewedBrollAndEmphasisSurviveTheQueuedJobPayload()
+    {
+        var shot = new BrollShotDto("campaigns/c/source/manual-broll/gaethje.mp4", 12, 2,
+            new CropRectDto(157, 0, 540, 480), 854, 480, [], "Gaethje speaking",
+            "https://www.youtube.com/watch?v=abcdefghijk", "Gaethje visits athletes");
+        var request = new ImportStoriesRequest(
+            [new ImportedStoryDto("Gaethje speaks", [new StoryPieceDto(100, 105)],
+                ReviewedBroll: [shot], Emphasis: ["speaks"])],
+            Url: "https://www.youtube.com/watch?v=abcdefghijk");
+        Assert.Empty(PodcastSplitEndpoints.ValidateStories(request));
+
+        var payload = new SourcePipelineJobPayload(Guid.NewGuid(), PlatformKind.TikTok,
+            MaxClips: 1, DeleteSourceWhenDone: false, EditStyle: EditStyles.PodcastSplit,
+            Stories: request.Stories);
+        var restored = JsonSerializer.Deserialize<SourcePipelineJobPayload>(
+            JsonSerializer.Serialize(payload, JsonDefaults.Serializer), JsonDefaults.Serializer)!;
+        var story = Assert.Single(restored.Stories!);
+        Assert.Equal("speaks", Assert.Single(story.Emphasis!));
+        Assert.Equal(shot.RelativePath, Assert.Single(story.ReviewedBroll!).RelativePath);
+        Assert.Equal(shot.SourceUrl, story.ReviewedBroll![0].SourceUrl);
+    }
+
+    [Fact]
+    public void ReviewedBrollCannotBeUnattributedOrTooShort()
+    {
+        var invalid = new BrollShotDto("campaigns/c/source/manual-broll/gaethje.mp4", 0, .25,
+            new CropRectDto(157, 0, 540, 480), 854, 480, [], "Gaethje speaking");
+        var request = new ImportStoriesRequest(
+            [new ImportedStoryDto("Gaethje speaks", [new StoryPieceDto(100, 105)],
+                ReviewedBroll: [invalid])],
+            Url: "https://www.youtube.com/watch?v=abcdefghijk");
+
+        Assert.Contains("stories[0]", PodcastSplitEndpoints.ValidateStories(request).Keys);
+    }
+
+    [Fact]
     public void AQueuedStoryRunSurvivesARestart()
     {
         var original = new SourcePipelineJobPayload(Guid.NewGuid(), PlatformKind.TikTok, MaxClips: 2,

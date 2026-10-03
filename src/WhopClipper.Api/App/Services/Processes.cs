@@ -7,8 +7,10 @@ using WhopClipper.Api.App.Contracts;
 
 namespace WhopClipper.Api.App.Services;
 
+/// <param name="OnStandardError">Called with each piece of standard error as it arrives, for progress reporting. It runs
+/// on the reading thread, so it must be quick and must not touch anything that is not thread-safe.</param>
 public sealed record ProcessInvocation(string Executable, IReadOnlyList<string> Arguments, string WorkingDirectory,
-    string? StandardInput = null, TimeSpan? Timeout = null);
+    string? StandardInput = null, TimeSpan? Timeout = null, Action<string>? OnStandardError = null);
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError, bool TimedOut, TimeSpan Duration);
 
 public interface IProcessRunner
@@ -63,8 +65,8 @@ public sealed class SafeProcessRunner(IOptions<AppOptions> options, ILogger<Safe
         }
 
         var captureLimit = Math.Max(4_096, options.Value.MaxCapturedLogCharacters);
-        var stdoutTask = ReadBoundedAsync(process.StandardOutput, captureLimit);
-        var stderrTask = ReadBoundedAsync(process.StandardError, captureLimit);
+        var stdoutTask = ReadBoundedAsync(process.StandardOutput, captureLimit, null);
+        var stderrTask = ReadBoundedAsync(process.StandardError, captureLimit, invocation.OnStandardError);
         using var timeout = new CancellationTokenSource(invocation.Timeout ?? TimeSpan.FromMinutes(options.Value.ProcessTimeoutMinutes));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
         if (invocation.StandardInput is not null)
@@ -99,7 +101,7 @@ public sealed class SafeProcessRunner(IOptions<AppOptions> options, ILogger<Safe
         return new ProcessResult(process.ExitCode, stdout, stderr, timedOut, stopwatch.Elapsed);
     }
 
-    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maxCharacters)
+    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maxCharacters, Action<string>? onRead)
     {
         var buffer = new char[4_096];
         var captured = new StringBuilder(Math.Min(maxCharacters, 32_768));
@@ -107,6 +109,11 @@ public sealed class SafeProcessRunner(IOptions<AppOptions> options, ILogger<Safe
         {
             var count = await reader.ReadAsync(buffer.AsMemory());
             if (count == 0) break;
+            if (onRead is not null)
+            {
+                // A progress reader that throws must not lose the process's output or its exit code.
+                try { onRead(new string(buffer, 0, count)); } catch (Exception) { }
+            }
             captured.Append(buffer, 0, count);
             var overflow = captured.Length - maxCharacters;
             if (overflow > 0) captured.Remove(0, overflow);

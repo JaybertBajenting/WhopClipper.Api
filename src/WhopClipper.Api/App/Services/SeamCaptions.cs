@@ -122,6 +122,15 @@ public static partial class CaptionBuilder
         for (var index = 0; index < tokens.Count; index++)
         {
             var current = tokens[index];
+            // Whisper splits "$500,000" into "$500" and ",000", and "one-one" into "one" and "-one": glue a
+            // fragment that starts with its joining punctuation back onto the word it belongs to.
+            while (index + 1 < tokens.Count && tokens[index + 1].Start - current.End < 0.3 &&
+                   (tokens[index + 1].Word is [',' or '.', var digit, ..] && char.IsDigit(digit) && current.Word.Length > 0 && char.IsDigit(current.Word[^1])
+                    || tokens[index + 1].Word is ['-', var letter, ..] && char.IsLetterOrDigit(letter)))
+            {
+                current = new TranscriptWord(current.Start, tokens[index + 1].End, current.Word + tokens[index + 1].Word);
+                index++;
+            }
             if (index + 1 < tokens.Count && current.Word.Any(char.IsDigit)
                 && NumberUnits.Contains(tokens[index + 1].Word.TrimEnd('?', '!', '.'))
                 && tokens[index + 1].Start - current.End < 0.4)

@@ -46,6 +46,14 @@ public static class PublishingEndpoints
                 if (result.Errors is not null) return Results.ValidationProblem(result.Errors);
                 return result.Kit is null ? Results.NotFound() : Results.Ok(result.Kit);
             }).WithTags("Publishing");
+        api.MapPost("/campaigns/{campaignId:guid}/publishing/account-kits/{platform}/regenerate-identity",
+            async (Guid campaignId, PlatformKind platform, HttpContext context,
+                LocalPublishingRequestGuard guard, PlatformAccountKitService service, CancellationToken ct) =>
+            {
+                if (!guard.IsValid(context)) return Forbidden();
+                var kit = await service.RegenerateIdentityAsync(campaignId, platform, ct);
+                return kit is null ? Results.NotFound() : Results.Ok(kit);
+            }).WithTags("Publishing");
 
         publishing.MapGet("/connections", async (PlatformConnectionService service, CancellationToken ct) =>
             Results.Ok(await service.GetAllAsync(ct)));

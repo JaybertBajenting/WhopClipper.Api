@@ -51,23 +51,25 @@ public static class PlatformPublishingCatalog
         var platformName = Guide(platform).DisplayName;
         return new Dictionary<string, AccountKitFieldDefinition>(StringComparer.OrdinalIgnoreCase)
         {
-            ["username"] = new("Username", false, $"Public profile username for {platformName}."),
-            ["handle"] = new("Handle", true, "Copy without the @ sign unless the platform asks for it."),
-            ["displayName"] = new("Display name", true, "Public account/channel name."),
+            ["username"] = new("Username", false, $"Suggested username for your independent {platformName} highlights channel; do not reuse the featured creator's official username."),
+            ["handle"] = new("Handle", true, "A distinct highlights-channel handle. Copy without the @ sign unless the platform asks for it."),
+            ["displayName"] = new("Channel display name", true, "Your editable highlights-channel identity, not the featured creator's official account name."),
             ["loginEmail"] = new("Signup email", false, "Non-secret email used during account creation. Passwords are never stored."),
             ["loginPhone"] = new("Signup phone", false, "Optional phone used during account creation. Verification codes are never stored."),
-            ["bio"] = new("Bio / description", false, "Short public profile description."),
+            ["bio"] = new("Bio / description", false, "State the channel's curation value, credit the featured subject, and make clear that this is not the official account."),
             ["website"] = new("Website / link", false, "Public link to paste into the profile when the account is eligible."),
             ["category"] = new("Category", false, platform == PlatformKind.InstagramReels ? "Choose a Professional account category." : "Suggested public category."),
             ["contactEmail"] = new("Public contact email", false, "Optional public-facing contact email; this can differ from the signup email."),
-            ["profileImage"] = new("Profile image path or URL", false, "Reference to the image you plan to upload; the app does not upload it automatically.")
+            ["profileImage"] = new("Profile image path or URL", false, "Use original highlights-channel artwork that is visually distinct from the creator's official avatar or logo. The app does not upload it automatically.")
         };
     }
 
     public static string[] SetupSteps(PlatformKind platform) =>
     [
         $"Open {Guide(platform).SignupUrl} and create the account manually.",
+        "Treat the campaign brand as the featured subject, not as the owner or identity of your account.",
         "Copy the prepared fields below into the platform's signup and profile forms.",
+        "Keep a distinct highlights-channel name and a clear 'not the official account' disclosure in the bio.",
         "Create a strong unique password in your password manager; do not save it in Whop Clipper.",
         "Finish email/phone verification and enable two-factor authentication directly on the platform.",
         platform == PlatformKind.InstagramReels
@@ -84,6 +86,9 @@ public sealed class PlatformAccountKitService(AppDbContext db)
 {
     private static readonly string[] BannedFragments =
         ["password", "passcode", "twofactor", "2fa", "otp", "recovery", "backupcode", "securityanswer"];
+    private static readonly HashSet<string> LegacyGeneratedIdentityKeys =
+        new(["username", "handle", "displayName", "bio"], StringComparer.OrdinalIgnoreCase);
+    private static readonly string[] GeneratedIdentityKeys = ["username", "handle", "displayName", "bio"];
 
     public async Task<IReadOnlyList<PlatformAccountKitDto>?> GetAllAsync(Guid campaignId, CancellationToken cancellationToken)
     {
@@ -110,7 +115,8 @@ public sealed class PlatformAccountKitService(AppDbContext db)
     {
         if (!PlatformPublishingCatalog.IsPublishingPlatform(platform))
             return (null, new() { ["platform"] = ["Choose TikTok, InstagramReels, or YouTubeShorts."] });
-        var campaign = await db.Campaigns.SingleOrDefaultAsync(x => x.Id == campaignId, cancellationToken);
+        var campaign = await db.Campaigns.Include(x => x.PlatformProfiles)
+            .SingleOrDefaultAsync(x => x.Id == campaignId, cancellationToken);
         if (campaign is null) return (null, null);
         var errors = Validate(fields, platform);
         if (errors.Count > 0) return (null, errors);
@@ -127,6 +133,31 @@ public sealed class PlatformAccountKitService(AppDbContext db)
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(cancellationToken);
         return (Build(campaign, platform, clean), null);
+    }
+
+    public async Task<PlatformAccountKitDto?> RegenerateIdentityAsync(Guid campaignId, PlatformKind platform,
+        CancellationToken cancellationToken)
+    {
+        if (!PlatformPublishingCatalog.IsPublishingPlatform(platform)) return null;
+        var campaign = await db.Campaigns.Include(x => x.PlatformProfiles)
+            .SingleOrDefaultAsync(x => x.Id == campaignId, cancellationToken);
+        if (campaign is null) return null;
+        var entity = await db.PlatformAccountKits.SingleOrDefaultAsync(
+            x => x.CampaignId == campaignId && x.Platform == platform, cancellationToken);
+        var fields = entity is null
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : ReadFields(entity.FieldsJson);
+        var generated = DefaultFields(campaign, platform);
+        foreach (var key in GeneratedIdentityKeys) fields[key] = generated[key];
+        if (entity is null)
+        {
+            entity = new PlatformAccountKit { CampaignId = campaignId, Platform = platform };
+            db.PlatformAccountKits.Add(entity);
+        }
+        entity.FieldsJson = System.Text.Json.JsonSerializer.Serialize(fields, JsonDefaults.Serializer);
+        entity.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(cancellationToken);
+        return Build(campaign, platform, fields);
     }
 
     internal static Dictionary<string, string[]> Validate(IReadOnlyDictionary<string, string>? fields, PlatformKind platform)
@@ -148,10 +179,10 @@ public sealed class PlatformAccountKitService(AppDbContext db)
         return errors;
     }
 
-    private static PlatformAccountKitDto Build(Campaign campaign, PlatformKind platform, IReadOnlyDictionary<string, string>? stored)
+    internal static PlatformAccountKitDto Build(Campaign campaign, PlatformKind platform,
+        IReadOnlyDictionary<string, string>? stored)
     {
-        var defaults = DefaultFields(campaign, platform);
-        if (stored is not null) foreach (var pair in stored) if (defaults.ContainsKey(pair.Key)) defaults[pair.Key] = pair.Value;
+        var defaults = MergeStoredFields(campaign, platform, stored);
         var definitions = PlatformPublishingCatalog.AccountFields(platform);
         var fields = definitions.Select(x => new AccountKitFieldDto(x.Key, x.Value.Label,
             defaults.GetValueOrDefault(x.Key, string.Empty), x.Value.Required, true, x.Value.HelpText)).ToList();
@@ -168,17 +199,13 @@ public sealed class PlatformAccountKitService(AppDbContext db)
             PlatformPublishingCatalog.SetupSteps(platform), publishDefaults);
     }
 
-    private static Dictionary<string, string> DefaultFields(Campaign campaign, PlatformKind platform)
+    internal static Dictionary<string, string> DefaultFields(Campaign campaign, PlatformKind platform)
     {
-        var display = string.IsNullOrWhiteSpace(campaign.Brand) ? campaign.Name.Trim() : campaign.Brand.Trim();
-        var handle = Slug(display, platform == PlatformKind.TikTok ? 24 : 30);
+        var subject = FeaturedSubject(campaign);
+        var display = $"Clip Notes: {subject}";
+        var handle = HighlightHandle(subject, platform == PlatformKind.TikTok ? 24 : 30);
         var category = string.IsNullOrWhiteSpace(campaign.Category) ? "Digital creator" : campaign.Category.Trim();
-        var bio = platform switch
-        {
-            PlatformKind.YouTubeShorts => $"Short-form highlights from {display}.",
-            PlatformKind.InstagramReels => $"Clips, highlights and updates from {display}.",
-            _ => $"The best moments from {display}."
-        };
+        var bio = $"Independent highlights featuring {subject}. Curated edits with captions and added context. Not the creator's official account.";
         return new(StringComparer.OrdinalIgnoreCase)
         {
             ["username"] = handle, ["handle"] = handle, ["displayName"] = display,
@@ -186,6 +213,59 @@ public sealed class PlatformAccountKitService(AppDbContext db)
             ["website"] = campaign.WhopUrl ?? "", ["category"] = category,
             ["contactEmail"] = "", ["profileImage"] = ""
         };
+    }
+
+    internal static Dictionary<string, string> MergeStoredFields(Campaign campaign, PlatformKind platform,
+        IReadOnlyDictionary<string, string>? stored)
+    {
+        var defaults = DefaultFields(campaign, platform);
+        if (stored is null) return defaults;
+        var legacy = LegacyGeneratedIdentityFields(campaign, platform);
+        foreach (var pair in stored)
+        {
+            if (!defaults.ContainsKey(pair.Key)) continue;
+            var isLegacyGenerated = LegacyGeneratedIdentityKeys.Contains(pair.Key) &&
+                                    legacy.TryGetValue(pair.Key, out var oldValue) &&
+                                    string.Equals(pair.Value, oldValue, StringComparison.Ordinal);
+            if (!isLegacyGenerated) defaults[pair.Key] = pair.Value;
+        }
+        return defaults;
+    }
+
+    private static Dictionary<string, string> LegacyGeneratedIdentityFields(Campaign campaign, PlatformKind platform)
+    {
+        var subject = FeaturedSubject(campaign);
+        var handle = Slug(subject, platform == PlatformKind.TikTok ? 24 : 30);
+        var bio = platform switch
+        {
+            PlatformKind.YouTubeShorts => $"Short-form highlights from {subject}.",
+            PlatformKind.InstagramReels => $"Clips, highlights and updates from {subject}.",
+            _ => $"The best moments from {subject}."
+        };
+        return new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["username"] = handle,
+            ["handle"] = handle,
+            ["displayName"] = subject,
+            ["bio"] = bio
+        };
+    }
+
+    private static string FeaturedSubject(Campaign campaign)
+    {
+        var subject = string.IsNullOrWhiteSpace(campaign.Brand) ? campaign.Name : campaign.Brand;
+        return string.IsNullOrWhiteSpace(subject) ? "Featured Creator" : subject.Trim();
+    }
+
+    private static string HighlightHandle(string subject, int maxLength)
+    {
+        const string identity = "clipnotes";
+        var subjectSlug = Slug(subject, maxLength);
+        var remaining = Math.Max(3, maxLength - identity.Length);
+        var subjectPart = subjectSlug[..Math.Min(subjectSlug.Length, remaining)].Trim('.', '_', '-');
+        if (string.IsNullOrWhiteSpace(subjectPart)) subjectPart = "highlights";
+        var result = $"{identity}{subjectPart}";
+        return result[..Math.Min(result.Length, maxLength)];
     }
 
     private static string Slug(string value, int maxLength)
