@@ -52,6 +52,32 @@ public sealed class PublishingAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task AScheduledUploadStaysPrivateUntilItsPublishAt()
+    {
+        var slot = new DateTimeOffset(2026, 9, 26, 15, 0, 0, TimeSpan.Zero);
+        var handler = new SequenceHandler([
+            async request =>
+            {
+                var metadata = await request.Content!.ReadAsStringAsync();
+                Assert.Contains("\"privacyStatus\":\"private\"", metadata);
+                Assert.Contains("\"publishAt\":\"2026-09-26T15:00:00Z\"", metadata);
+                return Response(HttpStatusCode.OK, "{}", location: "https://upload.googleapis.com/resumable/session-2");
+            },
+            _ => Task.FromResult(Response(HttpStatusCode.OK, "{\"id\":\"video-456\"}"))
+        ]);
+        var publisher = new YouTubePublisher(new SingleClientFactory(handler), Options.Create(new PublishingApiOptions()));
+        var credentials = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["clientId"] = "client", ["accessToken"] = "access", ["expiresAt"] = DateTimeOffset.UtcNow.AddHours(1).ToString("O")
+        };
+
+        var result = await publisher.PublishAsync(new(Guid.NewGuid(), _videoPath, "Title", "Caption", "public", false, false, slot),
+            credentials, new Progress<double>(), CancellationToken.None);
+
+        Assert.Equal("video-456", result.ExternalId);
+    }
+
+    [Fact]
     public async Task YouTubeDryRunMakesNoExternalRequest()
     {
         var handler = new SequenceHandler([]);

@@ -117,6 +117,9 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<DateTimeOffset?>("Deadline")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<string>("EditStyleJson")
+                        .HasColumnType("text");
+
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasColumnType("text");
@@ -475,6 +478,12 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<string>("Mood")
                         .HasColumnType("text");
 
+                    b.Property<double?>("SegmentEndSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("SegmentStartSeconds")
+                        .HasColumnType("double precision");
+
                     b.Property<long>("SizeBytes")
                         .HasColumnType("bigint");
 
@@ -698,6 +707,9 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<bool>("DryRun")
                         .HasColumnType("boolean");
 
+                    b.Property<Guid?>("EditPlanId")
+                        .HasColumnType("uuid");
+
                     b.Property<string>("Error")
                         .HasColumnType("text");
 
@@ -734,6 +746,12 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<string>("ManualPackageRelativePath")
                         .HasColumnType("text");
 
+                    b.Property<DateTimeOffset?>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("NotificationScheduledFor")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<string>("OutputRelativePath")
                         .IsRequired()
                         .HasColumnType("text");
@@ -763,6 +781,9 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<string>("ResultJson")
                         .HasColumnType("text");
 
+                    b.Property<DateTimeOffset?>("ScheduledPublishAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<bool>("ShareToFeed")
                         .HasColumnType("boolean");
 
@@ -786,6 +807,8 @@ namespace WhopClipper.Api.App.Data.Migrations
 
                     b.HasIndex("IdempotencyKey")
                         .IsUnique();
+
+                    b.HasIndex("Platform", "ScheduledPublishAt");
 
                     b.HasIndex("Status", "CreatedAt");
 

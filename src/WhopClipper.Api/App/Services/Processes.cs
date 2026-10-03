@@ -7,8 +7,10 @@ using WhopClipper.Api.App.Contracts;
 
 namespace WhopClipper.Api.App.Services;
 
+/// <param name="OnStandardError">Called with each piece of standard error as it arrives, for progress reporting. It runs
+/// on the reading thread, so it must be quick and must not touch anything that is not thread-safe.</param>
 public sealed record ProcessInvocation(string Executable, IReadOnlyList<string> Arguments, string WorkingDirectory,
-    string? StandardInput = null, TimeSpan? Timeout = null);
+    string? StandardInput = null, TimeSpan? Timeout = null, Action<string>? OnStandardError = null);
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError, bool TimedOut, TimeSpan Duration);
 
 public interface IProcessRunner
@@ -63,8 +65,8 @@ public sealed class SafeProcessRunner(IOptions<AppOptions> options, ILogger<Safe
         }
 
         var captureLimit = Math.Max(4_096, options.Value.MaxCapturedLogCharacters);
-        var stdoutTask = ReadBoundedAsync(process.StandardOutput, captureLimit);
-        var stderrTask = ReadBoundedAsync(process.StandardError, captureLimit);
+        var stdoutTask = ReadBoundedAsync(process.StandardOutput, captureLimit, null);
+        var stderrTask = ReadBoundedAsync(process.StandardError, captureLimit, invocation.OnStandardError);
         using var timeout = new CancellationTokenSource(invocation.Timeout ?? TimeSpan.FromMinutes(options.Value.ProcessTimeoutMinutes));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
         if (invocation.StandardInput is not null)
@@ -99,7 +101,7 @@ public sealed class SafeProcessRunner(IOptions<AppOptions> options, ILogger<Safe
         return new ProcessResult(process.ExitCode, stdout, stderr, timedOut, stopwatch.Elapsed);
     }
 
-    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maxCharacters)
+    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maxCharacters, Action<string>? onRead)
     {
         var buffer = new char[4_096];
         var captured = new StringBuilder(Math.Min(maxCharacters, 32_768));
@@ -107,6 +109,11 @@ public sealed class SafeProcessRunner(IOptions<AppOptions> options, ILogger<Safe
         {
             var count = await reader.ReadAsync(buffer.AsMemory());
             if (count == 0) break;
+            if (onRead is not null)
+            {
+                // A progress reader that throws must not lose the process's output or its exit code.
+                try { onRead(new string(buffer, 0, count)); } catch (Exception) { }
+            }
             captured.Append(buffer, 0, count);
             var overflow = captured.Length - maxCharacters;
             if (overflow > 0) captured.Remove(0, overflow);
@@ -145,7 +152,10 @@ public sealed class DependencyService(IProcessRunner runner, IOptions<AppOptions
     }
 }
 
-public sealed record AiProviderRequest(string Prompt, string SchemaPath, string WorkingDirectory);
+/// <param name="SchemaJson">The schema handed to the CLI. Null means the highlight schema, which is
+/// what every call used before the podcast-split style needed stories and B-roll plans too.
+/// Codex reads <paramref name="SchemaPath"/>, so write the same schema there.</param>
+public sealed record AiProviderRequest(string Prompt, string SchemaPath, string WorkingDirectory, string? SchemaJson = null);
 public sealed record AiHighlight(double StartSeconds, double EndSeconds, string Hook, string Rationale,
     double Score, double Confidence, JsonElement EditPlan);
 public sealed record AiProviderResponse(string Provider, IReadOnlyList<AiHighlight> Highlights, string RawOutput, int ExitCode);
@@ -156,6 +166,10 @@ public interface IAiMediaProvider
     string Name { get; }
     Task<AiProviderAvailability> CheckAvailabilityAsync(string workingDirectory, CancellationToken cancellationToken);
     Task<AiProviderResponse> AnalyzeAsync(AiProviderRequest request, CancellationToken cancellationToken);
+    /// <summary>Runs any schema and returns the payload <paramref name="accept"/> recognises, with the
+    /// same rate-limit retries as highlight analysis.</summary>
+    Task<JsonElement> RunStructuredAsync(AiProviderRequest request, Func<JsonElement, bool> accept,
+        CancellationToken cancellationToken);
 }
 
 public abstract class CliAiProvider(IProcessRunner runner) : IAiMediaProvider
@@ -191,16 +205,57 @@ public abstract class CliAiProvider(IProcessRunner runner) : IAiMediaProvider
         return lines.Length == 0 ? $"The CLI exited with code {result.ExitCode}." : string.Join(" | ", lines.Take(3));
     }
 
+    /// <summary>Attempts, and the wait before each retry. Long enough to outlast a short rate limit
+    /// without stalling a queue for the rest of the night.</summary>
+    private static readonly TimeSpan[] RetryDelays = [TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(90)];
+
+    /// <summary>
+    /// A rate limit is the queue's problem, not this source's. An overnight run lost a source to a
+    /// single 429 after the call had already been paid for, so transient refusals are waited out
+    /// here. Anything else - a bad schema, an expired login - repeats identically and costs money
+    /// each time, so it is raised on the first attempt.
+    /// </summary>
+    internal static bool IsTransient(ProcessResult result)
+    {
+        if (result.ExitCode == 0) return false;
+        var combined = result.StandardError + "\n" + result.StandardOutput;
+        return combined.Contains("api_error_status\":429", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("api_error_status\":529", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("rate_limit", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("overloaded", StringComparison.OrdinalIgnoreCase)
+            || combined.Contains("too many requests", StringComparison.OrdinalIgnoreCase);
+    }
+
     public async Task<AiProviderResponse> AnalyzeAsync(AiProviderRequest request, CancellationToken cancellationToken)
     {
-        var result = await runner.RunAsync(CreateInvocation(request), cancellationToken);
-        if (result.TimedOut) throw new TimeoutException($"{Name} timed out. {Describe(result)}");
-        if (result.ExitCode != 0) throw new InvalidOperationException($"{Name} failed (exit {result.ExitCode}). {Describe(result)}");
-        var output = await GetParserOutputAsync(request, result, cancellationToken);
+        var (result, output) = await RunWithRetriesAsync(request, cancellationToken);
         var highlights = AiOutputParser.Parse(output);
         if (highlights.Count == 0)
             throw new InvalidOperationException($"{Name} returned no schema-valid highlights. {Describe(result)}");
         return new AiProviderResponse(Name, highlights, output, result.ExitCode);
+    }
+
+    public async Task<JsonElement> RunStructuredAsync(AiProviderRequest request, Func<JsonElement, bool> accept,
+        CancellationToken cancellationToken)
+    {
+        var (result, output) = await RunWithRetriesAsync(request, cancellationToken);
+        return StructuredOutput.Extract(output, accept)
+            ?? throw new InvalidOperationException($"{Name} returned nothing matching the schema. {Describe(result)}");
+    }
+
+    private async Task<(ProcessResult Result, string Output)> RunWithRetriesAsync(AiProviderRequest request,
+        CancellationToken cancellationToken)
+    {
+        var result = await runner.RunAsync(CreateInvocation(request), cancellationToken);
+        for (var attempt = 0; attempt < RetryDelays.Length && IsTransient(result); attempt++)
+        {
+            await Task.Delay(RetryDelays[attempt], cancellationToken);
+            result = await runner.RunAsync(CreateInvocation(request), cancellationToken);
+        }
+        if (result.TimedOut) throw new TimeoutException($"{Name} timed out. {Describe(result)}");
+        if (result.ExitCode != 0) throw new InvalidOperationException($"{Name} failed (exit {result.ExitCode}). {Describe(result)}");
+        return (result, await GetParserOutputAsync(request, result, cancellationToken));
     }
 
     /// <summary>
@@ -231,7 +286,7 @@ public sealed class ClaudeCliProvider(IProcessRunner runner, IOptions<AppOptions
         // Structured output is delivered through a tool call, so a single turn is not enough:
         // the run stops with stop_reason "tool_use" before the JSON is produced. Plan mode
         // and safe mode remain the boundary that keeps the run read-only.
-        ["-p", "--output-format", "json", "--json-schema", AiSchemas.HighlightSchema, "--max-turns", "8",
+        ["-p", "--output-format", "json", "--json-schema", request.SchemaJson ?? AiSchemas.HighlightSchema, "--max-turns", "8",
             "--safe-mode", "--no-session-persistence", "--permission-mode", "plan"],
         request.WorkingDirectory, request.Prompt);
 
@@ -321,6 +376,24 @@ public static class AiOutputParser
         catch (JsonException) { return []; }
     }
 
+    // A dash holding two halves of a hook together reads as machine-written on a title card, so
+    // it is rewritten to a comma. Only separator dashes go: em, en and friends anywhere, and a
+    // plain hyphen only when it stands alone between spaces. A hyphen inside a word is left
+    // intact, because "co-op" must not become "coop".
+    // \u2010-\u2015 covers hyphen through horizontal bar; \u2212 is the minus sign. Written as
+    // escapes so the class cannot be broken by how this file is re-encoded.
+    private static readonly Regex SeparatorDash = new("\\s*[\u2010-\u2015\u2212]\\s*|\\s+-\\s+",
+        RegexOptions.Compiled);
+
+    internal static string CleanHookText(string hook)
+    {
+        var text = SeparatorDash.Replace(hook, ", ");
+        text = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        // Rewriting can butt the new comma against punctuation that was already there.
+        text = Regex.Replace(text, @",\s*(?=[,.;:!?])", string.Empty);
+        return text.Trim().Trim(',').Trim();
+    }
+
     private static IReadOnlyList<AiHighlight> ParseHighlights(JsonElement root)
     {
         if (root.ValueKind != JsonValueKind.Object || !HasOnlyProperties(root, "highlights") ||
@@ -339,8 +412,8 @@ public static class AiOutputParser
                 !item.TryGetProperty("confidence", out var confidence) || !confidence.TryGetDouble(out var confidenceValue) || confidenceValue is < 0 or > 1 ||
                 !item.TryGetProperty("editPlan", out var plan) || !ValidateEditPlan(plan, endValue - startValue))
                 return [];
-            parsed.Add(new AiHighlight(startValue, endValue, hook.GetString()!, rationale.GetString()!, scoreValue,
-                confidenceValue, plan.Clone()));
+            parsed.Add(new AiHighlight(startValue, endValue, CleanHookText(hook.GetString()!),
+                rationale.GetString()!, scoreValue, confidenceValue, plan.Clone()));
         }
         return parsed;
     }

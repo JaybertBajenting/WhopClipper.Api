@@ -1,0 +1,306 @@
+using System.Text.Json;
+using WhopClipper.Api.App.Contracts;
+using WhopClipper.Api.App.Services;
+
+namespace WhopClipper.Api.Tests.Tests;
+
+public sealed class NarratedTests
+{
+    private static List<TranscriptWord> Words(params (double Start, double End, string Word)[] words) =>
+        words.Select(x => new TranscriptWord(x.Start, x.End, x.Word)).ToList();
+
+    [Fact]
+    public void ElevenLabsCharacterTimingsBecomeWords()
+    {
+        using var document = JsonDocument.Parse("""
+            {"characters":["T","h","i","s"," ","$","1","8","4",","," ","t","r","a","d","e","r","."],
+             "character_start_times_seconds":[0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85],
+             "character_end_times_seconds":[0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9]}
+            """);
+        var words = ElevenLabsClient.WordsFromAlignment(document.RootElement);
+        Assert.Equal(["This", "$184,", "trader."], words.Select(x => x.Word));
+        Assert.Equal((0.25, 0.5), (words[1].Start, words[1].End));
+        Assert.Equal(0.9, words[^1].End);
+    }
+
+    [Fact]
+    public void TheFirstShotHoldsThroughTheOpeningAndCutsLandOnWords()
+    {
+        // 9 s of narration, a word every 0.45 s.
+        var narration = Enumerable.Range(0, 20).Select(i => new TranscriptWord(0.1 + i * 0.45, 0.1 + i * 0.45 + 0.35, $"w{i}")).ToList();
+        var slots = NarratedStories.Allocate(9, narration, [3, 3, 3, 3]);
+
+        Assert.Equal(1.75, slots[0].DurationSeconds);
+        Assert.Equal(9, slots.Sum(x => x.DurationSeconds), 3);
+        var clock = 0d;
+        foreach (var slot in slots.Take(slots.Count - 1))
+        {
+            clock += slot.DurationSeconds;
+            if (clock > 1.8) Assert.Contains(narration, w => Math.Abs(w.Start - clock) < 0.001);
+        }
+        Assert.All(slots, x => Assert.InRange(x.DurationSeconds, 0.6, 2.2));
+        // Four candidates for six-plus shots: the fifth shot reuses the first candidate from a later point.
+        Assert.Equal((0, 1.2), (slots[4].Candidate, slots[4].InSeconds));
+    }
+
+    [Fact]
+    public void AShortNarrationIsOneShot()
+    {
+        var slots = NarratedStories.Allocate(2.1, Words((0.1, 0.5, "This"), (0.5, 1.9, "trader")), [3]);
+        Assert.Equal(2.1, slots.Sum(x => x.DurationSeconds), 3);
+        Assert.True(slots.Count <= 2);
+    }
+
+    [Fact]
+    public void StoriesNeedNarrationAMemeLineAndMontageOutsideTheMoment()
+    {
+        var transcript = Enumerable.Range(0, 400).Select(i => new TranscriptWord(i * 0.5, i * 0.5 + 0.4, $"word{i}")).ToList();
+        var narration = "This 24 year old trader made $184,000 on one trade while on vacation in Greece, and what he did next is crazy.";
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            stories = new object[]
+            {
+                new
+                {
+                    title = "TJR's $184K trade in Greece 💀", caption = "TJR made $184K on vacation", overlayTitle = "POV: Your office is Greece 💀",
+                    narration, teller = "TJR", emphasis = new[] { "$184,000" }, score = 0.9, rationale = "",
+                    pieces = new[] { new { startSeconds = 100.0, endSeconds = 116.0, firstWords = "", lastWords = "" } },
+                    montage = new[] { new { atSeconds = 20.0, shows = "TJR on the yacht" }, new { atSeconds = 105.0, shows = "inside the moment" },
+                        new { atSeconds = 150.0, shows = "the villa" } },
+                },
+                new
+                {
+                    title = "Too short narration", caption = "", overlayTitle = "POV: short 💀", narration = "This trader won.",
+                    teller = "TJR", emphasis = Array.Empty<string>(), score = 0.8, rationale = "",
+                    pieces = new[] { new { startSeconds = 30.0, endSeconds = 45.0, firstWords = "", lastWords = "" } },
+                    montage = new[] { new { atSeconds = 90.0, shows = "a" }, new { atSeconds = 150.0, shows = "b" } },
+                },
+            },
+        }));
+        var stories = NarratedStories.Parse(document.RootElement, 200, transcript);
+
+        var story = Assert.Single(stories);
+        Assert.Equal(narration, story.Narration);
+        Assert.Equal("POV: Your office is Greece 💀", story.OverlayTitle);
+        // The montage moment inside the moment's own stretch is dropped.
+        Assert.Equal([20d, 150d], story.Montage.Select(x => x.AtSeconds));
+    }
+
+    [Fact]
+    public void NarrationIsPlainSpeech()
+    {
+        Assert.Equal("This trader, who never loses, made it", NarratedStories.CleanNarration("This trader — who “never” loses -\n made it"));
+        Assert.Equal("He did it, again", NarratedStories.CleanNarration("He did it - again"));
+    }
+
+    [Fact]
+    public void CaptionsAreOneColouredWordAtATimeAboveTheWindowCentre()
+    {
+        var ass = CaptionBuilder.BuildNarratedAss(Words((0, 0.4, "This"), (0.4, 0.9, "millionaire,"), (0.9, 1.3, "made"),
+            (1.3, 1.9, "$184,000."), (5, 5.4, "wow")), 5.2);
+        var lines = ass.Split('\n').Where(x => x.StartsWith("Dialogue:")).ToList();
+        Assert.Equal(5, lines.Count);
+        Assert.All(lines, x => Assert.Contains($"\\pos(540,{CaptionBuilder.NarratedCaptionY})", x));
+        Assert.Contains("\\1c&HF2E83C&}millionaire", lines[1]);
+        Assert.EndsWith("}$184,000", lines[3].TrimEnd());
+        // A word before a long pause does not sit on screen through it, and nothing runs past the clip.
+        Assert.Contains("0:00:01.30,0:00:02.25", lines[3]);
+        Assert.Contains(",0:00:05.20,", lines[4]);
+    }
+
+    [Fact]
+    public void TheWindowKeepsTheSubjectInViewWithoutRunningOffTheFrame()
+    {
+        Assert.Equal(452, FfmpegArgumentBuilder.NarratedCropX(0.5));
+        Assert.Equal(0, FfmpegArgumentBuilder.NarratedCropX(0.05));
+        Assert.Equal(1920 - FfmpegArgumentBuilder.NarratedVisibleWidth, FfmpegArgumentBuilder.NarratedCropX(0.99));
+        Assert.Equal(452, FfmpegArgumentBuilder.NarratedCropX(double.NaN));
+        Assert.Equal(361, FfmpegArgumentBuilder.NarratedWindowTop);
+    }
+
+    [Fact]
+    public void TheRenderGraphOpensWideThenPlaysTheMomentWithItsOwnSound()
+    {
+        var spec = new FfmpegNarratedSpec(
+            [
+                new FfmpegNarratedShot("m1.mp4", 0, 1.75, 0.4, false), new FfmpegNarratedShot("m2.mp4", 0.2, 1.25, 0.6, false),
+                new FfmpegNarratedShot("span.mp4", 3, 6, 0.5, true), new FfmpegNarratedShot("span.mp4", 12, 5, 0.5, true),
+            ],
+            "narration.mp3", 3, "out.mp4", 60, 20, new FfmpegNarratedImage("title.png", 1080, 70), "captions.ass",
+            new FfmpegNarratedImage("arrow.png", 300, 272), 249, 59, new FfmpegNarratedMark(0.45, 0.35, 0.08),
+            new FfmpegNarratedImage("skull.png", 437, 422), new FfmpegNarratedMark(0.5, 0.4, 0.1), "song.mp3", 12, 0.5);
+        var args = FfmpegArgumentBuilder.BuildNarrated(spec);
+        var graph = args[args.ToList().IndexOf("-filter_complex") + 1];
+
+        Assert.Contains("scale=w='2*trunc(960*", graph);
+        Assert.Contains("eval=frame", graph);
+        Assert.Contains("pad=1080:1920:0:361:color=black[v1]", graph);
+        Assert.Contains("concat=n=4:v=1:a=0[pic]", graph);
+        // Only the moment's pieces give sound; the montage is silent under the narrator.
+        Assert.Contains("[2:a]", graph);
+        Assert.Contains("[3:a]", graph);
+        Assert.DoesNotContain("[0:a]", graph);
+        Assert.DoesNotContain("[1:a]", graph);
+        Assert.Contains("hue=s=0:enable='gte(t\\,14)'", graph);
+        Assert.Contains("enable='lt(t\\,0.9)'", graph);
+        // The freeze is the 0.6 s the reference holds under the drop.
+        Assert.Equal("14.6", args[args.ToList().IndexOf("-t", args.ToList().IndexOf("-filter_complex")) + 1]);
+        // The song keeps its own dynamics (quiet build, loud drop) and is never normalised: low while anyone speaks,
+        // then up to its full gain the moment the freeze starts.
+        Assert.Contains("atrim=start=12:duration=14.6,asetpts=PTS-STARTPTS,volume=volume='if(lt(t\\,14)\\,0.2\\,0.5)':eval=frame[music]", graph);
+        Assert.DoesNotContain("loudnorm=I=-14:TP=-2", graph);
+        Assert.DoesNotContain("sidechaincompress", graph);
+    }
+
+    [Fact]
+    public void TheLastWordLandsOnTheSongsDrop()
+    {
+        // Canto de Luna (super slowed): rises at 4.35, 10.65, 53.35 and 85.35 s; the reference's clips end at 0:54.
+        MusicDrop[] drops = [new(4.35, 15.6), new(10.65, 12.6), new(53.35, 19.5, -4.5), new(85.35, 24.3)];
+        // A 19.2 s clip starts the song at 34.15 s, so the freeze begins exactly at the 53.35 s drop.
+        Assert.Equal(34.15, NarratedStories.MusicStartForDrop(drops, 19.2, 54, 0.6));
+        // Too long to fit before that drop: the next one is used.
+        Assert.Equal(25.35, NarratedStories.MusicStartForDrop(drops, 60, 54, 0.6));
+        // Without a guide the biggest rise late enough wins.
+        Assert.Equal(66.15, NarratedStories.MusicStartForDrop(drops, 19.2, null, 0.6));
+        // The ultra slowed version has smaller rises near its big one; the big one near the guide's end is chosen.
+        Assert.Equal(32.95, NarratedStories.MusicStartForDrop(
+            [new(40.85, 10.4), new(49.6, 13.1), new(52.95, 17.2, -10.5), new(93.05, 15.1)], 20, 60, 0.6));
+        // No drop late enough, or none at all: the caller falls back to the guide's start.
+        Assert.Null(NarratedStories.MusicStartForDrop(drops, 90, 54, 0.6));
+        Assert.Null(NarratedStories.MusicStartForDrop([], 20, 54, 0.6));
+    }
+
+    [Fact]
+    public void EverySongsDropPlaysAtTheSameLoudness()
+    {
+        // One version of Canto de Luna sits at -4.5 dB after its drop and another at -10.5; both land at -12.
+        Assert.Equal(0.422, NarratedStories.DropGain(-4.5, 0.4));
+        Assert.Equal(0.841, NarratedStories.DropGain(-10.5, 0.4));
+        Assert.Equal(-12, -4.5 + 20 * Math.Log10(NarratedStories.DropGain(-4.5, 0.4)), 1);
+        Assert.Equal(-12, -10.5 + 20 * Math.Log10(NarratedStories.DropGain(-10.5, 0.4)), 1);
+        // The campaign's slider scales it, within sane limits.
+        Assert.Equal(0.211, NarratedStories.DropGain(-4.5, 0.2));
+        Assert.Equal(1.5, NarratedStories.DropGain(-30, 0.4));
+
+        var spec = new FfmpegNarratedSpec(
+            [new FfmpegNarratedShot("m1.mp4", 0, 3, 0.5, false), new FfmpegNarratedShot("span.mp4", 3, 11, 0.5, true)],
+            "narration.mp3", 3, "out.mp4", 30, 20, new FfmpegNarratedImage("title.png", 1080, 70), MusicPath: "song.mp3",
+            MusicStartSeconds: 38.95, MusicVolume: 0.4, MusicDropVolume: 0.841);
+        var args = FfmpegArgumentBuilder.BuildNarrated(spec);
+        // Quiet under the talking whatever the song; the measured gain only from the freeze on.
+        Assert.Contains("volume=volume='if(lt(t\\,14)\\,0.16\\,0.841)':eval=frame[music]", args[args.ToList().IndexOf("-filter_complex") + 1]);
+    }
+
+    [Fact]
+    public void TheBellAndTheShutterAreLaidOverTheMix()
+    {
+        // The shutter starts a frame before the hand-over, so it is sounding as the white flash appears.
+        Assert.Equal(2.97, NarratedStories.ShutterAt(3));
+        Assert.Equal(0, NarratedStories.ShutterAt(0.01));
+        // Each sound is the library's own file: the first name with the first word that matches anything.
+        string[] library = [@"D:\sfx\Camera Whoosh.mp3", @"D:\sfx\Bell Ding.wav", @"D:\sfx\Camera Shutter.mp3", @"D:\sfx\Taco Bell Bong.mp3"];
+        Assert.Equal(@"D:\sfx\Bell Ding.wav", NarratedStories.PickSound(library, "bell", "ding"));
+        Assert.Equal(@"D:\sfx\Camera Shutter.mp3", NarratedStories.PickSound(library, "shutter", "camera"));
+        Assert.Equal(@"D:\sfx\Camera Whoosh.mp3", NarratedStories.PickSound(library[..2], "shutter", "camera"));
+        Assert.Null(NarratedStories.PickSound(library, "gong"));
+        Assert.Null(NarratedStories.PickSound([], "bell"));
+
+        FfmpegNarratedShot[] shots = [new("m1.mp4", 0, 3, 0.5, false), new("span.mp4", 3, 11, 0.5, true)];
+        var title = new FfmpegNarratedImage("title.png", 1080, 70);
+        FfmpegNarratedSound[] sounds = [new("ding.wav", 0), new("shutter.wav", NarratedStories.ShutterAt(3))];
+        var spec = new FfmpegNarratedSpec(shots, "narration.mp3", 3, "out.mp4", 30, 20, title, MusicPath: "song.mp3", Sounds: sounds);
+        var args = FfmpegArgumentBuilder.BuildNarrated(spec).ToList();
+        var graph = args[args.IndexOf("-filter_complex") + 1];
+
+        // Inputs: two shots, narration, song, title, then the sounds.
+        Assert.Equal("ding.wav", args[args.IndexOf("shutter.wav") - 2]);
+        Assert.Contains("[5:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=0:all=1,volume=1[sfx0]", graph);
+        Assert.Contains("[6:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=2970:all=1,volume=1[sfx1]", graph);
+        // Mixed as they are: no renormalising, so adding them leaves the voices and the song where they were.
+        Assert.Contains("[voice][sfx0][sfx1][music]amix=inputs=4:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]", graph);
+
+        // Without music the sounds still play; without sounds the graph is what it always was.
+        var silent = FfmpegArgumentBuilder.BuildNarrated(spec with { MusicPath = null }).ToList();
+        Assert.Contains("[voice][sfx0][sfx1]amix=inputs=3:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]",
+            silent[silent.IndexOf("-filter_complex") + 1]);
+        var plain = FfmpegArgumentBuilder.BuildNarrated(spec with { Sounds = null }).ToList();
+        Assert.Contains("[voice][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.9[aout]",
+            plain[plain.IndexOf("-filter_complex") + 1]);
+        Assert.DoesNotContain("sfx", plain[plain.IndexOf("-filter_complex") + 1]);
+        Assert.Throws<ArgumentOutOfRangeException>(() => FfmpegArgumentBuilder.BuildNarrated(spec with { Sounds = [new("", 0)] }));
+    }
+
+    [Fact]
+    public void NudgingTheWindowMovesItEvenWhenItIsPinnedToAnEdge()
+    {
+        // A subject at 0.2 has its window pinned to the left edge (crop 0). Moving 0.04 of the frame right must move
+        // the window 0.04 x 1920 = 77 px, not be swallowed by the pin.
+        Assert.Equal(0, FfmpegArgumentBuilder.NarratedCropX(0.2));
+        Assert.Equal(76, FfmpegArgumentBuilder.NarratedCropX(NarratedStories.ShiftFocus(0.2, 0.04)));
+        // In the middle of the frame it is a plain move, either way.
+        Assert.Equal(0.54, NarratedStories.ShiftFocus(0.5, 0.04), 3);
+        Assert.Equal(0.46, NarratedStories.ShiftFocus(0.5, -0.04), 3);
+        // And it stops at the frame's edge.
+        Assert.Equal(1920 - FfmpegArgumentBuilder.NarratedVisibleWidth, FfmpegArgumentBuilder.NarratedCropX(NarratedStories.ShiftFocus(0.9, 0.5)));
+    }
+
+    [Fact]
+    public void SwitchingTheSkullOffKeepsWhereItGoes()
+    {
+        // A clip made before the switch existed reads as "skull on".
+        const string stored = """
+            {"spanRelativePath":"span.mp4","spanWidth":1920,"spanHeight":1080,"pieces":[],"shots":[],"narration":"n",
+             "narrationRelativePath":"narration.mp3","narrationSeconds":3,"words":[],"overlayTitle":"t","title":"t",
+             "arrow":null,"skull":{"x":0.5,"y":0.4,"size":0.1},"episodeOffsetSeconds":0,"voice":"v"}
+            """;
+        var plan = JsonDefaults.Parse<NarratedPlanDto?>(stored, null)!;
+        Assert.False(plan.SkullOff);
+        // Off is a switch, not a deletion: the face it covered is still recorded, so it can be put back.
+        var off = JsonDefaults.Parse<NarratedPlanDto?>(JsonSerializer.Serialize(plan with { SkullOff = true }, JsonDefaults.Serializer), null)!;
+        Assert.True(off.SkullOff);
+        Assert.Equal(new NarratedMarkDto(0.5, 0.4, 0.1), off.Skull);
+    }
+
+    [Fact]
+    public void AMontageThatDoesNotFillTheNarrationIsRefused()
+    {
+        var spec = new FfmpegNarratedSpec(
+            [new FfmpegNarratedShot("m1.mp4", 0, 1.75, 0.5, false), new FfmpegNarratedShot("span.mp4", 3, 6, 0.5, true)],
+            "narration.mp3", 4, "out.mp4", 30, 20, new FfmpegNarratedImage("title.png", 1080, 70));
+        Assert.Throws<ArgumentException>(() => FfmpegArgumentBuilder.BuildNarrated(spec));
+    }
+
+    [Fact]
+    public void ANumberWhisperSplitStaysOneCaption()
+    {
+        var ass = CaptionBuilder.BuildNarratedAss(Words((0, 0.4, "like"), (0.4, 0.8, "$500"), (0.8, 1.2, ",000"), (1.3, 1.6, "one"),
+            (1.6, 1.9, "-one"), (2.0, 2.4, "bag")), 3);
+        var lines = ass.Split('\n').Where(x => x.StartsWith("Dialogue:")).Select(x => x[(x.LastIndexOf('}') + 1)..]).ToList();
+        Assert.Equal(["like", "$500,000", "one-one", "bag"], lines);
+    }
+
+    [Fact]
+    public void AnAudioTagSteersTheVoiceButIsNeverACaption()
+    {
+        using var document = JsonDocument.Parse("""
+            {"characters":["[","h","y","p","e","]"," ","W","o","w"],
+             "character_start_times_seconds":[0,0,0,0,0,0,0,0.1,0.2,0.3],
+             "character_end_times_seconds":[0,0,0,0,0,0,0.1,0.2,0.3,0.4]}
+            """);
+        Assert.Equal(["Wow"], ElevenLabsClient.WordsFromAlignment(document.RootElement).Select(x => x.Word));
+    }
+
+    [Theory]
+    [InlineData("eleven_v4", false)]
+    [InlineData("eleven_v4_turbo", false)]
+    [InlineData("eleven_v3", false)]
+    [InlineData("eleven_multilingual_v2", true)]
+    [InlineData("eleven_flash_v2_5", true)]
+    public void OnlyTheOlderModelsAreSentStyleAndSpeakerBoost(string model, bool hasStyle)
+    {
+        var settings = JsonSerializer.Serialize(ElevenLabsClient.VoiceSettings(model));
+        Assert.Equal(hasStyle, settings.Contains("\"style\""));
+        Assert.Contains("\"stability\"", settings);
+    }
+}

@@ -13,31 +13,81 @@ namespace WhopClipper.Api.App.Services;
 
 public sealed record SourceJobPayload(Guid SourceAssetId, bool Refresh = false, string? Quality = null);
 public sealed record AiJobPayload(Guid AnalysisRunId, Guid SourceAssetId, AiMode Mode, PlatformKind Platform, string? Transcript);
-public sealed record RenderJobPayload(Guid EditPlanId);
+public sealed record RenderJobPayload(Guid EditPlanId, Guid? MusicRemixFromPlanId = null);
+/// <param name="Manual">Footage Matthew picked in the B-roll editor. When set, no AI plans or searches anything:
+/// these shots, in order, fill the marked shots exactly.</param>
+public sealed record BrollRepairJobPayload(Guid EditPlanId, double StartSeconds, double EndSeconds,
+    string? Note = null, AiMode Mode = AiMode.Compare, IReadOnlyList<ManualBrollShot>? Manual = null);
+/// <param name="Framing">Where the 1080x960 window sits across a wide frame: 0 left edge, 0.5 centre, 1 right edge.</param>
+public sealed record ManualBrollShot(Guid FootageId, double InSeconds, double DurationSeconds, double Framing = 0.5);
+public sealed record FootageDownloadJobPayload(Guid EditPlanId, Guid FootageId);
 public sealed record ReferenceJobPayload(Guid ReferenceVideoId, bool Refresh = false);
 public sealed record TranscribeJobPayload(Guid SourceAssetId, bool Refresh = false);
 public sealed record ValidateJobPayload(string OutputRelativePath, double ExpectedMinDuration, double ExpectedMaxDuration, int Width, int Height);
 /// <param name="DeleteSourceWhenDone">Removes the downloaded VOD once its clips exist, so a
 /// long clip bank can be worked through without holding every source on disk at once.</param>
-/// <param name="HookYFraction">Where the hook card sits. Streams published as a vertical split
-/// carry a facecam across the top, and a hook anchored there covers the streamer's face.</param>
+/// <param name="HookYFraction">Where the hook card sits, as a fraction of frame height.
+/// The old default of 0.06 was measured landing 6px off the streamer's hair on a shipped render,
+/// which is the complaint that prompted this. Two things constrain the card: his head below it,
+/// and the burnt-in captions, which the caption style centres vertically (ASS Alignment 5) and
+/// which the card is composited *over* - so anything near mid-frame hides the captions for the
+/// whole clip. 0.012 is the value that satisfies both, verified on a real render and checked
+/// against 38 frames spanning 13 clips. A full-frame-face source would need this overridden.</param>
+/// <param name="EditStyle">Overrides the campaign's stored style for this run. Null follows the campaign.</param>
+/// <param name="Stories">Pieces chosen by hand. When set, story selection is skipped and exactly these
+/// are built - how a reference short is recreated from the moments it was cut from.</param>
 public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind Platform = PlatformKind.TikTok,
     int MaxClips = 8, bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude,
-    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = null,
-    bool ApplyStyling = true);
+    string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = 0.012,
+    bool ApplyStyling = true, string? EditStyle = null, IReadOnlyList<ImportedStoryDto>? Stories = null);
 
 public sealed class JobQueue
 {
-    private readonly Channel<Guid> _channel = Channel.CreateBounded<Guid>(new BoundedChannelOptions(100)
+    // Unbounded: every job is already persisted before it is queued, so a cap protects nothing. At 100 it
+    // made every new job - a "Re-render" click included - hang until a queued clip finished, about ten
+    // minutes, once a 130-clip re-do was waiting.
+    private readonly Channel<Guid> _channel = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
     {
-        FullMode = BoundedChannelFullMode.Wait,
+        SingleReader = false,
+        SingleWriter = false
+    });
+    // The B-roll editor's own jobs: a pasted link's download and a hand-placed preview. They take seconds and someone
+    // is sitting in the editor waiting for them, so they have their own consumers. In the single media lane, two
+    // downloads Matthew pasted sat "Downloading..." for an hour behind a nine-clip episode run.
+    private readonly Channel<Guid> _editor = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
+    {
+        SingleReader = false,
+        SingleWriter = false
+    });
+    // "Move campaign to Drive": minutes to hours of network, no CPU. In the media lane it would wait behind a clip run
+    // and hold renders up behind itself; in the editor lane it would take one of the two seats someone is waiting on.
+    private readonly Channel<Guid> _uploads = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
+    {
         SingleReader = false,
         SingleWriter = false
     });
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _running = new();
 
+    /// <summary>How many editor jobs run at once, beside the media jobs.</summary>
+    public const int EditorConsumers = 2;
+
     public ValueTask EnqueueAsync(Guid id, CancellationToken cancellationToken = default) => _channel.Writer.WriteAsync(id, cancellationToken);
+    /// <summary>Queues a job in the lane its kind belongs to.</summary>
+    public ValueTask EnqueueAsync(Guid id, JobKind kind, string payloadJson) =>
+        (kind is JobKind.DriveUpload or JobKind.DriveReturn ? _uploads : IsEditorJob(kind, payloadJson) ? _editor : _channel)
+        .Writer.WriteAsync(id, CancellationToken.None);
     public IAsyncEnumerable<Guid> ReadAllAsync(CancellationToken cancellationToken) => _channel.Reader.ReadAllAsync(cancellationToken);
+    public IAsyncEnumerable<Guid> ReadEditorAsync(CancellationToken cancellationToken) => _editor.Reader.ReadAllAsync(cancellationToken);
+    public IAsyncEnumerable<Guid> ReadUploadsAsync(CancellationToken cancellationToken) => _uploads.Reader.ReadAllAsync(cancellationToken);
+
+    /// <summary>A footage download, or a B-roll edit placed by hand. An AI repair searches and downloads many
+    /// candidates, so it stays in the media lane with everything else heavy.</summary>
+    public static bool IsEditorJob(JobKind kind, string payloadJson) => kind switch
+    {
+        JobKind.FootageDownload => true,
+        JobKind.BrollRepair => JsonDefaults.Parse<BrollRepairJobPayload?>(payloadJson, null)?.Manual is { Count: > 0 },
+        _ => false
+    };
     public CancellationToken Register(Guid id, CancellationToken hostToken)
     {
         var source = CancellationTokenSource.CreateLinkedTokenSource(hostToken);
@@ -62,7 +112,7 @@ public sealed class JobCoordinator(AppDbContext db, JobQueue queue)
         };
         db.Jobs.Add(job);
         await db.SaveChangesAsync(cancellationToken);
-        await queue.EnqueueAsync(job.Id, CancellationToken.None);
+        await queue.EnqueueAsync(job.Id, job.Kind, job.PayloadJson);
         return job;
     }
 
@@ -77,7 +127,7 @@ public sealed class JobCoordinator(AppDbContext db, JobQueue queue)
         };
         db.Jobs.Add(job);
         await db.SaveChangesAsync(cancellationToken);
-        await queue.EnqueueAsync(job.Id, CancellationToken.None);
+        await queue.EnqueueAsync(job.Id, job.Kind, job.PayloadJson);
         return job;
     }
 }
@@ -90,16 +140,22 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
         try
         {
             var consumers = Enumerable.Range(0, Math.Clamp(options.Value.MaxConcurrentMediaJobs, 1, 8))
-                .Select(_ => ConsumeAsync(stoppingToken)).ToArray();
-            await RequeuePersistedJobs(stoppingToken);
+                .Select(_ => ConsumeAsync(queue.ReadAllAsync(stoppingToken), stoppingToken))
+                .Concat(Enumerable.Range(0, JobQueue.EditorConsumers)
+                    .Select(_ => ConsumeAsync(queue.ReadEditorAsync(stoppingToken), stoppingToken)))
+                // One upload at a time: they share one connection and one rclone gate anyway.
+                .Append(ConsumeAsync(queue.ReadUploadsAsync(stoppingToken), stoppingToken))
+                .ToArray();
+            if (options.Value.RestoreQueuedJobs) await RequeuePersistedJobs(stoppingToken);
+            else logger.LogWarning("RestoreQueuedJobs is off: this instance runs only the jobs it queues itself.");
             await Task.WhenAll(consumers);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
     }
 
-    private async Task ConsumeAsync(CancellationToken stoppingToken)
+    private async Task ConsumeAsync(IAsyncEnumerable<Guid> lane, CancellationToken stoppingToken)
     {
-        await foreach (var jobId in queue.ReadAllAsync(stoppingToken))
+        await foreach (var jobId in lane)
         {
             var jobToken = queue.Register(jobId, stoppingToken);
             try
@@ -119,18 +175,19 @@ public sealed class MediaJobWorker(IServiceScopeFactory scopeFactory, JobQueue q
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = await db.Jobs.Where(x => x.Status == JobStatus.Queued || x.Status == JobStatus.Running)
-                .Select(x => x.Id).ToListAsync(cancellationToken);
-            foreach (var id in ids) await queue.EnqueueAsync(id, cancellationToken);
+            var jobs = await db.Jobs.Where(x => x.Status == JobStatus.Queued || x.Status == JobStatus.Running)
+                .OrderBy(x => x.CreatedAt).Select(x => new { x.Id, x.Kind, x.PayloadJson }).ToListAsync(cancellationToken);
+            foreach (var job in jobs) await queue.EnqueueAsync(job.Id, job.Kind, job.PayloadJson);
         }
         catch (Exception ex) { logger.LogWarning(ex, "Could not restore queued jobs; the database may not be ready."); }
     }
 }
 
-public sealed class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
+public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner processRunner, IOptions<AppOptions> options,
     WorkspaceService workspace, IEnumerable<IAiMediaProvider> providers, ReferenceStyleAnalyzer referenceAnalyzer,
-    SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist,
-    ILogger<JobExecutionService> logger)
+    SubjectTracker subjectTracker, HookCardRenderer hookCards, ClipStylist clipStylist, DiskSpaceGuard diskSpace,
+    GoogleDriveClient drive, VoiceOverSettingsStore voiceSettings, ElevenLabsClient elevenLabs,
+    DriveArchive driveArchive, ILogger<JobExecutionService> logger)
 {
     public async Task ExecuteAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -152,6 +209,10 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
                 case JobKind.ReferenceAnalysis: await AnalyzeReferenceAsync(job, cancellationToken); break;
                 case JobKind.Transcribe: await TranscribeAsync(job, cancellationToken); break;
                 case JobKind.SourcePipeline: await RunSourcePipelineAsync(job, cancellationToken); break;
+                case JobKind.BrollRepair: await PrepareBrollRepairAsync(job, cancellationToken); break;
+                case JobKind.FootageDownload: await DownloadFootageAsync(job, cancellationToken); break;
+                case JobKind.DriveUpload: await UploadCampaignToDriveAsync(job, cancellationToken); break;
+                case JobKind.DriveReturn: await BringCampaignBackFromDriveAsync(job, cancellationToken); break;
                 default: throw new InvalidOperationException($"Unsupported job kind {job.Kind}.");
             }
             job.Status = JobStatus.Completed;
@@ -220,7 +281,27 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
     private async Task RunSourcePipelineStagesAsync(JobRecord job, SourcePipelineJobPayload payload,
         Guid campaignId, SourceAsset source, CancellationToken cancellationToken)
     {
+        // The podcast-split style never downloads a whole episode: it reads YouTube's own captions,
+        // picks stories, and fetches only the minutes each story needs. Branching here keeps the
+        // full-VOD disk check below from refusing an episode that is never going to be downloaded.
+        if (await ResolveEditStyleAsync(campaignId, payload.EditStyle, cancellationToken) is { Style: EditStyles.PodcastSplit } podcastStyle)
+        {
+            await RunPodcastSplitPipelineAsync(job, payload, campaignId, source, podcastStyle, cancellationToken);
+            return;
+        }
+        if (await ResolveEditStyleAsync(campaignId, payload.EditStyle, cancellationToken) is { Style: EditStyles.NarratedLuxury } narratedStyle)
+        {
+            await RunNarratedPipelineAsync(job, payload, campaignId, source, narratedStyle, cancellationToken);
+            return;
+        }
+
         var stages = new List<object>();
+
+        // Checked before anything is fetched. A source that cannot fit fails here in milliseconds
+        // with a message naming the numbers, instead of after minutes of downloading, and because
+        // every source is its own queued job the run simply moves on to the next one.
+        if (string.IsNullOrWhiteSpace(source.LocalRelativePath))
+            diskSpace.EnsureRoomFor(source.DurationSeconds, payload.Quality);
 
         async Task StageAsync(string name, double progress, object stagePayload, Func<Task> run)
         {
@@ -372,10 +453,15 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
     {
         var payload = Deserialize<SourceJobPayload>(job.PayloadJson);
         var source = await db.SourceAssets.SingleAsync(x => x.Id == payload.SourceAssetId, cancellationToken);
+        if (GoogleDriveClient.TryParse(source.Url) is { } driveTarget)
+        {
+            await InspectDriveAsync(job, source, driveTarget, cancellationToken);
+            return;
+        }
         var directory = workspace.CampaignDirectory(source.CampaignId);
         var inspectArguments = new List<string>([.. CookieArguments(), .. JsRuntimeArguments()])
         {
-            "--print", "%(.{id,title,uploader,channel,duration,thumbnail,webpage_url})j", "--no-playlist",
+            "--print", "%(.{id,title,uploader,channel,duration,thumbnail,webpage_url,upload_date,timestamp})j", "--no-playlist",
             "--skip-download", "--no-warnings", source.Url
         };
         var result = await processRunner.RunAsync(new ProcessInvocation(options.Value.YtDlpPath,
@@ -388,8 +474,104 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         source.Uploader = GetString(root, "uploader") ?? GetString(root, "channel");
         source.DurationSeconds = root.TryGetProperty("duration", out var duration) && duration.TryGetDouble(out var seconds) ? seconds : null;
         source.ThumbnailUrl = GetString(root, "thumbnail");
-        source.MetadataJson = result.StandardOutput;
+        // Marked as looked up even when the site gives no date, so the date filler does not ask again.
+        source.MetadataJson = SourceDates.WithUploadDate(result.StandardOutput, GetString(root, SourceDates.UploadDateKey));
         job.ResultJson = JsonSerializer.Serialize(source.ToDto(), JsonDefaults.Serializer);
+    }
+
+    /// <summary>
+    /// Drive metadata without yt-dlp. A folder is not a source: it becomes one source per video
+    /// inside it and then stops existing, because a folder row can never be downloaded, transcribed
+    /// or clipped, and leaving it in the list only produces a row that fails forever.
+    /// </summary>
+    private async Task InspectDriveAsync(JobRecord job, SourceAsset source, DriveTarget target,
+        CancellationToken cancellationToken)
+    {
+        if (target.Kind == DriveTargetKind.Folder)
+        {
+            var files = await drive.ListFolderAsync(target.Id, cancellationToken);
+            var videos = files.Where(x => x.IsVideo).ToList();
+            if (videos.Count == 0)
+                throw new InvalidOperationException(
+                    "That Drive folder holds no video files. Check the link, or add the videos individually.");
+
+            var added = new List<string>();
+            foreach (var file in videos)
+            {
+                var url = $"https://drive.google.com/file/d/{file.Id}/view";
+                if (await db.SourceAssets.AnyAsync(x => x.CampaignId == source.CampaignId && x.Url == url, cancellationToken))
+                    continue;
+                db.SourceAssets.Add(new SourceAsset
+                {
+                    CampaignId = source.CampaignId, Url = url, Title = file.FileName,
+                    MetadataJson = DriveMetadata(file),
+                });
+                added.Add(file.FileName);
+            }
+            db.SourceAssets.Remove(source);
+            await db.SaveChangesAsync(cancellationToken);
+            job.ResultJson = JsonSerializer.Serialize(new
+            {
+                expandedFolder = target.Id, videos = added,
+                note = "The folder was replaced by the videos inside it.",
+            }, JsonDefaults.Serializer);
+            return;
+        }
+
+        var probe = await drive.ProbeAsync(target.Id, cancellationToken)
+            ?? throw new InvalidOperationException(
+                "That Drive link could not be read. It may be private, deleted, or a folder that is no longer shared.");
+        source.Title = probe.FileName;
+        source.MetadataJson = DriveMetadata(probe);
+        // Duration is not in Drive's headers. It stays null until ffprobe sees the file; the DTO
+        // proves this is a video from the content type instead, so the source is still processable.
+        job.ResultJson = JsonSerializer.Serialize(source.ToDto(), JsonDefaults.Serializer);
+    }
+
+    private static string DriveMetadata(DriveFile file) => JsonSerializer.Serialize(new
+    {
+        driveId = file.Id, title = file.FileName, contentType = file.ContentType, fileSizeBytes = file.SizeBytes,
+    }, JsonDefaults.Serializer);
+
+    /// <summary>
+    /// Streams a Drive file straight to the campaign's source folder. The point of doing this rather
+    /// than shelling to yt-dlp is that each way it can fail is knowable in advance and can be said
+    /// plainly - the wrong kind of file, no room on disk, or Google throttling a shared file - rather
+    /// than surfacing as an extractor traceback that says none of those things.
+    /// </summary>
+    private async Task DownloadFromDriveAsync(JobRecord job, SourceAsset source, string driveId,
+        string sourceDirectory, CancellationToken cancellationToken)
+    {
+        var file = await drive.ProbeAsync(driveId, cancellationToken)
+            ?? throw new InvalidOperationException(
+                "That Drive file could not be read. It may be private, deleted, or Google may be limiting it right now.");
+        if (!file.IsVideo)
+            throw new InvalidOperationException(
+                $"“{file.FileName}” is {file.ContentType}, not video, so it cannot be used as source footage. "
+                + "Campaign briefs often link a watermark or logo here; add that under Branding instead.");
+
+        // The probe gives the real byte count, so this checks the actual file rather than the
+        // duration-based estimate used elsewhere, which cannot see how large a Drive master is.
+        diskSpace.EnsureRoomForBytes(file.SizeBytes, file.FileName);
+
+        Directory.CreateDirectory(sourceDirectory);
+        var destination = Path.Combine(sourceDirectory, $"{Path.GetFileNameWithoutExtension(file.FileName)}-{file.Id}{Path.GetExtension(file.FileName)}");
+        WorkspaceService.EnsureInside(sourceDirectory, destination);
+        await drive.DownloadAsync(file, destination, fraction =>
+        {
+            // Reported straight onto the record; the queue persists it on the next save.
+            job.Progress = Math.Clamp(.05 + fraction * .9, 0, .95);
+        }, cancellationToken);
+
+        source.LocalRelativePath = workspace.ToRelative(destination);
+        source.Title ??= file.FileName;
+        source.MetadataJson = DriveMetadata(file);
+        source.DownloadedAt = DateTimeOffset.UtcNow;
+        // Drive carries no subtitles, so transcription runs from the media as it does for local files.
+        source.SubtitleRelativePath = null;
+        job.ResultJson = JsonSerializer.Serialize(new
+            { path = source.LocalRelativePath, subtitlePath = (string?)null, reused = false, bytes = file.SizeBytes },
+            JsonDefaults.Serializer);
     }
 
     private async Task DownloadAsync(JobRecord job, CancellationToken cancellationToken)
@@ -407,6 +589,11 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
             }
         }
         var sourceDirectory = workspace.ResolveRelative(Path.Combine("campaigns", source.CampaignId.ToString("N"), "source"));
+        if (GoogleDriveClient.TryParse(source.Url) is { Kind: DriveTargetKind.File } driveFile)
+        {
+            await DownloadFromDriveAsync(job, source, driveFile.Id, sourceDirectory, cancellationToken);
+            return;
+        }
         var requestedQuality = payload.Quality ?? options.Value.PreferredVideoQuality;
         var quality = requestedQuality.ToLowerInvariant() switch
         {
@@ -688,6 +875,20 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         var plan = await db.EditPlans.SingleAsync(x => x.Id == payload.EditPlanId, cancellationToken);
         if (options.Value.RequireEditApproval && !plan.IsApproved)
             throw new InvalidOperationException("The edit plan must be approved before rendering.");
+        // A podcast-split plan renders from its own downloaded span, not from the source video,
+        // which is never downloaded whole for this style.
+        if (IsNarratedPlan(plan))
+        {
+            await RenderNarratedAsync(job, plan, cancellationToken);
+            return;
+        }
+        if (IsPodcastSplitPlan(plan))
+        {
+            if (payload.MusicRemixFromPlanId is { } originalId)
+                await RemixPodcastAsync(job, plan, originalId, cancellationToken);
+            else await RenderPodcastSplitAsync(job, plan, cancellationToken);
+            return;
+        }
         var source = await db.SourceAssets.SingleAsync(x => x.Id == plan.SourceAssetId, cancellationToken);
         if (string.IsNullOrWhiteSpace(source.LocalRelativePath)) throw new InvalidOperationException("The source has not been downloaded.");
         var sourcePath = workspace.ResolveRelative(source.LocalRelativePath);
@@ -805,7 +1006,27 @@ public sealed class JobExecutionService(AppDbContext db, IProcessRunner processR
         Capture(job, result);
         EnsureSuccess(result, "FFmpeg render");
         if (!File.Exists(outputPath)) throw new InvalidOperationException("FFmpeg exited successfully but the output file is missing.");
-        job.ResultJson = JsonSerializer.Serialize(new { outputRelativePath = workspace.ToRelative(outputPath), editPlanId = plan.Id }, JsonDefaults.Serializer);
+
+        // A plan built anywhere other than the source pipeline never sees ClipStylist, so it
+        // renders with captions, logo and music but no cues, washes or punch-ins - correct, and
+        // visibly unlike every other clip in the campaign. Thirteen shipped that way before anyone
+        // noticed by eye. Recorded rather than thrown: a bare clip is occasionally what was wanted,
+        // and failing a finished encode over styling would be the worse outcome.
+        var unstyled = (extras.SoundEffects?.Count ?? 0) == 0
+            && (extras.ColorFlashes?.Count ?? 0) == 0
+            && (extras.ZoomPunches?.Count ?? 0) == 0;
+        if (unstyled)
+            logger.LogWarning("Edit plan {PlanId} rendered without the campaign's house style. "
+                + "POST /api/edit-plans/{PlanId}/restyle applies it without moving the cut.", plan.Id, plan.Id);
+
+        job.ResultJson = JsonSerializer.Serialize(new
+        {
+            outputRelativePath = workspace.ToRelative(outputPath),
+            editPlanId = plan.Id,
+            styling = unstyled
+                ? "none: no sound cues, colour flashes or zoom punches. POST /api/edit-plans/{id}/restyle applies the campaign style to this plan's existing cut."
+                : "applied",
+        }, JsonDefaults.Serializer);
     }
 
     /// <summary>
@@ -1083,6 +1304,7 @@ public sealed class MediaLibraryService(AppDbContext db)
         {
             var root = Path.GetFullPath(location.Path);
             if (!Directory.Exists(root)) continue;
+            var guide = await MusicSegmentGuide.ReadAsync(root, cancellationToken);
             foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).Where(x => SupportedExtensions.Contains(Path.GetExtension(x))))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1096,6 +1318,12 @@ public sealed class MediaLibraryService(AppDbContext db)
                 }
                 existing.SizeBytes = file.Length;
                 existing.ContentHash = await WorkspaceService.HashFileAsync(path, cancellationToken);
+                // A track the guide does not mention keeps its nulls and plays from the top.
+                if (guide.TryGetValue(file.Name, out var segment))
+                {
+                    existing.SegmentStartSeconds = segment.StartSeconds;
+                    existing.SegmentEndSeconds = segment.EndSeconds;
+                }
                 existing.IndexedAt = DateTimeOffset.UtcNow;
                 count++;
             }

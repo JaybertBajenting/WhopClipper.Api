@@ -1,7 +1,12 @@
 using System.IO.Compression;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using AngleSharp.Dom;
+using AngleSharp.Html.Dom;
+using AngleSharp.Html.Parser;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
 using WhopClipper.Api.App.Domain;
@@ -30,8 +35,69 @@ public sealed partial class DocumentTextExtractor : IDocumentTextExtractor
         {
             CampaignDocumentKind.Pdf => ExtractPdf(fullPath),
             CampaignDocumentKind.Word => ExtractWord(fullPath),
+            CampaignDocumentKind.Html => ExtractHtml(await File.ReadAllTextAsync(fullPath, cancellationToken)),
             _ => new DocumentTextResult(Normalize(await File.ReadAllTextAsync(fullPath, cancellationToken)), null)
         };
+    }
+
+    /// <summary>
+    /// Reads a campaign page the way the brief needs it, which is not the same as how it reads on
+    /// screen. Two differences carry the whole value of taking the markup over a screenshot:
+    /// every link keeps its exact <c>href</c>, and the page arrives whole rather than only the part
+    /// that happened to be scrolled into view.
+    /// </summary>
+    internal static DocumentTextResult ExtractHtml(string html)
+    {
+        var parser = new HtmlParser();
+        var document = parser.ParseDocument(html ?? string.Empty);
+        var body = (INode?)document.Body ?? document.DocumentElement;
+        if (body is null) return new DocumentTextResult(string.Empty, null);
+        var builder = new StringBuilder();
+        Walk(body, builder);
+        return new DocumentTextResult(Normalize(builder.ToString()), null);
+    }
+
+    /// <summary>Block elements that should start a new line, so one list item stays one requirement.</summary>
+    private static readonly HashSet<string> BlockTags = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "fieldset",
+        "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+        "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul",
+    };
+
+    private static void Walk(INode node, StringBuilder builder)
+    {
+        foreach (var child in node.ChildNodes)
+        {
+            if (child is IText text)
+            {
+                builder.Append(text.Data);
+                continue;
+            }
+            if (child is not IElement element) continue;
+
+            // Script and style hold source code, not brief text. Left in, a minified bundle would
+            // dwarf the requirements and be handed to the AI as though the client had written it.
+            if (element.TagName is "SCRIPT" or "STYLE" or "NOSCRIPT" or "TEMPLATE" or "SVG") continue;
+
+            var block = BlockTags.Contains(element.TagName);
+            if (block) builder.Append('\n');
+            Walk(element, builder);
+
+            // The visible text is often a label - "Podcast Link" - with the address only in the
+            // attribute. Dropping it would lose the exact thing that makes reading markup better
+            // than reading pixels. Skipped when the label already is the address, which is how
+            // this page happens to render, so the URL is not printed twice.
+            if (element is IHtmlAnchorElement anchor)
+            {
+                var href = anchor.GetAttribute("href")?.Trim();
+                if (!string.IsNullOrEmpty(href)
+                    && href.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                    && !anchor.TextContent.Contains(href, StringComparison.OrdinalIgnoreCase))
+                    builder.Append(" <").Append(href).Append('>');
+            }
+            if (block) builder.Append('\n');
+        }
     }
 
     private static DocumentTextResult ExtractPdf(string fullPath)
@@ -124,6 +190,159 @@ public sealed partial class DocumentTextExtractor : IDocumentTextExtractor
     private static partial Regex TrailingSpaceRegex();
 }
 
+public sealed record FetchedPage(string Url, string Html, string Label);
+
+/// <summary>
+/// Fetches a campaign brief that is published as a web page rather than sent as a file. The result
+/// is inert data, never instructions: anyone can put "ignore your instructions" on a public page,
+/// and this text goes on to be part of an AI prompt.
+/// </summary>
+public sealed class CampaignPageFetcher(IHttpClientFactory factory, ILogger<CampaignPageFetcher> logger)
+{
+    public const string ClientName = "BriefFetch";
+    public const int MaxPageBytes = 5 * 1024 * 1024;
+    private const int MaxRedirects = 5;
+
+    public async Task<FetchedPage> FetchAsync(string requestedUrl, CancellationToken cancellationToken)
+    {
+        var target = ParseAndGuard(requestedUrl);
+        var client = factory.CreateClient(ClientName);
+
+        // Redirects are followed by hand so every hop is guarded. Letting HttpClient follow them
+        // checks only the address the user typed, and a public URL that redirects inward would
+        // walk straight past the guard.
+        HttpResponseMessage? response = null;
+        try
+        {
+            for (var hop = 0; ; hop++)
+            {
+                response?.Dispose();
+                using var request = new HttpRequestMessage(HttpMethod.Get, target);
+                request.Headers.TryAddWithoutValidation("User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WhopClipper/1.0");
+                request.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml,text/plain");
+                response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+                if ((int)response.StatusCode is >= 300 and < 400 && response.Headers.Location is { } location)
+                {
+                    if (hop >= MaxRedirects)
+                        throw new InvalidOperationException("That address redirected too many times.");
+                    target = ParseAndGuard(location.IsAbsoluteUri ? location.ToString() : new Uri(target, location).ToString());
+                    continue;
+                }
+                break;
+            }
+
+            if (!response.IsSuccessStatusCode)
+                throw new InvalidOperationException(
+                    $"The page could not be read ({(int)response.StatusCode} {response.ReasonPhrase}).");
+
+            // A brief is text. Without this a PDF or a video URL would be read as though it were
+            // markup and stored as a wall of mojibake.
+            var mediaType = response.Content.Headers.ContentType?.MediaType ?? string.Empty;
+            if (!mediaType.Contains("html", StringComparison.OrdinalIgnoreCase)
+                && !mediaType.Contains("text/plain", StringComparison.OrdinalIgnoreCase)
+                && !mediaType.Contains("xml", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"That address returned {(mediaType.Length == 0 ? "an unknown type" : mediaType)}, not a web page. "
+                    + "Upload a file instead if the brief is a document.");
+            if (response.Content.Headers.ContentLength is > MaxPageBytes)
+                throw new InvalidOperationException("That page is larger than 5 MB.");
+
+            var html = await ReadCappedAsync(response, cancellationToken);
+            logger.LogInformation("Fetched campaign brief page {Url} ({Bytes} bytes)", target, html.Length);
+            return new FetchedPage(target.ToString(), html, LabelFor(target));
+        }
+        finally { response?.Dispose(); }
+    }
+
+    /// <summary>Reads at most <see cref="MaxPageBytes"/> so a server that lies about its length cannot fill the disk.</summary>
+    private static async Task<string> ReadCappedAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[64 * 1024];
+        int read;
+        while ((read = await stream.ReadAsync(chunk, cancellationToken)) > 0)
+        {
+            if (buffer.Length + read > MaxPageBytes)
+                throw new InvalidOperationException("That page is larger than 5 MB.");
+            buffer.Write(chunk, 0, read);
+        }
+        var encoding = response.Content.Headers.ContentType?.CharSet is { Length: > 0 } charset
+            ? TryEncoding(charset) : Encoding.UTF8;
+        return encoding.GetString(buffer.ToArray());
+    }
+
+    private static Encoding TryEncoding(string charset)
+    {
+        try { return Encoding.GetEncoding(charset.Trim('"')); }
+        catch (ArgumentException) { return Encoding.UTF8; }
+    }
+
+    /// <summary>Host and path, so the document list reads "reachclipping.com/Lacy" and not a GUID.</summary>
+    internal static string LabelFor(Uri uri)
+    {
+        var path = uri.AbsolutePath.TrimEnd('/');
+        return (uri.Host + path) is { Length: > 0 } label && label.Length <= 120 ? label : uri.Host;
+    }
+
+    /// <summary>
+    /// Rejects anything that is not a public http(s) address. This runs on the user's own machine,
+    /// where the app's API is listening on loopback with every campaign behind it - a fetcher that
+    /// will retrieve 127.0.0.1 is a way to read that back out through a brief. Cloud metadata
+    /// endpoints (169.254.169.254) are blocked for the same reason.
+    /// </summary>
+    internal static Uri ParseAndGuard(string requestedUrl)
+    {
+        if (string.IsNullOrWhiteSpace(requestedUrl))
+            throw new InvalidOperationException("Enter the address of the campaign page.");
+        if (!Uri.TryCreate(requestedUrl.Trim(), UriKind.Absolute, out var uri))
+            throw new InvalidOperationException("That is not a valid web address.");
+        if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            throw new InvalidOperationException("Only http and https addresses can be fetched.");
+
+        var addresses = ResolveAddresses(uri.DnsSafeHost);
+        if (addresses.Count == 0)
+            throw new InvalidOperationException($"'{uri.Host}' could not be resolved.");
+        // Every address, not just the first: a host that answers with one public and one private
+        // address would otherwise be a way through.
+        if (addresses.Any(IsPrivate))
+            throw new InvalidOperationException(
+                $"'{uri.Host}' resolves to an address on this machine or private network, which cannot be fetched.");
+        return uri;
+    }
+
+    private static List<IPAddress> ResolveAddresses(string host)
+    {
+        if (IPAddress.TryParse(host, out var literal)) return [literal];
+        try { return [.. Dns.GetHostAddresses(host)]; }
+        catch (SocketException) { return []; }
+        catch (ArgumentException) { return []; }
+    }
+
+    internal static bool IsPrivate(IPAddress address)
+    {
+        if (IPAddress.IsLoopback(address)) return true;
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            if (address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || address.IsIPv6Multicast) return true;
+            if (address.IsIPv4MappedToIPv6) return IsPrivate(address.MapToIPv4());
+            var v6 = address.GetAddressBytes();
+            return (v6[0] & 0xFE) == 0xFC || address.Equals(IPAddress.IPv6Any); // unique-local fc00::/7
+        }
+        var bytes = address.GetAddressBytes();
+        return bytes[0] switch
+        {
+            0 or 10 or 127 => true,                              // this-network, private, loopback
+            169 => bytes[1] == 254,                              // link-local, incl. cloud metadata
+            172 => bytes[1] >= 16 && bytes[1] <= 31,             // private
+            192 => bytes[1] == 168 || (bytes[1] == 0 && bytes[2] == 2),
+            _ => bytes[0] >= 224,                                // multicast and reserved
+        };
+    }
+}
+
 public sealed record DocumentUploadResult(CampaignDocument Document, string? Warning);
 
 /// <summary>Validates, stores, and text-extracts an uploaded campaign brief. Extension and magic bytes must agree.</summary>
@@ -196,6 +415,65 @@ public sealed class CampaignDocumentService(WorkspaceService workspace, IDocumen
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 logger.LogWarning(ex, "Text extraction failed for campaign document {FileName}", safeName);
+                document.ExtractionStatus = DocumentExtractionStatus.Failed;
+                document.ExtractionError = ex.Message.Length <= 500 ? ex.Message : ex.Message[..500];
+                warning = document.ExtractionError;
+            }
+            return new DocumentUploadResult(document, warning);
+        }
+        catch
+        {
+            TryDelete(fullPath);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Stores a fetched campaign page as a document, so a brief published on the web is handled
+    /// exactly like one that was emailed as a PDF - same list, same include-in-extraction toggle,
+    /// same delete. The raw markup is kept rather than only the extracted text: the text is a lossy
+    /// derivative, and when a rule is later disputed the bytes actually served are the evidence.
+    /// </summary>
+    public async Task<DocumentUploadResult> StoreFetchedPageAsync(Guid campaignId, FetchedPage page,
+        CancellationToken cancellationToken)
+    {
+        var directory = workspace.ResolveRelative(Path.Combine("campaigns", campaignId.ToString("N"), "campaign", "documents"));
+        Directory.CreateDirectory(directory);
+        var safeName = WorkspaceService.SafeFileName(page.Label + ".html", "brief-page");
+        var fullPath = Path.Combine(directory, $"{Guid.NewGuid():N}-{safeName}");
+        WorkspaceService.EnsureInside(directory, fullPath);
+        await File.WriteAllTextAsync(fullPath, page.Html, new UTF8Encoding(false), cancellationToken);
+
+        try
+        {
+            var document = new CampaignDocument
+            {
+                CampaignId = campaignId,
+                // The address, not the stored filename: the list should say where this came from.
+                FileName = page.Label,
+                RelativePath = workspace.ToRelative(fullPath),
+                Kind = CampaignDocumentKind.Html,
+                SizeBytes = new FileInfo(fullPath).Length,
+                ContentHash = await WorkspaceService.HashFileAsync(fullPath, cancellationToken),
+            };
+            string? warning = null;
+            try
+            {
+                var extracted = await extractor.ExtractAsync(fullPath, CampaignDocumentKind.Html, cancellationToken);
+                document.ExtractedText = extracted.Text;
+                document.ExtractedCharacterCount = extracted.Text.Length;
+                document.ExtractionStatus = DocumentExtractionStatus.Extracted;
+                if (extracted.Text.Length == 0)
+                {
+                    document.ExtractionStatus = DocumentExtractionStatus.Failed;
+                    document.ExtractionError = "The page had no readable text. It may build its content with JavaScript, "
+                        + "in which case paste the brief text instead.";
+                    warning = document.ExtractionError;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "Text extraction failed for fetched campaign page {Page}", page.Label);
                 document.ExtractionStatus = DocumentExtractionStatus.Failed;
                 document.ExtractionError = ex.Message.Length <= 500 ? ex.Message : ex.Message[..500];
                 warning = document.ExtractionError;

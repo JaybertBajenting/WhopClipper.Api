@@ -52,7 +52,23 @@ public sealed record PublishJobDto(Guid Id, Guid CampaignId, PlatformKind Platfo
     double Progress, string OutputRelativePath, string FileName, string Title, string Caption, string Privacy,
     bool ShareToFeed, bool DryRun, string? AccountIdentifier, string FileSha256,
     string? ExternalId, string? ExternalUrl, string? Error, string? ManualPackageDownloadUrl,
-    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? PublishedAt);
+    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? PublishedAt,
+    Guid? EditPlanId = null, DateTimeOffset? ScheduledPublishAt = null, DateTimeOffset? UploadsAfter = null,
+    bool NotificationScheduled = false);
+
+/// <summary>A scheduled YouTube upload: its go-public slot and when the upload itself may start.</summary>
+public sealed record ScheduledUpload(DateTimeOffset PublishAt, DateTimeOffset NextAttemptAt, Guid? EditPlanId);
+
+public sealed record YouTubeScheduleSettingsDto(IReadOnlyList<string> Slots, string TimeZoneId, string TimeZoneName,
+    int UploadWindowHours);
+public sealed record PhoneNotificationSettingsDto(bool Enabled, string Server, string Topic, string SubscribeUrl);
+public sealed record UpdatePhoneNotificationsRequest(bool Enabled, string? Server, string? Topic);
+public sealed record ScheduleYouTubeRequest(string OutputRelativePath, Guid? EditPlanId, string Title, string Caption,
+    bool Confirmed = false, string? IdempotencyKey = null);
+public sealed record UnscheduleYouTubeRequest(bool Confirmed = false);
+public sealed record YouTubeScheduleDto(YouTubeScheduleSettingsDto Settings, PhoneNotificationSettingsDto Notifications,
+    bool Connected, bool CanManage, string? Channel, string Message, DateTimeOffset NextFreeSlot,
+    IReadOnlyList<PublishJobDto> Items);
 
 public static class PublishingMappings
 {
@@ -61,5 +77,6 @@ public static class PublishingMappings
         value.Privacy, value.ShareToFeed, value.DryRun, value.AccountIdentifier, value.FileSha256,
         value.ExternalId, value.ExternalUrl, value.Error,
         value.ManualPackageRelativePath is null ? null : $"/api/publishing/jobs/{value.Id}/manual-package",
-        value.CreatedAt, value.UpdatedAt, value.PublishedAt);
+        value.CreatedAt, value.UpdatedAt, value.PublishedAt, value.EditPlanId, value.ScheduledPublishAt,
+        value.Status == PublishStatus.Queued ? value.NextAttemptAt : null, value.NotificationScheduledFor is not null);
 }

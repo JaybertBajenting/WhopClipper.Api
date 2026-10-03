@@ -30,7 +30,7 @@ public enum CaptionBackdrop { Outline, Box }
 /// time, centred, and large enough to read on a phone; a sentence-per-card subtitle track
 /// reads as a documentary and is not what these clips want.
 /// </summary>
-public static class CaptionBuilder
+public static partial class CaptionBuilder
 {
     private const int PlayResX = 1080;
     private const int PlayResY = 1920;

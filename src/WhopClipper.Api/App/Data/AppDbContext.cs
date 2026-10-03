@@ -72,6 +72,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
         modelBuilder.Entity<PublishJob>().HasIndex(x => x.IdempotencyKey).IsUnique();
         modelBuilder.Entity<PublishJob>().HasIndex(x => x.FinalPublishIdempotencyKey).IsUnique();
         modelBuilder.Entity<PublishJob>().HasIndex(x => new { x.Status, x.CreatedAt });
+        modelBuilder.Entity<PublishJob>().HasIndex(x => new { x.Platform, x.ScheduledPublishAt });
         modelBuilder.Entity<Campaign>().HasMany(x => x.PublishJobs).WithOne(x => x.Campaign)
             .HasForeignKey(x => x.CampaignId).OnDelete(DeleteBehavior.Cascade);
 

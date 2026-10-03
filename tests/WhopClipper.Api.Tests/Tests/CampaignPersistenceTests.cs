@@ -93,7 +93,24 @@ public sealed class SourcePipelinePayloadTests
         Assert.True(payload.DeleteSourceWhenDone);
         Assert.Equal(PlatformKind.TikTok, payload.Platform);
         Assert.Equal("SmartCrop", payload.Framing);
-        Assert.Null(payload.HookYFraction);
+    }
+
+    /// <summary>
+    /// The hook card has to default to a position that clears the streamer's head *and* the
+    /// captions. It used to default to null, which the renderer reads as 0.06 of frame height and
+    /// which shipped a clip with six pixels between the card and his hair. Anything near mid-frame
+    /// is no good either: captions are centred vertically and the card is drawn over them, so a
+    /// card there hides the captions for the whole clip. Both faults reached rendered output.
+    /// </summary>
+    [Fact]
+    public void PlacesTheHookCardClearOfHisHeadAndTheCaptionBand()
+    {
+        var payload = new SourcePipelineJobPayload(Guid.NewGuid());
+
+        var y = Assert.IsType<double>(payload.HookYFraction);
+        Assert.True(y > 0, "a card at the very top edge has no margin at all");
+        Assert.True(y < 0.06, $"0.06 was measured grazing his hair; {y} is no better");
+        Assert.True(y + 0.09 < 0.4, $"a card at {y} plus its own height reaches the caption band");
     }
 
     /// <summary>

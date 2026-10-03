@@ -103,8 +103,10 @@ public sealed record PublishJobCreationResult(PublishJob? Job, Dictionary<string
 public sealed class PublishJobService(AppDbContext db, PublishingMediaValidator mediaValidator,
     PlatformConnectionService connections, PlatformAccountKitService accountKits)
 {
+    /// <param name="schedule">A scheduled YouTube upload. Set here, in the same insert, so the worker can
+    /// never pick the job up before it knows its slot and upload it straight away.</param>
     public async Task<PublishJobCreationResult> CreateAsync(Guid campaignId,
-        CreatePublishJobRequest request, CancellationToken cancellationToken)
+        CreatePublishJobRequest request, CancellationToken cancellationToken, ScheduledUpload? schedule = null)
     {
         var errors = ValidateRequest(request);
         if (errors.Count > 0) return new(null, errors);
@@ -144,7 +146,7 @@ public sealed class PublishJobService(AppDbContext db, PublishingMediaValidator 
                 : new(null, new() { ["idempotencyKey"] = ["This idempotency key is already bound to different video, metadata, account, or destination settings."] }, Conflict: true);
         var recentSameOutput = await db.PublishJobs.AsNoTracking().AnyAsync(x => x.CampaignId == campaignId &&
             x.Platform == request.Platform && x.FileSha256 == validation.Sha256 &&
-            x.Status != PublishStatus.Failed && x.Status != PublishStatus.Cancelled &&
+            x.Status != PublishStatus.Failed && x.Status != PublishStatus.Cancelled && x.Status != PublishStatus.Removed &&
             x.CreatedAt > DateTimeOffset.UtcNow.AddHours(-24), cancellationToken);
         if (recentSameOutput) return new(null, new() { ["outputRelativePath"] = ["This exact video already has a recent publish attempt for that platform. Use its existing status instead of risking a duplicate post."] }, Conflict: true);
         var job = new PublishJob
@@ -154,7 +156,8 @@ public sealed class PublishJobService(AppDbContext db, PublishingMediaValidator 
             Privacy = request.Privacy.ToLowerInvariant(), ShareToFeed = request.ShareToFeed,
             DryRun = request.DryRun, IdempotencyKey = idempotencyKey, RequestHash = requestHash,
             FileSha256 = validation.Sha256!, FileSizeBytes = validation.SizeBytes!.Value,
-            AccountIdentifier = accountIdentifier
+            AccountIdentifier = accountIdentifier,
+            EditPlanId = schedule?.EditPlanId, ScheduledPublishAt = schedule?.PublishAt, NextAttemptAt = schedule?.NextAttemptAt
         };
         db.PublishJobs.Add(job);
         try { await db.SaveChangesAsync(cancellationToken); }
@@ -314,8 +317,11 @@ public sealed class PublishingWorker(IServiceScopeFactory scopeFactory, ILogger<
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var candidateId = await db.PublishJobs.AsNoTracking().Where(x => x.Status == PublishStatus.Queued)
-            .OrderBy(x => x.CreatedAt).Select(x => (Guid?)x.Id).FirstOrDefaultAsync(cancellationToken);
+        var now = DateTimeOffset.UtcNow;
+        // A scheduled upload waits for its window (its slot is near) or for YouTube's quota to reset.
+        var candidateId = await db.PublishJobs.AsNoTracking()
+            .Where(x => x.Status == PublishStatus.Queued && (x.NextAttemptAt == null || x.NextAttemptAt <= now))
+            .OrderBy(x => x.ScheduledPublishAt ?? x.CreatedAt).Select(x => (Guid?)x.Id).FirstOrDefaultAsync(cancellationToken);
         if (!candidateId.HasValue) return;
         var claimed = await db.PublishJobs.Where(x => x.Id == candidateId.Value && x.Status == PublishStatus.Queued)
             .ExecuteUpdateAsync(setters => setters
@@ -388,15 +394,23 @@ public sealed class PublishingWorker(IServiceScopeFactory scopeFactory, ILogger<
             else
             {
                 var publisher = scope.ServiceProvider.GetServices<IPlatformPublisher>().Single(x => x.Platform == job.Platform);
+                // The app was closed through this slot's upload window: give it the next free slot rather
+                // than hand YouTube a publishAt in the past.
+                if (job.ScheduledPublishAt is { } slot && slot < DateTimeOffset.UtcNow + YouTubeScheduleService.MinimumLead)
+                    job.ScheduledPublishAt = await scope.ServiceProvider.GetRequiredService<YouTubeScheduleService>()
+                        .NextFreeSlotAsync(DateTimeOffset.UtcNow + YouTubeScheduleService.MinimumLead, job.Id, cancellationToken);
                 job.Status = PublishStatus.Uploading; job.Progress = 0.05; job.UpdatedAt = DateTimeOffset.UtcNow;
                 await db.SaveChangesAsync(cancellationToken);
                 remoteOperationStarted = true;
                 result = await publisher.PublishAsync(new(job.Id, media!.FullPath!, job.Title, job.Caption, job.Privacy,
-                    job.ShareToFeed, false), credentials, progress, cancellationToken);
+                    job.ShareToFeed, false, job.ScheduledPublishAt), credentials, progress, cancellationToken);
             }
-            job.Status = PublishStatus.Published; job.Progress = 1; job.ExternalId = result.ExternalId;
-            job.ExternalUrl = result.ExternalUrl; job.PublishedAt = DateTimeOffset.UtcNow; job.UpdatedAt = DateTimeOffset.UtcNow;
-            job.ResultJson = JsonSerializer.Serialize(new { result.ResultCode }, JsonDefaults.Serializer);
+            var waitsForSlot = job.ScheduledPublishAt > DateTimeOffset.UtcNow;
+            job.Status = waitsForSlot ? PublishStatus.Scheduled : PublishStatus.Published;
+            job.Progress = 1; job.ExternalId = result.ExternalId; job.ExternalUrl = result.ExternalUrl;
+            job.PublishedAt = waitsForSlot ? null : DateTimeOffset.UtcNow; job.UpdatedAt = DateTimeOffset.UtcNow;
+            job.Error = null; job.NextAttemptAt = null;
+            job.ResultJson = JsonSerializer.Serialize(new { result.ResultCode, scheduledFor = job.ScheduledPublishAt }, JsonDefaults.Serializer);
             await db.SaveChangesAsync(cancellationToken);
             if (job.Platform == PlatformKind.YouTubeShorts && credentials.Count > 0)
             {
@@ -420,6 +434,18 @@ public sealed class PublishingWorker(IServiceScopeFactory scopeFactory, ILogger<
                 ? "The app stopped during a remote operation. Check the platform before creating any retry."
                 : "Cancelled before a remote operation started.";
             await db.SaveChangesAsync(CancellationToken.None);
+        }
+        catch (PublishingApiException ex) when (job.ScheduledPublishAt is not null && YouTubeScheduleService.IsQuotaError(ex))
+        {
+            // YouTube refuses the upload before creating anything once the day's quota is spent, so the
+            // scheduled clip simply waits for the reset and keeps its place in the queue.
+            job.Status = PublishStatus.Queued;
+            job.NextAttemptAt = YouTubeScheduleService.NextQuotaReset(DateTimeOffset.UtcNow);
+            job.Progress = 0;
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            job.Error = "Waiting for YouTube's daily upload quota to reset (midnight Pacific time).";
+            await db.SaveChangesAsync(CancellationToken.None);
+            logger.LogWarning("YouTube quota reached; scheduled upload {PublishJobId} waits until {Retry}.", job.Id, job.NextAttemptAt);
         }
         catch (Exception ex)
         {

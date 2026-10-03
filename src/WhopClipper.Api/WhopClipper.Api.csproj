@@ -17,6 +17,8 @@
     <None Include="App\Services\transcribe.py" CopyToOutputDirectory="PreserveNewest" />
     <None Include="App\Services\framing.py" CopyToOutputDirectory="PreserveNewest" />
     <None Include="App\Services\hookcard.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="App\Services\broll.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="App\Services\narrated.py" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -25,6 +27,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="AngleSharp" Version="1.7.2" />
     <PackageReference Include="FluentValidation.DependencyInjectionExtensions" Version="12.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.9" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.9" />

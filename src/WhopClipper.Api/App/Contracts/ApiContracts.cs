@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using FluentValidation;
 using WhopClipper.Api.App.Domain;
+using WhopClipper.Api.App.Services;
 
 namespace WhopClipper.Api.App.Contracts;
 
@@ -22,7 +23,7 @@ public sealed record CampaignDetail(Guid Id, string Name, string? WhopUrl, strin
     CampaignStatus Status, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
     IReadOnlyList<RequirementRevisionDto> RequirementRevisions, IReadOnlyList<PlatformProfileDto> PlatformProfiles,
     IReadOnlyList<SourceAssetDto> Sources, IReadOnlyList<CampaignDocumentDto> Documents,
-    IReadOnlyList<ReferenceVideoDto> ReferenceVideos, CampaignBrandingDto? Branding);
+    IReadOnlyList<ReferenceVideoDto> ReferenceVideos, CampaignBrandingDto? Branding, CampaignEditStyleDto? EditStyle = null);
 /// <summary>
 /// The client logo burned into every clip for a campaign. Sizes are fractions of the output
 /// frame so one setting covers every platform preset. <paramref name="LogoCropRect"/> is the
@@ -38,6 +39,8 @@ public sealed record CampaignDocumentDto(Guid Id, string FileName, CampaignDocum
     int? PageCount, int ExtractedCharacterCount, DocumentExtractionStatus ExtractionStatus, string? ExtractionError,
     bool IncludeInExtraction, string RelativePath, DateTimeOffset UploadedAt);
 public sealed record UpdateCampaignDocumentRequest(bool IncludeInExtraction);
+/// <summary>Address of a campaign brief published as a web page rather than sent as a file.</summary>
+public sealed record FetchBriefPageRequest(string Url);
 public sealed record ReferenceVideoDto(Guid Id, string Label, string? Url, string? LocalRelativePath, string? Notes,
     bool IsPrimary, double? DurationSeconds, ReferenceVideoStatus Status, string? Error, JsonElement? StyleProfile,
     DateTimeOffset CreatedAt, DateTimeOffset? AnalyzedAt);
@@ -62,8 +65,24 @@ public sealed record DetectedLinkDto(string Url, string Host, string Kind, strin
 public sealed record ImportLinksRequest(IReadOnlyList<string> Urls, string Target, bool ConfirmedPermission, bool Download = true);
 public sealed record ImportLinksResult(int Added, int Skipped, int Queued, IReadOnlyList<string> Errors);
 public sealed record LocalSourceScanDto(int Attached, int Added, int AlreadyKnown, string Folder, IReadOnlyList<string> Notes);
+/// <param name="Title">What the clip is about - the hook burned onto it.</param>
+/// <param name="Caption">Ready to paste into an upload form, with the campaign's required
+/// hashtags and mentions already in it. A missing required hashtag gets a clip rejected.</param>
+/// <param name="Drive">Set when the clip's video has been moved to Google Drive: it stays listed, with its
+/// thumbnail, until it is brought back.</param>
 public sealed record RenderedClipDto(string RelativePath, string FileName, string Platform, long SizeBytes,
-    DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds);
+    DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds,
+    string Title = "", string Caption = "", RenderedClipStyleDto? Style = null, RenderedClipDriveDto? Drive = null,
+    string? SourceTitle = null, DateOnly? SourcePublishedOn = null);
+public sealed record RenderedClipDriveDto(string Remote, DateTimeOffset MovedAt, long Bytes);
+/// <summary>What "Move campaign to Drive" would move for a campaign, counted on this PC before anything is sent.</summary>
+/// <param name="ClipBytes">What the clips free on this PC, their music-free previews included.</param>
+/// <param name="AlreadyMoved">Clips moved to Drive earlier, whose video is no longer here.</param>
+/// <param name="StillWriting">Files a render or download is still writing; they wait for the next run.</param>
+public sealed record CampaignDriveUploadDto(string Remote, int Sources, long SourceBytes, int Clips, long ClipBytes,
+    int AlreadyMoved, int StillWriting);
+/// <summary>What "Bring campaign back from Drive" would fetch, and the room this PC has for it.</summary>
+public sealed record CampaignDriveReturnDto(int Sources, long SourceBytes, int Clips, long ClipBytes, long FreeBytes);
 public sealed record AddSourceRequest(string Url);
 public sealed record InspectSourceRequest(string Url);
 public sealed record StartDownloadRequest(Guid SourceAssetId, string? Quality = null, bool Refresh = false);
@@ -73,9 +92,30 @@ public sealed record StartSourcePipelineRequest(IReadOnlyList<Guid>? SourceAsset
     IReadOnlyList<string>? Urls = null, PlatformKind Platform = PlatformKind.TikTok, int MaxClips = 8,
     bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude, string? Quality = null,
     string? Framing = null, double? HookYFraction = null);
+/// <summary>Works the campaign's outstanding clip bank without naming each source.</summary>
+/// <param name="MaxSources">Caps how many are queued in one go; null queues every outstanding one.</param>
+/// <param name="DryRun">Reports what would run without queueing anything. Each source is a
+/// multi-gigabyte download and a paid analysis, so being able to look first is worth having.</param>
+public sealed record AutoRunCampaignRequest(PlatformKind Platform = PlatformKind.TikTok, int MaxClips = 8,
+    bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude, string? Quality = null,
+    string? Framing = null, double? HookYFraction = null, int? MaxSources = null, bool DryRun = false);
+/// <param name="Queued">Empty on a dry run; see <paramref name="Outstanding"/> for what would go.</param>
+/// <param name="Outstanding">Sources with no clips yet that resolve to a real video, in run order.</param>
+/// <param name="NotInspected">Sources with no clips and no known duration, so not confirmed to be a
+/// single video - typically the brand's channel and profile links. Left alone; inspect one to
+/// include it.</param>
+/// <param name="Skipped">Sources left alone because they already have clips.</param>
+public sealed record AutoRunCampaignDto(IReadOnlyList<JobDto> Queued, IReadOnlyList<string> Outstanding,
+    IReadOnlyList<string> NotInspected, int Skipped, long EstimatedBytes, long FreeBytes, bool DryRun);
 public sealed record SourceAssetDto(Guid Id, string Url, string? Title, string? Uploader, double? DurationSeconds,
     string? ThumbnailUrl, string? LocalRelativePath, string? SubtitleRelativePath, string Status,
-    DateTimeOffset CreatedAt, DateTimeOffset? DownloadedAt, bool IsLocalFile, bool HasWordTranscript);
+    DateTimeOffset CreatedAt, DateTimeOffset? DownloadedAt, bool IsLocalFile, bool HasWordTranscript,
+    /// <summary>Confirmed to be a single video, so it can be handed to the pipeline. A known
+    /// duration proves it; so does a video content type, which is all Drive reports before the
+    /// file is on disk. Without the second test a Drive source could never be processed.</summary>
+    bool IsVideo = false, long? FileSizeBytes = null,
+    /// <summary>The day the video was published where it came from; null until looked up, or for a local file.</summary>
+    DateOnly? PublishedOn = null);
 public sealed record StartAiAnalysisRequest(Guid SourceAssetId, AiMode? Mode = null, PlatformKind Platform = PlatformKind.TikTok,
     string? Transcript = null);
 public sealed record SoundEffectPlacementDto(Guid AssetId, double AtSeconds, double GainDb = -6);
@@ -91,9 +131,14 @@ public sealed record OverlayDto(string Text, double StartSeconds, double EndSeco
 public sealed record ColorFlashDto(double AtSeconds, double DurationSeconds = 0.5, double Intensity = 0.45, string Color = "Green");
 /// <summary>Punch-in on a beat; reference edits run 1.1x-2.3x over 0.3-1.0s.</summary>
 public sealed record ZoomPunchDto(double AtSeconds, double DurationSeconds = 0.5, double Scale = 1.25);
+/// <param name="PodcastSplit">Set only on podcast-split plans, whose Framing is "PodcastSplit": the
+/// downloaded span, camera shots, B-roll and clip-clock words the renderer needs.</param>
 public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, string? SubtitleStyle,
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects, IReadOnlyList<OverlayDto> Overlays,
-    IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null);
+    IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
+    PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null,
+    double? VoiceVolume = null, double? MusicVolume = null, string? Caption = null,
+    string? Title = null, bool MusicNeedsRender = false, NarratedPlanDto? Narrated = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,
@@ -114,15 +159,19 @@ public sealed record EditPlanDto(Guid Id, Guid CampaignId, Guid SourceAssetId, P
     double MusicDuckingDb, IReadOnlyList<SoundEffectPlacementDto> SoundEffects,
     IReadOnlyList<OverlayDto> Overlays, DateTimeOffset CreatedAt,
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null);
+/// <param name="SubjectName">What this job is working on - the source video's title, or for a
+/// render the clip's own name. Every job in a campaign otherwise shows only the campaign name, so
+/// a queue of pipelines is indistinguishable and you cannot tell which video you are watching.</param>
 public sealed record JobDto(Guid Id, Guid? CampaignId, JobKind Kind, JobStatus Status, double Progress,
     string? ResultJson, JsonElement? Result, string? Error, string? CampaignName, int? ExitCode, int Attempt, DateTimeOffset CreatedAt,
-    DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt);
+    DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt, string? SubjectName = null);
 public sealed record AddMediaLocationRequest(string Path, MediaAssetKind Kind);
 public sealed record UpdateMediaAssetRequest(string[]? Tags, string? Mood, string? Energy, string? Genre, double? Bpm, bool Favorite, string? LicenseNotes);
 public sealed record MediaLocationDto(Guid Id, string Path, MediaAssetKind Kind, bool Enabled, DateTimeOffset CreatedAt);
 public sealed record MediaAssetDto(Guid Id, Guid LocationId, string FileName, MediaAssetKind Kind, long SizeBytes,
     string ContentHash, double? DurationSeconds, string[] Tags, string? Mood, string? Energy, string? Genre,
-    double? Bpm, bool Favorite, string? LicenseNotes, DateTimeOffset IndexedAt);
+    double? Bpm, bool Favorite, string? LicenseNotes, DateTimeOffset IndexedAt,
+    double? SegmentStartSeconds = null, double? SegmentEndSeconds = null);
 public sealed record UpdateSettingsRequest(string WorkspaceRoot, string YtDlpPath, string FfmpegPath,
     string FfprobePath, string ClaudePath, string CodexPath, int ProcessTimeoutMinutes,
     AiMode DefaultAiMode = AiMode.Compare, int MaxConcurrentMediaJobs = 1, bool RequireEditApproval = true,
@@ -308,14 +357,18 @@ public static class ApiMappings
             x.IsApproved, x.CreatedAt, x.ApprovedAt, x.Items.Select(i => new RequirementItemDto(i.Id, i.Category, i.Key,
                 i.Value, i.SourceText, i.Confidence, i.NeedsReview)).ToList())).ToList(),
         value.PlatformProfiles.OrderBy(x => x.Platform).Select(ToDto).ToList(),
-        value.Sources.OrderByDescending(x => x.CreatedAt).Select(ToDto).ToList(),
+        SourceDates.NewestFirst(value.Sources).Select(ToDto).ToList(),
         value.Documents.OrderBy(x => x.UploadedAt).Select(ToDto).ToList(),
         value.ReferenceVideos.OrderByDescending(x => x.IsPrimary).ThenBy(x => x.CreatedAt).Select(ToDto).ToList(),
-        value.ReadBranding());
+        value.ReadBranding(), value.ReadEditStyle());
 
     /// <summary>Null until a logo is uploaded; there is nothing to burn in before that.</summary>
     public static CampaignBrandingDto? ReadBranding(this Campaign value) =>
         string.IsNullOrWhiteSpace(value.BrandingJson) ? null : JsonDefaults.Parse<CampaignBrandingDto?>(value.BrandingJson, null);
+
+    /// <summary>Null until a style is chosen; every existing campaign keeps the streamer style.</summary>
+    public static CampaignEditStyleDto? ReadEditStyle(this Campaign value) =>
+        string.IsNullOrWhiteSpace(value.EditStyleJson) ? null : JsonDefaults.Parse<CampaignEditStyleDto?>(value.EditStyleJson, null);
 
     public static CampaignDocumentDto ToDto(this CampaignDocument value) => new(value.Id, value.FileName, value.Kind,
         value.SizeBytes, value.PageCount, value.ExtractedCharacterCount, value.ExtractionStatus, value.ExtractionError,
@@ -336,11 +389,56 @@ public static class ApiMappings
         value.DurationSeconds, value.ThumbnailUrl, value.LocalRelativePath, value.SubtitleRelativePath,
         value.DownloadedAt.HasValue ? "Downloaded" : value.Title is not null ? "Inspected" : "Pending", value.CreatedAt,
         value.DownloadedAt, string.IsNullOrWhiteSpace(value.Url),
-        !string.IsNullOrWhiteSpace(value.WordTranscriptRelativePath));
+        !string.IsNullOrWhiteSpace(value.WordTranscriptRelativePath),
+        value.DurationSeconds is > 0 || MetadataSaysVideo(value.MetadataJson),
+        MetadataSize(value.MetadataJson), SourceDates.PublishedOn(value.MetadataJson));
 
-    public static JobDto ToDto(this JobRecord value, string? campaignName = null) => new(value.Id, value.CampaignId, value.Kind, value.Status,
+    private static bool MetadataSaysVideo(string? metadataJson) =>
+        ReadMetadata(metadataJson, "contentType")?.GetString()?
+            .StartsWith("video/", StringComparison.OrdinalIgnoreCase) ?? false;
+
+    private static long? MetadataSize(string? metadataJson) =>
+        ReadMetadata(metadataJson, "fileSizeBytes") is { } element && element.TryGetInt64(out var bytes)
+            ? bytes : null;
+
+    /// <summary>Metadata is whatever the inspector wrote, so a missing or malformed field is normal.</summary>
+    private static JsonElement? ReadMetadata(string? metadataJson, string property)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(metadataJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty(property, out var element)
+                ? element.Clone() : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    public static JobDto ToDto(this JobRecord value, string? campaignName = null, string? subjectName = null) => new(value.Id, value.CampaignId, value.Kind, value.Status,
         value.Progress, value.ResultJson, JsonDefaults.ParseElement(value.ResultJson), value.Error, campaignName,
-        value.ExitCode, value.Attempt, value.CreatedAt, value.StartedAt, value.CompletedAt);
+        value.ExitCode, value.Attempt, value.CreatedAt, value.StartedAt, value.CompletedAt, subjectName);
+
+    /// <summary>
+    /// Reads the id a job's payload points at. The payload shape changes per stage - a pipeline
+    /// swaps its own payload as it runs - so this looks for the property rather than deserialising
+    /// into any one type, and returns nothing rather than throwing on a shape it does not know.
+    /// </summary>
+    public static Guid? PayloadId(this JobRecord value, string property)
+    {
+        if (string.IsNullOrWhiteSpace(value.PayloadJson)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(value.PayloadJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                   document.RootElement.TryGetProperty(property, out var element) &&
+                   element.ValueKind == JsonValueKind.String &&
+                   Guid.TryParse(element.GetString(), out var id)
+                ? id
+                : null;
+        }
+        catch (JsonException) { return null; }
+    }
 
     public static EditPlanDto ToDto(this EditPlan value)
     {
@@ -355,5 +453,6 @@ public static class ApiMappings
 
     public static MediaAssetDto ToDto(this MediaLibraryAsset value) => new(value.Id, value.LocationId, value.FileName,
         value.Kind, value.SizeBytes, value.ContentHash, value.DurationSeconds, JsonDefaults.Parse(value.TagsJson, Array.Empty<string>()),
-        value.Mood, value.Energy, value.Genre, value.Bpm, value.IsFavorite, value.LicenseNotes, value.IndexedAt);
+        value.Mood, value.Energy, value.Genre, value.Bpm, value.IsFavorite, value.LicenseNotes, value.IndexedAt,
+        value.SegmentStartSeconds, value.SegmentEndSeconds);
 }
