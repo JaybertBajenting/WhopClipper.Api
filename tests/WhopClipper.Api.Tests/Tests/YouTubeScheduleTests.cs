@@ -72,6 +72,17 @@ public sealed class PublishSlotTests
             HttpStatusCode.Forbidden)));
         Assert.False(YouTubeScheduleService.IsQuotaError(new PublishingApiException("forbidden", HttpStatusCode.Forbidden)));
     }
+
+    [Fact]
+    public void TheChannelsOwnDailyLimitIsAWaitNotAFailure()
+    {
+        Assert.True(YouTubeScheduleService.IsChannelUploadLimit(new PublishingApiException(
+            "YouTube could not start the resumable upload (400): The user has exceeded the number of videos they may upload.",
+            HttpStatusCode.BadRequest)));
+        Assert.False(YouTubeScheduleService.IsChannelUploadLimit(new PublishingApiException(
+            "YouTube could not start the resumable upload (400): The request metadata specifies an invalid video title.",
+            HttpStatusCode.BadRequest)));
+    }
 }
 
 public sealed class PhoneNotifierTests
@@ -207,6 +218,43 @@ public sealed class YouTubeScheduleServiceTests : IDisposable
         Assert.DoesNotContain(_http.Calls, x => x.Contains(passed.Id.ToString("N")));
     }
 
+    [Fact]
+    public async Task ChangingACampaignsLinkReplacesTheNotificationsAlreadySet()
+    {
+        await new PublishingSettingsStore(_db).SaveNotificationsAsync(
+            new PhoneNotificationSettings(true, "https://ntfy.sh", "whopclipper-test-topic-1"), CancellationToken.None);
+        var set = Seed(PublishStatus.Scheduled, DateTimeOffset.UtcNow.AddHours(5), "vidSet", notified: true);
+        var service = Service();
+
+        _campaign.WhopUrl = "https://whop.com/new-campaign-page";
+        _db.SaveChanges();
+        await service.RefreshNotificationsAsync(_campaign.Id, CancellationToken.None);
+        await service.SyncAsync(CancellationToken.None);
+
+        // Sent again under the clip's own ID, which is how ntfy replaces the message it is holding.
+        Assert.Contains(_http.Calls, x => x == $"POST /whopclipper-test-topic-1/wc-{set.Id:N}");
+        Assert.Equal(["https://whop.com/new-campaign-page"], _http.Clicks);
+        Assert.Equal(set.ScheduledPublishAt, (await _db.PublishJobs.SingleAsync(x => x.Id == set.Id)).NotificationScheduledFor);
+    }
+
+    [Fact]
+    public async Task ReconnectingSendsWaitingClipsUpStraightAway()
+    {
+        var waiting = Seed(PublishStatus.Queued, DateTimeOffset.UtcNow.AddHours(5), null);
+        waiting.NextAttemptAt = DateTimeOffset.UtcNow.AddMinutes(15);
+        waiting.Error = YouTubePublisher.SignedOut;
+        var uploaded = Seed(PublishStatus.Scheduled, DateTimeOffset.UtcNow.AddHours(8), "vidUp");
+        uploaded.Error = "kept";
+        _db.SaveChanges();
+
+        await Service().RetryWaitingAsync(CancellationToken.None);
+
+        var retried = await _db.PublishJobs.SingleAsync(x => x.Id == waiting.Id);
+        Assert.Null(retried.NextAttemptAt);
+        Assert.Null(retried.Error);
+        Assert.Equal("kept", (await _db.PublishJobs.SingleAsync(x => x.Id == uploaded.Id)).Error);
+    }
+
     private sealed class FakeVault : IPublishingCredentialVault
     {
         public string Store(PlatformKind platform, IReadOnlyDictionary<string, string> credentials) => "ref";
@@ -230,11 +278,14 @@ public sealed class YouTubeScheduleServiceTests : IDisposable
     {
         public List<string> Calls { get; } = [];
         public List<string> Bodies { get; } = [];
+        /// <summary>Where each notification opens when it is tapped.</summary>
+        public List<string> Clicks { get; } = [];
         public string? FailUpdatesFor { get; set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Calls.Add($"{request.Method} {request.RequestUri!.PathAndQuery}");
+            if (request.Headers.TryGetValues("Click", out var click)) Clicks.AddRange(click);
             var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
             if (body.Length > 0) Bodies.Add(body);
             if (request.Method == HttpMethod.Get && request.RequestUri.AbsolutePath.EndsWith("/videos", StringComparison.Ordinal))

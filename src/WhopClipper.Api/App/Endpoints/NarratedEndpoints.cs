@@ -13,8 +13,13 @@ namespace WhopClipper.Api.App.Endpoints;
 /// right: for a vlog shot with something at the window's edge that must not show, such as an app's logo.</param>
 /// <param name="Skull">False leaves the skull off the ending, keeping the black-and-white freeze; true puts it back.
 /// Null keeps the clip as it is.</param>
+/// <param name="CarShots">True cuts the clip's picture again as a car clip: the shots under the narrator are taken from
+/// where a car is on screen in the video and framed on it. The narration is kept, so no voice credits are spent.</param>
+/// <param name="StoryShots">True cuts the clip's picture again to show what it is about, whatever that is: the shots
+/// under the narrator are taken from where the video shows what he names (a car, a house, a watch, money). The
+/// narration is kept. With <paramref name="CarShots"/> as well, it is cut as a car clip.</param>
 public sealed record NarratedRerenderRequest(Guid? MusicAssetId = null, double? MusicVolume = null, string? OverlayTitle = null,
-    double? PayoffShiftX = null, bool? Skull = null);
+    double? PayoffShiftX = null, bool? Skull = null, bool? CarShots = null, bool? StoryShots = null);
 
 public static class NarratedEndpoints
 {
@@ -59,7 +64,9 @@ public static class NarratedEndpoints
                 MusicVolume = request.MusicVolume ?? extras.MusicVolume, Narrated = narrated,
             }, JsonDefaults.Serializer);
             await db.SaveChangesAsync(ct);
-            var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.Render, new RenderJobPayload(plan.Id), ct);
+            var job = await coordinator.CreateAsync(plan.CampaignId, JobKind.Render,
+                new RenderJobPayload(plan.Id, CarShots: request.CarShots == true,
+                    StoryShots: request.StoryShots == true && request.CarShots != true), ct);
             return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto(subjectName: extras.Narrated.Title));
         }).WithTags("Edit style");
     }

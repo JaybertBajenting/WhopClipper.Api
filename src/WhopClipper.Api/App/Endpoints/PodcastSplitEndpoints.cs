@@ -130,6 +130,20 @@ public static partial class PodcastSplitEndpoints
             return Results.Ok(new { title, caption });
         }).WithTags("Edit style");
 
+        // Mark a finished clip as a car clip, or as not one, by hand. The clip list's "Cars only" switch goes by the
+        // words in the title and caption; this corrects the clips that rule gets wrong, and needs no re-render.
+        api.MapPut("/edit-plans/{planId:guid}/car", async (Guid planId, SetPlanCarRequest request,
+            AppDbContext db, CancellationToken ct) =>
+        {
+            var plan = await db.EditPlans.SingleOrDefaultAsync(x => x.Id == planId, ct);
+            if (plan is null) return Results.NotFound();
+            var extras = JsonDefaults.Parse<EditPlanExtrasDto?>(plan.ExtraSettingsJson, null)
+                ?? new EditPlanExtrasDto("SmartCrop", null, null, -12, [], []);
+            plan.ExtraSettingsJson = JsonSerializer.Serialize(extras with { Car = request.Car }, JsonDefaults.Serializer);
+            await db.SaveChangesAsync(ct);
+            return Results.Ok(new { car = request.Car });
+        }).WithTags("Edit style");
+
         // Point one clip at a specific bed without re-rendering it. Updates the plan's music id and the
         // stored start (the asset's own segment when the caller doesn't pass one), so the live preview and
         // any later re-render both use the new song. Used to give each highlight its own bed from the folder.

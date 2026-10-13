@@ -39,7 +39,11 @@ public sealed record PlatformConnectionDto(PlatformKind Platform, PublishingConn
     IReadOnlyDictionary<string, bool> SecretConfigured, string? AccountIdentifier,
     IReadOnlyList<string> GrantedScopes,
     DateTimeOffset? TokenExpiresAt, DateTimeOffset? UpdatedAt, DateTimeOffset? LastValidatedAt, string? LastError,
-    bool CanPublish, string CapabilityMessage);
+    bool CanPublish, string CapabilityMessage, Guid? Id = null, string? ChannelTitle = null);
+public sealed record AddYouTubePageRequest(string? AccountId, Guid? CopyClientFrom = null);
+public sealed record SetCampaignYouTubePageRequest(Guid? PageId);
+/// <summary>One YouTube page for a selector: its label and whether it can take a scheduled clip.</summary>
+public sealed record YouTubePageDto(Guid Id, string Label, bool Ready);
 public sealed record PublishingSessionDto(string Nonce, string HeaderName);
 public sealed record OAuthStartResponse(string AuthorizationUrl, DateTimeOffset ExpiresAt);
 
@@ -53,22 +57,22 @@ public sealed record PublishJobDto(Guid Id, Guid CampaignId, PlatformKind Platfo
     bool ShareToFeed, bool DryRun, string? AccountIdentifier, string FileSha256,
     string? ExternalId, string? ExternalUrl, string? Error, string? ManualPackageDownloadUrl,
     DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? PublishedAt,
-    Guid? EditPlanId = null, DateTimeOffset? ScheduledPublishAt = null, DateTimeOffset? UploadsAfter = null,
-    bool NotificationScheduled = false);
+    Guid? EditPlanId = null, DateTimeOffset? ScheduledPublishAt = null, bool NotificationScheduled = false);
 
-/// <summary>A scheduled YouTube upload: its go-public slot and when the upload itself may start.</summary>
-public sealed record ScheduledUpload(DateTimeOffset PublishAt, DateTimeOffset NextAttemptAt, Guid? EditPlanId);
+/// <summary>A scheduled YouTube upload: its go-public slot. The upload itself starts straight away.</summary>
+public sealed record ScheduledUpload(DateTimeOffset PublishAt, Guid? EditPlanId);
 
-public sealed record YouTubeScheduleSettingsDto(IReadOnlyList<string> Slots, string TimeZoneId, string TimeZoneName,
-    int UploadWindowHours);
+public sealed record YouTubeScheduleSettingsDto(IReadOnlyList<string> Slots, string TimeZoneId, string TimeZoneName);
 public sealed record PhoneNotificationSettingsDto(bool Enabled, string Server, string Topic, string SubscribeUrl);
 public sealed record UpdatePhoneNotificationsRequest(bool Enabled, string? Server, string? Topic);
 public sealed record ScheduleYouTubeRequest(string OutputRelativePath, Guid? EditPlanId, string Title, string Caption,
     bool Confirmed = false, string? IdempotencyKey = null);
 public sealed record UnscheduleYouTubeRequest(bool Confirmed = false);
+/// <param name="PageId">The page this schedule is for. Null when there is none, or a campaign has yet to choose one.</param>
+/// <param name="Pages">Every connected YouTube page, for the selectors.</param>
 public sealed record YouTubeScheduleDto(YouTubeScheduleSettingsDto Settings, PhoneNotificationSettingsDto Notifications,
     bool Connected, bool CanManage, string? Channel, string Message, DateTimeOffset NextFreeSlot,
-    IReadOnlyList<PublishJobDto> Items);
+    IReadOnlyList<PublishJobDto> Items, Guid? PageId, IReadOnlyList<YouTubePageDto> Pages);
 
 public static class PublishingMappings
 {
@@ -78,5 +82,5 @@ public static class PublishingMappings
         value.ExternalId, value.ExternalUrl, value.Error,
         value.ManualPackageRelativePath is null ? null : $"/api/publishing/jobs/{value.Id}/manual-package",
         value.CreatedAt, value.UpdatedAt, value.PublishedAt, value.EditPlanId, value.ScheduledPublishAt,
-        value.Status == PublishStatus.Queued ? value.NextAttemptAt : null, value.NotificationScheduledFor is not null);
+        value.NotificationScheduledFor is not null);
 }

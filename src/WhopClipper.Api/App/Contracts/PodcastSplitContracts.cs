@@ -103,3 +103,6 @@ public sealed record SetPlanMusicRequest(Guid? MusicAssetId, double? MusicStartS
 
 /// <summary>Rewrite the title and caption a finished clip is uploaded with.</summary>
 public sealed record SetPlanCopyRequest(string? Title, string? Caption);
+
+/// <summary>Mark a finished clip as a car clip, or as not one, by hand.</summary>
+public sealed record SetPlanCarRequest(bool Car);

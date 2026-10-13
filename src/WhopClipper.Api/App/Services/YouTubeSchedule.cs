@@ -11,10 +11,7 @@ using WhopClipper.Api.App.Domain;
 namespace WhopClipper.Api.App.Services;
 
 /// <param name="Slots">Local go-public times, "HH:mm".</param>
-/// <param name="UploadWindowHours">How long before its slot a clip is uploaded. YouTube's default quota
-/// allows about six uploads a day (1,600 of 10,000 units each), so queueing twenty clips cannot upload
-/// them all at once; each goes up about a day before it is due.</param>
-public sealed record YouTubeScheduleSettings(IReadOnlyList<string> Slots, string TimeZoneId, int UploadWindowHours = 30)
+public sealed record YouTubeScheduleSettings(IReadOnlyList<string> Slots, string TimeZoneId)
 {
     /// <summary>Matthew's four daily slots, 11 pm / 2 am / 5 am / 8 am in this machine's time zone.</summary>
     public static YouTubeScheduleSettings Default => new(["23:00", "02:00", "05:00", "08:00"], TimeZoneInfo.Local.Id);
@@ -89,15 +86,20 @@ public sealed class PublishingSettingsStore(AppDbContext db)
     private const string ScheduleKey = "youtube.schedule";
     private const string NotificationsKey = "notifications.ntfy";
 
-    public async Task<YouTubeScheduleSettings> GetScheduleAsync(CancellationToken cancellationToken)
+    private static string ScheduleKeyFor(Guid? pageId) => pageId is { } id ? $"{ScheduleKey}:{id:N}" : ScheduleKey;
+
+    /// <summary>A page's own daily times. Until it saves some, it uses the shared ones every page starts with.</summary>
+    public async Task<YouTubeScheduleSettings> GetScheduleAsync(Guid? pageId, CancellationToken cancellationToken)
     {
-        var row = await db.ApplicationSettings.AsNoTracking().SingleOrDefaultAsync(x => x.Key == ScheduleKey, cancellationToken);
+        var own = ScheduleKeyFor(pageId);
+        var rows = await db.ApplicationSettings.AsNoTracking().Where(x => x.Key == own || x.Key == ScheduleKey).ToListAsync(cancellationToken);
+        var row = rows.FirstOrDefault(x => x.Key == own) ?? rows.FirstOrDefault();
         return row is null ? YouTubeScheduleSettings.Default
             : JsonDefaults.Parse<YouTubeScheduleSettings?>(row.Value, null) ?? YouTubeScheduleSettings.Default;
     }
 
-    public Task SaveScheduleAsync(YouTubeScheduleSettings settings, CancellationToken cancellationToken) =>
-        SaveAsync(ScheduleKey, settings, cancellationToken);
+    public Task SaveScheduleAsync(Guid? pageId, YouTubeScheduleSettings settings, CancellationToken cancellationToken) =>
+        SaveAsync(ScheduleKeyFor(pageId), settings, cancellationToken);
 
     /// <summary>First use creates the topic, so the phone can subscribe before anything is scheduled.</summary>
     public async Task<PhoneNotificationSettings> GetNotificationsAsync(CancellationToken cancellationToken)
@@ -204,7 +206,8 @@ public sealed class PhoneNotifier(IHttpClientFactory clients, ILogger<PhoneNotif
 
 /// <summary>
 /// The YouTube posting schedule: one button to put a clip into the next free daily slot, one to take it
-/// off. Clips upload private with a publishAt, so YouTube makes them public at the slot by itself.
+/// off. A clip uploads as soon as it is scheduled, private with a publishAt, so YouTube makes it public
+/// at the slot by itself and this PC is only needed for the upload.
 /// </summary>
 public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsStore settingsStore, PublishJobService jobs,
     PlatformConnectionService connections, YouTubePublisher youtube, PhoneNotifier notifier,
@@ -221,8 +224,23 @@ public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsSt
         [PublishStatus.Queued, PublishStatus.Validating, PublishStatus.Uploading, PublishStatus.Processing,
          PublishStatus.Scheduled, PublishStatus.NeedsAttention];
 
+    /// <summary>How long an upload waits before trying again once the channel's own daily limit is reached.</summary>
+    public static readonly TimeSpan ChannelLimitWait = TimeSpan.FromHours(3);
+
+    /// <summary>How often a waiting upload checks whether YouTube has been reconnected. Reconnecting also retries at once.</summary>
+    public static readonly TimeSpan ReconnectWait = TimeSpan.FromMinutes(15);
+
+    /// <summary>The Google project's daily allowance (100 uploads by default) is used up.</summary>
     public static bool IsQuotaError(PublishingApiException exception) =>
         exception.StatusCode == HttpStatusCode.Forbidden && exception.Message.Contains("quota", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The channel has uploaded as many videos as YouTube lets it in a day (uploadLimitExceeded). The
+    /// limit differs per channel and frees up over 24 hours rather than at a fixed time.
+    /// </summary>
+    public static bool IsChannelUploadLimit(PublishingApiException exception) =>
+        exception.StatusCode == HttpStatusCode.BadRequest &&
+        exception.Message.Contains("exceeded the number of videos", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>YouTube's API quota resets at midnight Pacific time.</summary>
     public static DateTimeOffset NextQuotaReset(DateTimeOffset now)
@@ -233,35 +251,86 @@ public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsSt
         return new DateTimeOffset(midnight, pacific.GetUtcOffset(midnight)).ToUniversalTime().AddMinutes(5);
     }
 
-    public async Task<DateTimeOffset> NextFreeSlotAsync(DateTimeOffset after, Guid? except, CancellationToken cancellationToken)
+    /// <summary>YouTube was just reconnected: clips that were waiting upload now instead of at their next check.</summary>
+    public async Task RetryWaitingAsync(CancellationToken cancellationToken)
     {
-        var settings = await settingsStore.GetScheduleAsync(cancellationToken);
+        var waiting = await db.PublishJobs
+            .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.Status == PublishStatus.Queued && x.ScheduledPublishAt != null)
+            .ToListAsync(cancellationToken);
+        foreach (var job in waiting)
+        {
+            job.NextAttemptAt = null;
+            job.Error = null;
+        }
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// A campaign's link or name changed, and the notifications already handed to ntfy carry the old one.
+    /// Clearing their mark makes the next sync send each again under the same ID, which replaces the one
+    /// ntfy is holding.
+    /// </summary>
+    public async Task RefreshNotificationsAsync(Guid campaignId, CancellationToken cancellationToken)
+    {
+        var held = await db.PublishJobs
+            .Where(x => x.CampaignId == campaignId && x.Platform == PlatformKind.YouTubeShorts
+                && x.Status == PublishStatus.Scheduled && x.NotificationScheduledFor != null)
+            .ToListAsync(cancellationToken);
+        foreach (var job in held) job.NotificationScheduledFor = null;
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>Each page has its own queue: a slot taken on one page is still free on another.</summary>
+    public async Task<DateTimeOffset> NextFreeSlotAsync(DateTimeOffset after, Guid? except, Guid? pageId, CancellationToken cancellationToken)
+    {
+        var settings = await settingsStore.GetScheduleAsync(pageId, cancellationToken);
         var taken = await db.PublishJobs.AsNoTracking()
-            .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.ScheduledPublishAt != null && Holding.Contains(x.Status)
-                && x.Id != except)
+            .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.ConnectionId == pageId && x.ScheduledPublishAt != null
+                && Holding.Contains(x.Status) && x.Id != except)
             .Select(x => x.ScheduledPublishAt!.Value).ToListAsync(cancellationToken);
         return PublishSlots.FirstFree(after, taken.Select(x => x.ToUniversalTime()).ToHashSet(), settings);
     }
 
-    public async Task<YouTubeScheduleDto> GetAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// One page's schedule. Asked for a campaign, it is the page that campaign posts to, plus that
+    /// campaign's own clips wherever they were scheduled; otherwise the named page, or the first.
+    /// </summary>
+    public async Task<YouTubeScheduleDto> GetAsync(Guid? pageId, Guid? campaignId, CancellationToken cancellationToken)
     {
-        var settings = await settingsStore.GetScheduleAsync(cancellationToken);
+        var all = (await connections.GetAllAsync(cancellationToken))
+            .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.Id is not null).ToList();
+        var mustChoose = false;
+        if (campaignId is { } campaign) (pageId, mustChoose) = await connections.ResolveYouTubePageAsync(campaign, cancellationToken);
+        else pageId = all.FirstOrDefault(x => x.Id == pageId)?.Id ?? all.FirstOrDefault()?.Id;
+
+        var settings = await settingsStore.GetScheduleAsync(pageId, cancellationToken);
         var notifications = await settingsStore.GetNotificationsAsync(cancellationToken);
-        var connection = await connections.GetAsync(PlatformKind.YouTubeShorts, cancellationToken);
-        var canManage = YouTubeOAuthService.CanManageSchedule(connection.GrantedScopes);
+        // With no page there is nothing to read, and GetAsync(null) would hand back the first page.
+        var connection = all.FirstOrDefault(x => x.Id == pageId) ?? connections.ToDto(PlatformKind.YouTubeShorts, null);
+        var connected = !mustChoose && connection.CanPublish;
+        var canManage = !mustChoose && YouTubeOAuthService.CanManageSchedule(connection.GrantedScopes);
         var since = DateTimeOffset.UtcNow.AddDays(-2);
+        // A page's schedule lists what is waiting and what went up in the last two days. A campaign's own clips
+        // stay on it once they are public, however long ago: its clip list goes by this to mark a clip as posted,
+        // and after two days a public clip looked unposted and was offered for scheduling again.
         var items = await db.PublishJobs.AsNoTracking()
             .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.ScheduledPublishAt != null
-                && (Holding.Contains(x.Status) || x.ScheduledPublishAt > since))
+                && (Holding.Contains(x.Status) || x.ScheduledPublishAt > since
+                    || (campaignId != null && x.CampaignId == campaignId && x.Status == PublishStatus.Published))
+                && ((pageId != null && x.ConnectionId == pageId) || (campaignId != null && x.CampaignId == campaignId)))
             .OrderBy(x => x.ScheduledPublishAt).ToListAsync(cancellationToken);
-        var message = !connection.CanPublish ? connection.CapabilityMessage
+        var message = mustChoose ? PlatformConnectionService.ChoosePage
+            : !connection.CanPublish ? connection.CapabilityMessage
             : !canManage ? "Reconnect YouTube once: scheduling needs permission to move and delete videos, not just upload them."
             : "Ready. Each clip goes into the next free slot and YouTube makes it public on time, even if this PC is off.";
         var zone = PublishSlots.Zone(settings.TimeZoneId);
-        return new(new(settings.Slots, zone.Id, zone.DisplayName, settings.UploadWindowHours),
-            ToDto(notifications), connection.CanPublish, canManage, connection.AccountIdentifier, message,
-            await NextFreeSlotAsync(DateTimeOffset.UtcNow + MinimumLead, null, cancellationToken),
-            items.Select(x => x.ToDto()).ToList());
+        return new(new(settings.Slots, zone.Id, zone.DisplayName),
+            ToDto(notifications), connected, canManage,
+            pageId is null ? null : PlatformConnectionService.PageLabel(connection.AccountIdentifier, connection.ChannelTitle), message,
+            await NextFreeSlotAsync(DateTimeOffset.UtcNow + MinimumLead, null, pageId, cancellationToken),
+            items.Select(x => x.ToDto()).ToList(), pageId,
+            all.Select(x => new YouTubePageDto(x.Id!.Value, PlatformConnectionService.PageLabel(x.AccountIdentifier, x.ChannelTitle),
+                x.CanPublish && YouTubeOAuthService.CanManageSchedule(x.GrantedScopes))).ToList());
     }
 
     public static PhoneNotificationSettingsDto ToDto(PhoneNotificationSettings settings) =>
@@ -272,21 +341,20 @@ public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsSt
     {
         if (!request.Confirmed)
             return (null, new() { ["confirmed"] = ["Review the clip, title and slot, then confirm."] });
-        var connection = await connections.GetAsync(PlatformKind.YouTubeShorts, cancellationToken);
+        var (pageId, mustChoose) = await connections.ResolveYouTubePageAsync(campaignId, cancellationToken);
+        if (mustChoose) return (null, new() { ["platform"] = [PlatformConnectionService.ChoosePage] });
+        var connection = await connections.GetAsync(PlatformKind.YouTubeShorts, pageId, cancellationToken);
         if (!connection.CanPublish) return (null, new() { ["platform"] = [connection.CapabilityMessage] });
         if (!YouTubeOAuthService.CanManageSchedule(connection.GrantedScopes))
             return (null, new() { ["platform"] = ["Reconnect YouTube once: scheduling needs permission to move and delete videos, not just upload them."] });
-        var settings = await settingsStore.GetScheduleAsync(cancellationToken);
         await Gate.WaitAsync(cancellationToken);
         try
         {
-            var now = DateTimeOffset.UtcNow;
-            var slot = await NextFreeSlotAsync(now + MinimumLead, null, cancellationToken);
-            var uploadAt = slot - TimeSpan.FromHours(Math.Clamp(settings.UploadWindowHours, 1, 72));
+            var slot = await NextFreeSlotAsync(DateTimeOffset.UtcNow + MinimumLead, null, pageId, cancellationToken);
             var created = await jobs.CreateAsync(campaignId, new CreatePublishJobRequest(PlatformKind.YouTubeShorts,
                     request.OutputRelativePath, Trim(request.Title, 100), request.Caption ?? string.Empty, "private", true,
                     Confirmed: true, IdempotencyKey: request.IdempotencyKey),
-                cancellationToken, new ScheduledUpload(slot, uploadAt > now ? uploadAt : now, request.EditPlanId));
+                cancellationToken, new ScheduledUpload(slot, request.EditPlanId));
             if (created.CampaignNotFound) return (null, new() { ["campaign"] = ["Campaign not found."] });
             return (created.Job, created.Errors);
         }
@@ -310,7 +378,7 @@ public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsSt
             if (job.Status is PublishStatus.Validating or PublishStatus.Uploading or PublishStatus.Processing)
                 return (null, "This clip is uploading right now. Take it off in a minute, once the upload finishes.");
 
-            var credentials = await connections.GetCredentialsAsync(PlatformKind.YouTubeShorts, cancellationToken)
+            var credentials = await connections.GetCredentialsAsync(PlatformKind.YouTubeShorts, job.ConnectionId, cancellationToken)
                 ?? new(StringComparer.OrdinalIgnoreCase);
             var freed = job.ScheduledPublishAt.Value;
             var wasHolding = Holding.Contains(job.Status);
@@ -331,18 +399,18 @@ public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsSt
             }
             await db.SaveChangesAsync(cancellationToken);
 
-            if (wasHolding) await CloseGapAsync(freed, credentials, notifications, cancellationToken);
+            if (wasHolding) await CloseGapAsync(freed, job.ConnectionId, credentials, notifications, cancellationToken);
             return (job, null);
         }
         finally { Gate.Release(); }
     }
 
-    private async Task CloseGapAsync(DateTimeOffset freed, Dictionary<string, string> credentials,
+    private async Task CloseGapAsync(DateTimeOffset freed, Guid? pageId, Dictionary<string, string> credentials,
         PhoneNotificationSettings notifications, CancellationToken cancellationToken)
     {
-        var settings = await settingsStore.GetScheduleAsync(cancellationToken);
         var later = await db.PublishJobs.Include(x => x.Campaign)
-            .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.ScheduledPublishAt > freed && Holding.Contains(x.Status))
+            .Where(x => x.Platform == PlatformKind.YouTubeShorts && x.ConnectionId == pageId && x.ScheduledPublishAt > freed
+                && Holding.Contains(x.Status))
             .ToListAsync(cancellationToken);
         var now = DateTimeOffset.UtcNow;
         var moves = PublishSlots.CloseGap(freed, later.Select(x => (x.Id, x.ScheduledPublishAt!.Value)), now + MinimumLead);
@@ -367,11 +435,6 @@ public sealed class YouTubeScheduleService(AppDbContext db, PublishingSettingsSt
             }
             else if (job.Status != PublishStatus.Queued) break;
             job.ScheduledPublishAt = slot;
-            if (job.Status == PublishStatus.Queued)
-            {
-                var uploadAt = slot - TimeSpan.FromHours(Math.Clamp(settings.UploadWindowHours, 1, 72));
-                job.NextAttemptAt = uploadAt > now ? uploadAt : now;
-            }
             job.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync(cancellationToken);
             await ScheduleNotificationAsync(job, notifications, cancellationToken);

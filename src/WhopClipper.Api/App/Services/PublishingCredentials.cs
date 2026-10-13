@@ -102,25 +102,111 @@ public sealed class PlatformConnectionService(AppDbContext db, IPublishingCreden
     private static readonly HashSet<string> SecretFields = new(StringComparer.OrdinalIgnoreCase)
         { "clientSecret", "accessToken", "refreshToken" };
 
+    public const string ChoosePage = "This campaign has no YouTube page chosen yet. Pick one under Review & export, beside Rendered clips.";
+
+    /// <summary>A platform's pages, oldest first. Only YouTube has more than one.</summary>
+    private IQueryable<PlatformConnection> Pages(PlatformKind platform) =>
+        db.PlatformConnections.Where(x => x.Platform == platform).OrderBy(x => x.CreatedAt).ThenBy(x => x.Id);
+
+    /// <summary>The page asked for, or the platform's first one when none is named.</summary>
+    private IQueryable<PlatformConnection> Page(PlatformKind platform, Guid? connectionId) =>
+        connectionId is { } id ? db.PlatformConnections.Where(x => x.Platform == platform && x.Id == id) : Pages(platform);
+
+    /// <summary>Every page of every platform, with a not-configured entry for a platform that has none.</summary>
     public async Task<IReadOnlyList<PlatformConnectionDto>> GetAllAsync(CancellationToken cancellationToken)
     {
-        var rows = await db.PlatformConnections.AsNoTracking().ToDictionaryAsync(x => x.Platform, cancellationToken);
-        return PlatformPublishingCatalog.Platforms.Select(platform =>
-            ToDto(platform, rows.GetValueOrDefault(platform))).ToList();
+        var rows = await db.PlatformConnections.AsNoTracking().OrderBy(x => x.CreatedAt).ThenBy(x => x.Id).ToListAsync(cancellationToken);
+        return PlatformPublishingCatalog.Platforms.SelectMany(platform =>
+        {
+            var pages = rows.Where(x => x.Platform == platform).ToList();
+            return pages.Count == 0 ? [ToDto(platform, null)] : pages.Select(x => ToDto(platform, x));
+        }).ToList();
     }
 
-    public async Task<PlatformConnectionDto> GetAsync(PlatformKind platform, CancellationToken cancellationToken)
+    public Task<PlatformConnectionDto> GetAsync(PlatformKind platform, CancellationToken cancellationToken) =>
+        GetAsync(platform, null, cancellationToken);
+
+    public async Task<PlatformConnectionDto> GetAsync(PlatformKind platform, Guid? connectionId, CancellationToken cancellationToken)
     {
-        var row = await db.PlatformConnections.AsNoTracking().SingleOrDefaultAsync(x => x.Platform == platform, cancellationToken);
+        var row = await Page(platform, connectionId).AsNoTracking().FirstOrDefaultAsync(cancellationToken);
         return ToDto(platform, row);
     }
 
+    /// <summary>
+    /// The YouTube page a campaign posts to: the one chosen for it, or the only page there is. With several
+    /// pages and none chosen there is no safe guess, because a wrong one posts to the wrong channel.
+    /// </summary>
+    public async Task<(Guid? PageId, bool MustChoose)> ResolveYouTubePageAsync(Guid campaignId, CancellationToken cancellationToken)
+    {
+        var pages = await Pages(PlatformKind.YouTubeShorts).AsNoTracking().Select(x => x.Id).ToListAsync(cancellationToken);
+        var chosen = await db.Campaigns.AsNoTracking().Where(x => x.Id == campaignId)
+            .Select(x => x.YouTubeConnectionId).SingleOrDefaultAsync(cancellationToken);
+        if (chosen is { } id && pages.Contains(id)) return (id, false);
+        return pages.Count == 1 ? (pages[0], false) : (null, pages.Count > 1);
+    }
+
+    /// <summary>Points a campaign at one of the YouTube pages, or clears the choice with null.</summary>
+    public async Task<(bool Found, string? Error)> SetCampaignYouTubePageAsync(Guid campaignId, Guid? pageId, CancellationToken cancellationToken)
+    {
+        var campaign = await db.Campaigns.SingleOrDefaultAsync(x => x.Id == campaignId, cancellationToken);
+        if (campaign is null) return (false, null);
+        if (pageId is { } id && !await db.PlatformConnections.AnyAsync(x => x.Id == id && x.Platform == PlatformKind.YouTubeShorts, cancellationToken))
+            return (true, "That YouTube page is no longer listed. Reload and pick again.");
+        // Clips already waiting keep the page they were scheduled on; only new ones follow the change.
+        campaign.YouTubeConnectionId = pageId;
+        campaign.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(cancellationToken);
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Adds another YouTube page. It starts with the same Google client as an existing page, so the only
+    /// thing left is to sign in and pick the channel.
+    /// </summary>
+    public async Task<(PlatformConnectionDto? Connection, Dictionary<string, string[]>? Errors)> AddYouTubePageAsync(
+        string? accountId, Guid? copyClientFrom, CancellationToken cancellationToken)
+    {
+        var label = accountId?.Trim();
+        if (string.IsNullOrWhiteSpace(label) || label.Length > 200 || label.Any(char.IsControl))
+            return (null, new() { ["accountId"] = ["Type the new page's channel handle, for example @yourchannel."] });
+        var existing = await Pages(PlatformKind.YouTubeShorts).AsNoTracking().ToListAsync(cancellationToken);
+        if (existing.Any(x => string.Equals(x.AccountIdentifier, label, StringComparison.OrdinalIgnoreCase)))
+            return (null, new() { ["accountId"] = ["A page with that handle is already listed."] });
+        var source = copyClientFrom is { } from ? existing.FirstOrDefault(x => x.Id == from) : existing.FirstOrDefault();
+        var credentials = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["accountId"] = label };
+        var client = ReadCredentials(source);
+        foreach (var key in new[] { "clientId", "clientSecret" })
+            if (client.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)) credentials[key] = value;
+        var row = new PlatformConnection { Platform = PlatformKind.YouTubeShorts };
+        Apply(row, credentials);
+        db.PlatformConnections.Add(row);
+        try { await db.SaveChangesAsync(cancellationToken); }
+        catch { vault.Delete(row.CredentialReference); throw; }
+        return (ToDto(PlatformKind.YouTubeShorts, row, credentials), null);
+    }
+
+    private void Apply(PlatformConnection row, IReadOnlyDictionary<string, string> credentials)
+    {
+        row.CredentialReference = vault.Store(row.Platform, credentials);
+        row.ConfiguredFieldsJson = JsonDefaults.StringArray(credentials.Where(x => !string.IsNullOrWhiteSpace(x.Value)).Select(x => x.Key));
+        row.SecretFlagsJson = JsonSerializer.Serialize(SecretFields.ToDictionary(x => x,
+            x => credentials.TryGetValue(x, out var value) && !string.IsNullOrWhiteSpace(value)), JsonDefaults.Serializer);
+        row.AccountIdentifier = credentials.GetValueOrDefault("accountId");
+        row.UpdatedAt = DateTimeOffset.UtcNow;
+    }
+
+    public Task<(PlatformConnectionDto? Connection, Dictionary<string, string[]>? Errors)> SaveAsync(
+        PlatformKind platform, SavePlatformConnectionRequest request, CancellationToken cancellationToken) =>
+        SaveAsync(platform, null, request, cancellationToken);
+
     public async Task<(PlatformConnectionDto? Connection, Dictionary<string, string[]>? Errors)> SaveAsync(
-        PlatformKind platform, SavePlatformConnectionRequest request, CancellationToken cancellationToken)
+        PlatformKind platform, Guid? connectionId, SavePlatformConnectionRequest request, CancellationToken cancellationToken)
     {
         var errors = Validate(platform, request);
         if (errors.Count > 0) return (null, errors);
-        var row = await db.PlatformConnections.SingleOrDefaultAsync(x => x.Platform == platform, cancellationToken);
+        var row = await Page(platform, connectionId).FirstOrDefaultAsync(cancellationToken);
+        if (row is null && connectionId is not null)
+            return (null, new() { ["connectionId"] = ["That page is no longer listed. Reload and try again."] });
         var credentials = ReadCredentials(row);
         foreach (var field in request.ClearFields ?? []) credentials.Remove(field);
         Set(credentials, "clientId", request.ClientId);
@@ -153,20 +239,54 @@ public sealed class PlatformConnectionService(AppDbContext db, IPublishingCreden
         return (ToDto(platform, row, credentials), null);
     }
 
-    public async Task<bool> DeleteAsync(PlatformKind platform, CancellationToken cancellationToken)
+    /// <summary>A YouTube page with its stored sign-in, for checks that span pages.</summary>
+    public sealed record YouTubePage(Guid Id, string Label, Dictionary<string, string> Credentials, DateTimeOffset? TokenExpiresAt);
+
+    public async Task<IReadOnlyList<YouTubePage>> YouTubePagesAsync(CancellationToken cancellationToken) =>
+        (await Pages(PlatformKind.YouTubeShorts).AsNoTracking().ToListAsync(cancellationToken)).Select(x =>
+        {
+            var credentials = ReadCredentials(x);
+            return new YouTubePage(x.Id, PageLabel(x.AccountIdentifier, credentials.GetValueOrDefault("channelTitle")), credentials, x.TokenExpiresAt);
+        }).ToList();
+
+    /// <summary>The handle typed for a page, with the channel name YouTube reports when the two differ.</summary>
+    public static string PageLabel(string? typed, string? channelTitle)
     {
-        var row = await db.PlatformConnections.SingleOrDefaultAsync(x => x.Platform == platform, cancellationToken);
-        if (row is null) return false;
+        var label = string.IsNullOrWhiteSpace(typed) ? "Unnamed page" : typed.Trim();
+        return string.IsNullOrWhiteSpace(channelTitle) || string.Equals(channelTitle, label.TrimStart('@'), StringComparison.OrdinalIgnoreCase)
+            ? label : $"{label} ({channelTitle})";
+    }
+
+    /// <summary>States in which a clip still depends on its page: waiting, uploading, or uploaded and not yet public.</summary>
+    private static readonly PublishStatus[] StillNeedsPage =
+        [PublishStatus.Queued, PublishStatus.Validating, PublishStatus.Uploading, PublishStatus.Processing, PublishStatus.Scheduled];
+
+    /// <returns>Whether the page existed, and why it could not be removed when it could not.</returns>
+    public async Task<(bool Found, string? Blocked)> DeleteAsync(PlatformKind platform, Guid? connectionId, CancellationToken cancellationToken)
+    {
+        var row = await Page(platform, connectionId).FirstOrDefaultAsync(cancellationToken);
+        if (row is null) return (false, null);
+        // Removing the sign-in would strand these: a waiting clip could not upload, and an uploaded one
+        // could no longer be taken off or moved.
+        var waiting = await db.PublishJobs.CountAsync(x => x.ConnectionId == row.Id && x.ScheduledPublishAt != null
+            && StillNeedsPage.Contains(x.Status), cancellationToken);
+        if (waiting > 0)
+            return (true, $"{waiting} clip{(waiting == 1 ? " is" : "s are")} still on this page's schedule. Take {(waiting == 1 ? "it" : "them")} off YouTube first, or wait until {(waiting == 1 ? "it has" : "they have")} gone public.");
         var reference = row.CredentialReference;
+        foreach (var campaign in await db.Campaigns.Where(x => x.YouTubeConnectionId == row.Id).ToListAsync(cancellationToken))
+            campaign.YouTubeConnectionId = null;
         db.PlatformConnections.Remove(row);
         await db.SaveChangesAsync(cancellationToken);
         vault.Delete(reference);
-        return true;
+        return (true, null);
     }
 
-    public async Task<PlatformConnectionDto> VerifyAsync(PlatformKind platform, CancellationToken cancellationToken)
+    public Task<PlatformConnectionDto> VerifyAsync(PlatformKind platform, CancellationToken cancellationToken) =>
+        VerifyAsync(platform, null, cancellationToken);
+
+    public async Task<PlatformConnectionDto> VerifyAsync(PlatformKind platform, Guid? connectionId, CancellationToken cancellationToken)
     {
-        var row = await db.PlatformConnections.SingleOrDefaultAsync(x => x.Platform == platform, cancellationToken);
+        var row = await Page(platform, connectionId).FirstOrDefaultAsync(cancellationToken);
         if (row is null) return ToDto(platform, null);
         var credentials = ReadCredentials(row);
         var readiness = Readiness(platform, credentials, row.TokenExpiresAt, row.LastError);
@@ -194,16 +314,23 @@ public sealed class PlatformConnectionService(AppDbContext db, IPublishingCreden
         return ToDto(platform, row, credentials);
     }
 
-    public async Task<Dictionary<string, string>?> GetCredentialsAsync(PlatformKind platform, CancellationToken cancellationToken)
+    public Task<Dictionary<string, string>?> GetCredentialsAsync(PlatformKind platform, CancellationToken cancellationToken) =>
+        GetCredentialsAsync(platform, null, cancellationToken);
+
+    public async Task<Dictionary<string, string>?> GetCredentialsAsync(PlatformKind platform, Guid? connectionId, CancellationToken cancellationToken)
     {
-        var row = await db.PlatformConnections.AsNoTracking().SingleOrDefaultAsync(x => x.Platform == platform, cancellationToken);
+        var row = await Page(platform, connectionId).AsNoTracking().FirstOrDefaultAsync(cancellationToken);
         return row is null ? null : ReadCredentials(row);
     }
 
-    public async Task SaveCredentialSetAsync(PlatformKind platform, IReadOnlyDictionary<string, string> credentials,
+    public Task SaveCredentialSetAsync(PlatformKind platform, IReadOnlyDictionary<string, string> credentials,
+        DateTimeOffset? tokenExpiresAt, CancellationToken cancellationToken) =>
+        SaveCredentialSetAsync(platform, null, credentials, tokenExpiresAt, cancellationToken);
+
+    public async Task SaveCredentialSetAsync(PlatformKind platform, Guid? connectionId, IReadOnlyDictionary<string, string> credentials,
         DateTimeOffset? tokenExpiresAt, CancellationToken cancellationToken)
     {
-        var row = await db.PlatformConnections.SingleOrDefaultAsync(x => x.Platform == platform, cancellationToken)
+        var row = await Page(platform, connectionId).FirstOrDefaultAsync(cancellationToken)
             ?? throw new InvalidOperationException("Platform connection no longer exists.");
         var oldReference = row.CredentialReference;
         var newReference = vault.Store(platform, credentials);
@@ -238,7 +365,8 @@ public sealed class PlatformConnectionService(AppDbContext db, IPublishingCreden
             SecretFields.ToDictionary(x => x, x => credentials.TryGetValue(x, out var value) && !string.IsNullOrWhiteSpace(value), StringComparer.OrdinalIgnoreCase),
             row?.AccountIdentifier, row is null ? [] : JsonDefaults.Parse(row.GrantedScopesJson, Array.Empty<string>()),
             row?.TokenExpiresAt, row?.UpdatedAt, row?.LastValidatedAt,
-            CleanError(row?.LastError), canPublish, string.IsNullOrWhiteSpace(row?.LastError) ? capability : CleanError(row.LastError)!);
+            CleanError(row?.LastError), canPublish, string.IsNullOrWhiteSpace(row?.LastError) ? capability : CleanError(row.LastError)!,
+            row?.Id, credentials.GetValueOrDefault("channelTitle"));
     }
 
     internal static (bool CanPublish, string Message) Readiness(PlatformKind platform,
@@ -354,13 +482,13 @@ public sealed class YouTubeOAuthStateStore(IOptions<PublishingApiOptions> option
 {
     private readonly ConcurrentDictionary<string, YouTubeOAuthState> _states = new(StringComparer.Ordinal);
 
-    public YouTubeOAuthState Create(string redirectUri)
+    public YouTubeOAuthState Create(string redirectUri, Guid? connectionId = null)
     {
         Prune();
         var state = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
         var verifier = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(48));
         var record = new YouTubeOAuthState(state, verifier, redirectUri,
-            DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(options.Value.OAuthStateMinutes, 2, 30)));
+            DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(options.Value.OAuthStateMinutes, 2, 30)), connectionId);
         _states[state] = record;
         return record;
     }
@@ -379,7 +507,9 @@ public sealed class YouTubeOAuthStateStore(IOptions<PublishingApiOptions> option
     }
 }
 
-public sealed record YouTubeOAuthState(string State, string CodeVerifier, string RedirectUri, DateTimeOffset ExpiresAt)
+/// <param name="ConnectionId">The YouTube page this sign-in is for. Null is the first page.</param>
+public sealed record YouTubeOAuthState(string State, string CodeVerifier, string RedirectUri, DateTimeOffset ExpiresAt,
+    Guid? ConnectionId = null)
 {
     public string CodeChallenge => WebEncoders.Base64UrlEncode(SHA256.HashData(Encoding.ASCII.GetBytes(CodeVerifier)));
 }

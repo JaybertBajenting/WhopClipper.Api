@@ -70,10 +70,11 @@ public sealed record LocalSourceScanDto(int Attached, int Added, int AlreadyKnow
 /// hashtags and mentions already in it. A missing required hashtag gets a clip rejected.</param>
 /// <param name="Drive">Set when the clip's video has been moved to Google Drive: it stays listed, with its
 /// thumbnail, until it is brought back.</param>
+/// <param name="Car">Whether this is a car clip: what the clip list's "Cars only" switch keeps.</param>
 public sealed record RenderedClipDto(string RelativePath, string FileName, string Platform, long SizeBytes,
     DateTimeOffset CreatedAt, Guid? EditPlanId, double? StartSeconds, double? EndSeconds,
     string Title = "", string Caption = "", RenderedClipStyleDto? Style = null, RenderedClipDriveDto? Drive = null,
-    string? SourceTitle = null, DateOnly? SourcePublishedOn = null);
+    string? SourceTitle = null, DateOnly? SourcePublishedOn = null, bool Car = false);
 public sealed record RenderedClipDriveDto(string Remote, DateTimeOffset MovedAt, long Bytes);
 /// <summary>What "Move campaign to Drive" would move for a campaign, counted on this PC before anything is sent.</summary>
 /// <param name="ClipBytes">What the clips free on this PC, their music-free previews included.</param>
@@ -88,10 +89,11 @@ public sealed record InspectSourceRequest(string Url);
 public sealed record StartDownloadRequest(Guid SourceAssetId, string? Quality = null, bool Refresh = false);
 /// <summary>Queues the whole download-to-clips pipeline for each video, one at a time.</summary>
 /// <param name="Urls">Videos not already registered are added to the campaign first.</param>
+/// <param name="Focus">"cars" makes car clips: only moments where a car is on screen. Null is an ordinary run.</param>
 public sealed record StartSourcePipelineRequest(IReadOnlyList<Guid>? SourceAssetIds = null,
     IReadOnlyList<string>? Urls = null, PlatformKind Platform = PlatformKind.TikTok, int MaxClips = 8,
     bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude, string? Quality = null,
-    string? Framing = null, double? HookYFraction = null);
+    string? Framing = null, double? HookYFraction = null, string? Focus = null);
 /// <summary>Works the campaign's outstanding clip bank without naming each source.</summary>
 /// <param name="MaxSources">Caps how many are queued in one go; null queues every outstanding one.</param>
 /// <param name="DryRun">Reports what would run without queueing anything. Each source is a
@@ -138,7 +140,7 @@ public sealed record EditPlanExtrasDto(string Framing, string? CtaOverlayText, s
     IReadOnlyList<ColorFlashDto>? ColorFlashes = null, IReadOnlyList<ZoomPunchDto>? ZoomPunches = null,
     PodcastSplitPlanDto? PodcastSplit = null, double? MusicStartSeconds = null,
     double? VoiceVolume = null, double? MusicVolume = null, string? Caption = null,
-    string? Title = null, bool MusicNeedsRender = false, NarratedPlanDto? Narrated = null);
+    string? Title = null, bool MusicNeedsRender = false, NarratedPlanDto? Narrated = null, bool? Car = null);
 public sealed record CreateEditPlanRequest(Guid SourceAssetId, PlatformKind Platform, double StartSeconds, double EndSeconds,
     int? Width, int? Height, int? FramesPerSecond, int? Crf, bool NormalizeAudio, bool BurnSubtitles,
     string? SubtitleRelativePath, Guid? MusicAssetId, double? MusicVolume, string? OutputFileName, bool IsApproved,

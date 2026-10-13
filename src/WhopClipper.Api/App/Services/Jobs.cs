@@ -13,7 +13,12 @@ namespace WhopClipper.Api.App.Services;
 
 public sealed record SourceJobPayload(Guid SourceAssetId, bool Refresh = false, string? Quality = null);
 public sealed record AiJobPayload(Guid AnalysisRunId, Guid SourceAssetId, AiMode Mode, PlatformKind Platform, string? Transcript);
-public sealed record RenderJobPayload(Guid EditPlanId, Guid? MusicRemixFromPlanId = null);
+/// <param name="CarShots">A narrated clip is cut again as a car clip before it renders: new opening shots from where a
+/// car is on screen, framed on the car. Its narration is kept.</param>
+/// <param name="StoryShots">A narrated clip is cut again to show what it is about, a car or not: new opening shots
+/// from wherever the video shows what the narrator names. Its narration is kept.</param>
+public sealed record RenderJobPayload(Guid EditPlanId, Guid? MusicRemixFromPlanId = null, bool CarShots = false,
+    bool StoryShots = false);
 /// <param name="Manual">Footage Matthew picked in the B-roll editor. When set, no AI plans or searches anything:
 /// these shots, in order, fill the marked shots exactly.</param>
 public sealed record BrollRepairJobPayload(Guid EditPlanId, double StartSeconds, double EndSeconds,
@@ -36,10 +41,14 @@ public sealed record ValidateJobPayload(string OutputRelativePath, double Expect
 /// <param name="EditStyle">Overrides the campaign's stored style for this run. Null follows the campaign.</param>
 /// <param name="Stories">Pieces chosen by hand. When set, story selection is skipped and exactly these
 /// are built - how a reference short is recreated from the moments it was cut from.</param>
+/// <param name="Focus">What the run is steered toward; null is an ordinary run. "cars" (<see cref="PipelineFocus.Cars"/>)
+/// makes car clips in the narrated style: the video's thumbnails are looked at first, and every moment and opening
+/// shot comes from where a car is on screen.</param>
 public sealed record SourcePipelineJobPayload(Guid SourceAssetId, PlatformKind Platform = PlatformKind.TikTok,
     int MaxClips = 8, bool DeleteSourceWhenDone = true, AiMode Mode = AiMode.Claude,
     string? Quality = null, string Framing = "SmartCrop", double? HookYFraction = 0.012,
-    bool ApplyStyling = true, string? EditStyle = null, IReadOnlyList<ImportedStoryDto>? Stories = null);
+    bool ApplyStyling = true, string? EditStyle = null, IReadOnlyList<ImportedStoryDto>? Stories = null,
+    string? Focus = null);
 
 public sealed class JobQueue
 {
@@ -879,6 +888,13 @@ public sealed partial class JobExecutionService(AppDbContext db, IProcessRunner 
         // which is never downloaded whole for this style.
         if (IsNarratedPlan(plan))
         {
+            if (payload.CarShots || payload.StoryShots)
+            {
+                var footage = await RecutNarratedWithCarShotsAsync(plan, payload.CarShots, cancellationToken);
+                try { await RenderNarratedAsync(job, plan, cancellationToken); }
+                finally { ReleaseNarratedMedia(footage); }
+                return;
+            }
             await RenderNarratedAsync(job, plan, cancellationToken);
             return;
         }

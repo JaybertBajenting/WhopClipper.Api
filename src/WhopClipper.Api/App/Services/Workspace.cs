@@ -44,6 +44,11 @@ public sealed class AppOptions
     /// </summary>
     public bool AllowWindowsVoice { get; set; }
     /// <summary>
+    /// Turns the phone app's PC half on: its Publishing screen, its endpoints and the saves to Firebase. Off by
+    /// default, so an install carries the code without showing or running any of it.
+    /// </summary>
+    public bool PhoneCompanion { get; set; }
+    /// <summary>
     /// Caps x264 encoder threads. Each thread holds its own frame buffers, so on a machine with
     /// little free memory a vertical 1080x1920 encode fails at encoder open with nothing but an
     /// x264 malloc error. 0 leaves FFmpeg to pick, which is one thread per core.

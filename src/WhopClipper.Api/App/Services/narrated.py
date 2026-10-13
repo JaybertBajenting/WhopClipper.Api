@@ -3,7 +3,9 @@
   faces <spec.json> <out.json>     where the main face is at given moments of given files
   overlays <spec.json> <out.json>  the meme title, the red arrow and the skull as transparent PNGs
   sheet <spec.json> <out.json>     labelled frame rows of candidate montage shots, for an AI to look at
-  drops <spec.json> <out.json>     where a song slams back in after a quiet stretch, for timing the ending to it
+  cuts <spec.json> <out.json>      where each file jumps from one shot to another
+  storyboard <spec.json> <out.json>  YouTube's preview thumbnails of a whole video as time-labelled sheets
+  drops<spec.json> <out.json>     where a song slams back in after a quiet stretch, for timing the ending to it
   sfx <spec.json> <out.json>       the opening bell and the hand-over camera shutter, as WAV files at playing level
 
 Every spec is JSON so no path or title ever passes through a command line.
@@ -202,6 +204,146 @@ def sheet(spec, out):
     write(out, {"sheets": paths})
 
 
+# ---------------------------------------------------------------- cuts
+
+def cuts(spec, out):
+    """Where each file jumps from one shot to another. A few seconds taken out of a vlog often straddle one of its
+    own cuts, and a montage candidate that does shows two things: the three frames looked at were once a grey
+    Lamborghini, the same again, and a purple Dodge. A cut is a frame whose colours no longer match the one before
+    it (histogram correlation under 0.5) and whose picture has also changed a lot; a camera move changes the
+    picture but keeps the colours, and a flash changes the colours for one frame only, so neither counts."""
+    import cv2
+    import numpy as np
+    result = {}
+    for item in spec["items"]:
+        capture = cv2.VideoCapture(item["file"])
+        fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+        found, previous_hist, previous_gray, index, last, bars = [], None, None, 0, -1.0, None
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            small = cv2.resize(frame, (160, 90))
+            if index % 15 == 0:
+                columns = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).max(axis=0).astype(np.float32)
+                bars = columns if bars is None else np.maximum(bars, columns)
+            hist = cv2.calcHist([cv2.cvtColor(small, cv2.COLOR_BGR2HSV)], [0, 1, 2], None, [8, 4, 4], [0, 180, 0, 256, 0, 256])
+            cv2.normalize(hist, hist)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            if previous_hist is not None:
+                same = cv2.compareHist(previous_hist, hist, cv2.HISTCMP_CORREL)
+                moved = float(np.mean(np.abs(gray - previous_gray))) / 255.0
+                at = index / fps
+                if same < 0.5 and moved > 0.08 and at - last > 0.3:
+                    found.append(round(at, 3))
+                    last = at
+            previous_hist, previous_gray = hist, gray
+            index += 1
+        capture.release()
+        # Phone footage dropped into a vlog sits between black bars. Where the picture really starts and ends across
+        # the frame, as fractions, read off the brightest of a few frames so a dark scene is not taken for bars.
+        left, right = 0.0, 1.0
+        if bars is not None:
+            lit = np.where(bars > 14)[0]
+            if len(lit) > 0:
+                left, right = round(float(lit[0]) / len(bars), 4), round(float(lit[-1] + 1) / len(bars), 4)
+        result[item["file"]] = {"cuts": found, "seconds": round(index / fps, 3), "left": left, "right": right}
+    write(out, result)
+
+
+# ---------------------------------------------------------------- storyboard
+
+def storyboard_images(raw):
+    """The pictures inside the .mhtml yt-dlp saves for a storyboard format, in order. Each is a grid of thumbnails.
+    YouTube names them .jpg and sends WebP, so every part is simply offered to Pillow."""
+    import io
+    import re
+    from PIL import Image
+    images = []
+    boundary = re.search(rb'boundary="?([^";\r\n]+)', raw[:4000])
+    if boundary:
+        for part in raw.split(b"--" + boundary.group(1)):
+            head, gap, body = part.partition(b"\r\n\r\n")
+            if not gap or b"image/" not in head.lower():
+                continue
+            try:
+                images.append(Image.open(io.BytesIO(body)).convert("RGB"))
+            except Exception:
+                pass
+    if images:
+        return images
+    at = 0
+    while True:  # no readable parts: look for the WebP files themselves, "RIFF" + length + "WEBP"
+        start = raw.find(b"RIFF", at)
+        if start < 0:
+            return images
+        if raw[start + 8:start + 12] == b"WEBP":
+            size = int.from_bytes(raw[start + 4:start + 8], "little") + 8
+            images.append(Image.open(io.BytesIO(raw[start:start + size])).convert("RGB"))
+            at = start + size
+        else:
+            at = start + 4
+
+
+def storyboard(spec, out):
+    """YouTube keeps a small thumbnail of every few seconds of a video: the ones shown when hovering over the
+    timeline. This cuts them out of their grids and lays them on sheets small enough for an AI to read at full
+    size, each thumbnail labelled with its time, so the whole video can be looked at for a few megabytes."""
+    from PIL import Image, ImageDraw, ImageFont
+    with open(spec["mhtml"], "rb") as handle:
+        grids = storyboard_images(handle.read())
+    if not grids:
+        raise ValueError("The storyboard file holds no pictures.")
+    seconds = float(spec["seconds"])
+    columns, rows = int(spec.get("columns") or 3), int(spec.get("rows") or 3)
+    tile_w = int(spec.get("tileWidth") or grids[0].width // columns)
+    tile_h = int(spec.get("tileHeight") or grids[0].height // rows)
+    tiles = []
+    for grid in grids:
+        for y in range(0, grid.height - tile_h + 1, tile_h):
+            for x in range(0, grid.width - tile_w + 1, tile_w):
+                tiles.append(grid.crop((x, y, x + tile_w, y + tile_h)))
+
+    def blank(tile):
+        return tile.resize((8, 8)).convert("L").getextrema()[1] <= 12
+
+    # The last grid is padded with black. yt-dlp's frame rate says how many thumbnails are real; without it, only
+    # trailing black ones are dropped, because a black thumbnail in the middle is a real, dark moment.
+    rate = float(spec.get("fps") or 0)
+    count = min(len(tiles), int(round(seconds * rate))) if rate > 0 else len(tiles)
+    while count > 1 and blank(tiles[count - 1]):
+        count -= 1
+    tiles = tiles[:count]
+    interval = seconds / count
+    # YouTube takes them every 1, 2, 5 or 10 seconds; seconds / count comes out a touch under and drifts by the end.
+    for known in (1, 2, 5, 10):
+        if abs(interval - known) / known <= 0.06:
+            interval = float(known)
+
+    def label(index):  # the last thumbnail is the video's last frame, which a whole interval would put past its end
+        return int(min(round(index * interval), max(0, seconds - 1)))
+
+    across, down, cell_w, cell_h, strip = 8, 5, 196, 110, 16
+    font = ImageFont.truetype(first_existing(TEXT_FONTS), 12)
+    paths, ranges = [], []
+    per_sheet = across * down
+    for first in range(0, count, per_sheet):
+        group = tiles[first:first + per_sheet]
+        lines = (len(group) + across - 1) // across
+        page = Image.new("RGB", (across * cell_w, lines * (cell_h + strip)), "black")
+        draw = ImageDraw.Draw(page)
+        for index, tile in enumerate(group):
+            x, y = (index % across) * cell_w, (index // across) * (cell_h + strip)
+            at = label(first + index)
+            page.paste(tile.resize((cell_w, cell_h)), (x, y + strip))
+            draw.text((x + 3, y), f"{at}s  ({at // 60}:{at % 60:02d})", fill="white", font=font)
+        path = os.path.abspath(f"{spec['outPrefix']}-{first // per_sheet + 1}.jpg")
+        page.save(path, quality=85)
+        paths.append(path)
+        ranges.append([label(first), label(first + len(group) - 1)])
+    write(out, {"sheets": paths, "ranges": ranges, "frames": count, "intervalSeconds": interval})
+
+
 # ---------------------------------------------------------------- music drops
 
 def drops(spec, out):
@@ -330,7 +472,8 @@ def write(path, value):
 
 
 def main():
-    modes = {"faces": faces, "overlays": overlays, "sheet": sheet, "drops": drops, "sfx": sfx}
+    modes = {"faces": faces, "overlays": overlays, "sheet": sheet, "cuts": cuts, "storyboard": storyboard, "drops": drops,
+             "sfx": sfx}
     if len(sys.argv) != 4 or sys.argv[1] not in modes:
         print(__doc__, file=sys.stderr)
         return 2

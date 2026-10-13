@@ -151,6 +151,9 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<string>("WhopUrl")
                         .HasColumnType("text");
 
+                    b.Property<Guid?>("YouTubeConnectionId")
+                        .HasColumnType("uuid");
+
                     b.HasKey("Id");
 
                     b.HasIndex("Status");
@@ -600,8 +603,7 @@ namespace WhopClipper.Api.App.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("Platform")
-                        .IsUnique();
+                    b.HasIndex("Platform");
 
                     b.ToTable("PlatformConnections", "clipper");
                 });
@@ -700,6 +702,9 @@ namespace WhopClipper.Api.App.Data.Migrations
                     b.Property<string>("Caption")
                         .IsRequired()
                         .HasColumnType("text");
+
+                    b.Property<Guid?>("ConnectionId")
+                        .HasColumnType("uuid");
 
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
@@ -807,6 +812,8 @@ namespace WhopClipper.Api.App.Data.Migrations
 
                     b.HasIndex("IdempotencyKey")
                         .IsUnique();
+
+                    b.HasIndex("ConnectionId", "ScheduledPublishAt");
 
                     b.HasIndex("Platform", "ScheduledPublishAt");
 

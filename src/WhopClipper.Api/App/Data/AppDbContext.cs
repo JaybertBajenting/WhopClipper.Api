@@ -61,7 +61,8 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
         modelBuilder.Entity<PlatformConnection>().Property(x => x.Platform).HasConversion<string>();
         modelBuilder.Entity<PlatformConnection>().Property(x => x.CredentialReference).HasMaxLength(256);
         modelBuilder.Entity<PlatformConnection>().Property(x => x.AccountIdentifier).HasMaxLength(500);
-        modelBuilder.Entity<PlatformConnection>().HasIndex(x => x.Platform).IsUnique();
+        // Not unique: YouTube can have several pages, each its own sign-in.
+        modelBuilder.Entity<PlatformConnection>().HasIndex(x => x.Platform);
         modelBuilder.Entity<PublishJob>().Property(x => x.Platform).HasConversion<string>();
         modelBuilder.Entity<PublishJob>().Property(x => x.Status).HasConversion<string>();
         modelBuilder.Entity<PublishJob>().Property(x => x.IdempotencyKey).HasMaxLength(200);
@@ -73,6 +74,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
         modelBuilder.Entity<PublishJob>().HasIndex(x => x.FinalPublishIdempotencyKey).IsUnique();
         modelBuilder.Entity<PublishJob>().HasIndex(x => new { x.Status, x.CreatedAt });
         modelBuilder.Entity<PublishJob>().HasIndex(x => new { x.Platform, x.ScheduledPublishAt });
+        modelBuilder.Entity<PublishJob>().HasIndex(x => new { x.ConnectionId, x.ScheduledPublishAt });
         modelBuilder.Entity<Campaign>().HasMany(x => x.PublishJobs).WithOne(x => x.Campaign)
             .HasForeignKey(x => x.CampaignId).OnDelete(DeleteBehavior.Cascade);
 
