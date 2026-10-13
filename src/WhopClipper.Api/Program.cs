@@ -119,6 +119,11 @@ builder.Services.AddScoped<PublishingSettingsStore>();
 builder.Services.AddScoped<VoiceOverSettingsStore>();
 builder.Services.AddSingleton<ElevenLabsClient>();
 builder.Services.AddScoped<PhoneNotifier>();
+builder.Services.AddSingleton<PhoneCompanionRuntime>();
+builder.Services.AddSingleton<PhoneThumbnails>();
+builder.Services.AddScoped<PhoneCompanionService>();
+builder.Services.AddHttpClient("PhoneFirebase", client => client.Timeout = TimeSpan.FromSeconds(25))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 builder.Services.AddScoped<YouTubeScheduleService>();
 builder.Services.AddScoped<DriveArchive>();
 builder.Services.AddHttpClient("PublishingExternal", client => client.Timeout = Timeout.InfiniteTimeSpan)
@@ -139,6 +144,8 @@ if (builder.Configuration.GetValue("WhopClipper:RunPublishingWorkers", true))
 {
     builder.Services.AddHostedService<PublishingWorker>();
     builder.Services.AddHostedService<YouTubeScheduleWorker>();
+    if (builder.Configuration.GetValue("WhopClipper:PhoneCompanion", false))
+        builder.Services.AddHostedService<PhoneCompanionWorker>();
 }
 
 var allowedOrigins = builder.Configuration.GetSection("WhopClipper:AllowedOrigins").Get<string[]>() ?? ["http://localhost:5173"];

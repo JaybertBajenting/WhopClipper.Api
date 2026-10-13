@@ -10,21 +10,36 @@ public static class YouTubeScheduleEndpoints
     {
         var publishing = api.MapGroup("/publishing").WithTags("Publishing");
 
-        publishing.MapGet("/youtube-schedule", async (YouTubeScheduleService service, CancellationToken ct) =>
-            Results.Ok(await service.GetAsync(ct)));
+        publishing.MapGet("/youtube-schedule", async (Guid? pageId, YouTubeScheduleService service, CancellationToken ct) =>
+            Results.Ok(await service.GetAsync(pageId, null, ct)));
 
-        publishing.MapPut("/youtube-schedule/settings", async (YouTubeScheduleSettingsDto request, HttpContext context,
+        // The schedule of the page this campaign posts to, with the campaign's own clips on it.
+        api.MapGet("/campaigns/{campaignId:guid}/publishing/youtube-schedule", async (Guid campaignId,
+            YouTubeScheduleService service, CancellationToken ct) =>
+            Results.Ok(await service.GetAsync(null, campaignId, ct))).WithTags("Publishing");
+
+        api.MapPut("/campaigns/{campaignId:guid}/publishing/youtube-page", async (Guid campaignId,
+            SetCampaignYouTubePageRequest request, HttpContext context, LocalPublishingRequestGuard guard,
+            PlatformConnectionService connections, YouTubeScheduleService service, CancellationToken ct) =>
+        {
+            if (!guard.IsValid(context)) return Forbidden();
+            var result = await connections.SetCampaignYouTubePageAsync(campaignId, request.PageId, ct);
+            if (result.Error is not null)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["pageId"] = [result.Error] });
+            return result.Found ? Results.Ok(await service.GetAsync(null, campaignId, ct)) : Results.NotFound();
+        }).WithTags("Publishing");
+
+        publishing.MapPut("/youtube-schedule/settings", async (Guid? pageId, YouTubeScheduleSettingsDto request, HttpContext context,
             LocalPublishingRequestGuard guard, PublishingSettingsStore store, YouTubeScheduleService service, CancellationToken ct) =>
         {
             if (!guard.IsValid(context)) return Forbidden();
             var slots = request.Slots.Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
             if (slots.Count is 0 or > 12 || PublishSlots.Parse(slots).Count != slots.Distinct().Count())
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["slots"] = ["Give 1 to 12 distinct times as HH:mm, e.g. 23:00."] });
-            if (request.UploadWindowHours is < 1 or > 72)
-                return Results.ValidationProblem(new Dictionary<string, string[]> { ["uploadWindowHours"] = ["Upload between 1 and 72 hours before the slot."] });
-            await store.SaveScheduleAsync(new YouTubeScheduleSettings(slots, PublishSlots.Zone(request.TimeZoneId).Id,
-                request.UploadWindowHours), ct);
-            return Results.Ok(await service.GetAsync(ct));
+            // Saved against the page the screen is showing, which is the first page when none is named.
+            var shown = (await service.GetAsync(pageId, null, ct)).PageId;
+            await store.SaveScheduleAsync(shown, new YouTubeScheduleSettings(slots, PublishSlots.Zone(request.TimeZoneId).Id), ct);
+            return Results.Ok(await service.GetAsync(shown, null, ct));
         });
 
         api.MapPost("/campaigns/{campaignId:guid}/publishing/youtube-schedule", async (Guid campaignId,

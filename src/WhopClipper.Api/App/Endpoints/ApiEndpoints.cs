@@ -16,6 +16,25 @@ public static class ApiEndpoints
     public static IEndpointRouteBuilder MapWhopClipperApi(this IEndpointRouteBuilder app)
     {
         var api = app.MapGroup("/api");
+        // The phone app's PC half is switched off unless WhopClipper:PhoneCompanion is set. The Publishing page asks
+        // here whether to show its screen.
+        var phoneCompanion = app.ServiceProvider.GetRequiredService<IOptions<AppOptions>>().Value.PhoneCompanion;
+        api.MapGet("/publishing/phone-app/enabled", () => Results.Ok(new { enabled = phoneCompanion })).WithTags("Phone app");
+        // Persist phone changes before completing schedule/campaign writes, with background retry
+        // if Firebase is offline. Phone sync cannot turn a successful local edit into a failed edit.
+        if (phoneCompanion) api.AddEndpointFilter(async (context, next) =>
+        {
+            var result = await next(context);
+            var request = context.HttpContext.Request;
+            var path = request.Path.Value ?? "";
+            var write = HttpMethods.IsPost(request.Method) || HttpMethods.IsPut(request.Method)
+                || HttpMethods.IsDelete(request.Method) || HttpMethods.IsPatch(request.Method);
+            if (write && !path.StartsWith("/api/publishing/phone-app", StringComparison.Ordinal)
+                && (path.StartsWith("/api/campaigns", StringComparison.Ordinal) || path.StartsWith("/api/publishing", StringComparison.Ordinal))
+                && (result is not Microsoft.AspNetCore.Http.IStatusCodeHttpResult status || status.StatusCode is null or < 400))
+                await context.HttpContext.RequestServices.GetRequiredService<PhoneCompanionService>().TrySyncAsync(request.HttpContext.RequestAborted);
+            return result;
+        });
         MapDashboard(api);
         MapCampaigns(api);
         MapJobs(api);
@@ -24,6 +43,7 @@ public static class ApiEndpoints
         MapMediaLibrary(api);
         MapSettings(api);
         PublishingEndpoints.Map(api);
+        if (phoneCompanion) PhoneCompanionEndpoints.Map(api);
         YouTubeScheduleEndpoints.Map(api);
         VoiceOverEndpoints.Map(api);
         NarratedEndpoints.Map(api);
@@ -98,17 +118,20 @@ public static class ApiEndpoints
         });
 
         campaigns.MapPut("/{id:guid}", async (Guid id, UpdateCampaignRequest request, IValidator<UpdateCampaignRequest> validator,
-            AppDbContext db, CancellationToken ct) =>
+            AppDbContext db, YouTubeScheduleService schedule, CancellationToken ct) =>
         {
             var invalid = await Validate(request, validator, ct); if (invalid is not null) return invalid;
             var campaign = await db.Campaigns.SingleOrDefaultAsync(x => x.Id == id, ct);
             if (campaign is null) return Results.NotFound();
+            // Phone notifications that are already set carry this campaign's name and link.
+            var notified = (campaign.Name, campaign.WhopUrl);
             campaign.Name = request.Name.Trim(); campaign.WhopUrl = request.WhopUrl; campaign.CampaignType = request.CampaignType ?? "Clipping";
             campaign.Brand = request.Brand; campaign.Category = request.Category; campaign.PayoutAmount = request.PayoutAmount;
             campaign.PayoutPerViews = request.PayoutPerViews; campaign.PayoutUnit = request.PayoutUnit; campaign.Deadline = request.Deadline;
             campaign.Notes = request.Notes; campaign.RawInstructions = request.RawInstructions ?? string.Empty;
             campaign.Status = request.Status; campaign.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync(ct);
+            if (notified != (campaign.Name, campaign.WhopUrl)) await schedule.RefreshNotificationsAsync(id, ct);
             return Results.Ok((await DetailQuery(db).SingleAsync(x => x.Id == id, ct)).ToDetail());
         });
 
@@ -286,6 +309,14 @@ public static class ApiEndpoints
             var urls = (request.Urls ?? []).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
             if (request.SourceAssetIds is { Count: 0 } && urls.Count == 0)
                 return Results.BadRequest(new { error = "Give at least one source id or URL." });
+            if (!PipelineFocus.IsKnown(request.Focus))
+                return Results.BadRequest(new { error = "The only focus a run can have is \"cars\"." });
+            // Car clips are a way of cutting the narrated style; any other style would ignore the focus and run as usual.
+            if (PipelineFocus.Normalise(request.Focus) is not null &&
+                JsonDefaults.Parse<CampaignEditStyleDto?>(
+                    await db.Campaigns.Where(x => x.Id == id).Select(x => x.EditStyleJson).SingleAsync(ct), null)
+                    is not { Style: EditStyles.NarratedLuxury })
+                return Results.BadRequest(new { error = "Car clips are made in the narrated style, and this campaign uses another one." });
 
             var sourceIds = new List<Guid>(request.SourceAssetIds ?? []);
             foreach (var url in urls)
@@ -311,7 +342,8 @@ public static class ApiEndpoints
                 var job = await coordinator.CreateAsync(id, JobKind.SourcePipeline,
                     new SourcePipelineJobPayload(sourceId, request.Platform, request.MaxClips,
                         request.DeleteSourceWhenDone, request.Mode, request.Quality,
-                        request.Framing ?? "SmartCrop", request.HookYFraction), ct);
+                        request.Framing ?? "SmartCrop", request.HookYFraction,
+                        Focus: PipelineFocus.Normalise(request.Focus)), ct);
                 queued.Add(job.ToDto());
             }
             return Results.Accepted($"/api/jobs", queued);
@@ -863,13 +895,14 @@ public static class ApiEndpoints
             // platform profile, and uploading by hand without them gets a clip rejected.
             var profiles = await db.PlatformProfiles.AsNoTracking().Where(x => x.CampaignId == id).ToListAsync(ct);
             // Each clip says which video it was cut from and when that video came out; the list is newest video first.
+            // It also says whether it is a car clip, for the list's "Cars only" switch.
             var sources = (await db.SourceAssets.AsNoTracking().Where(x => x.CampaignId == id)
                     .Select(x => new { x.Id, x.Title, x.Url, x.MetadataJson }).ToListAsync(ct))
                 .ToDictionary(x => x.Id, x => (Title: x.Title ?? x.Url, Day: SourceDates.PublishedOn(x.MetadataJson)));
             RenderedClipDto WithSource(RenderedClipDto clip, EditPlan? plan) =>
-                plan is not null && sources.TryGetValue(plan.SourceAssetId, out var source)
+                (plan is not null && sources.TryGetValue(plan.SourceAssetId, out var source)
                     ? clip with { SourceTitle = source.Title, SourcePublishedOn = source.Day }
-                    : clip;
+                    : clip) with { Car = ClipTopics.IsCar(plan, clip.Title, clip.Caption) };
 
             var clips = Directory.EnumerateFiles(outputRoot, "*", SearchOption.AllDirectories)
                 .Where(x => RenderedClipExtensions.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase))

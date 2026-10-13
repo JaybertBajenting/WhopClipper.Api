@@ -39,8 +39,8 @@ public static class PlatformPublishingCatalog
              new("accountId", "YouTube channel handle or ID", false, true, "The exact channel that this browser authorization will upload to; shown again before every upload."),
              new("refreshToken", "OAuth refresh token", true, false, "Normally created by Connect YouTube; paste only for recovery."),
              new("accessToken", "OAuth access token", true, false, "Optional short-lived token; a refresh token is preferred.")],
-            ["Use a title no longer than 100 characters.", "Private is the safe default.", "The upload uses the youtube.upload OAuth scope only."],
-            ["Save the Desktop OAuth client ID and exact destination channel; the client secret is optional.", "Choose Connect YouTube and approve the youtube.upload scope in your browser.", "Select an output, re-check the displayed channel, confirm metadata and upload."],
+            ["Use a title no longer than 100 characters.", "Private is the safe default.", "Connecting asks for two permissions: uploading videos, and managing them so a scheduled clip can be moved or taken off."],
+            ["Save the Desktop OAuth client ID and exact destination channel; the client secret is optional.", "Choose Connect YouTube and allow both permissions in your browser.", "Select an output, re-check the displayed channel, confirm metadata and upload."],
             ["YouTube service accounts are not supported.", "Unverified API projects may be restricted to private uploads until Google completes an audit."]),
         _ => throw new ArgumentOutOfRangeException(nameof(platform), "Publishing is only available for TikTok, Instagram Reels, and YouTube Shorts.")
     };
@@ -75,7 +75,7 @@ public static class PlatformPublishingCatalog
         platform == PlatformKind.InstagramReels
             ? "Switch the Instagram account to Professional (Business or Creator) before configuring API publishing."
             : platform == PlatformKind.YouTubeShorts
-                ? "Create the channel, enable YouTube Data API, then connect with the youtube.upload scope."
+                ? "Create the channel, then connect it under Connections. The steps are listed there."
                 : "Use the manual package for every TikTok upload."
     ];
 

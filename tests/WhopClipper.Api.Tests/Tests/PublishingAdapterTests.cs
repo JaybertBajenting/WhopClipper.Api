@@ -112,6 +112,51 @@ public sealed class PublishingAdapterTests : IDisposable
     }
 
     [Fact]
+    public async Task AnEndedGoogleSignInAsksForAReconnectBeforeAnythingIsUploaded()
+    {
+        var handler = new SequenceHandler([
+            _ => Task.FromResult(Response(HttpStatusCode.BadRequest,
+                "{\"error\":\"invalid_grant\",\"error_description\":\"Token has been expired or revoked.\"}"))
+        ]);
+        var publisher = new YouTubePublisher(new SingleClientFactory(handler), Options.Create(new PublishingApiOptions()));
+        var credentials = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["clientId"] = "client", ["accountId"] = "@channel", ["accessToken"] = "old", ["refreshToken"] = "refresh",
+            ["expiresAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O")
+        };
+
+        var error = await Assert.ThrowsAsync<PublishingApiException>(() => publisher.PublishAsync(
+            new(Guid.NewGuid(), _videoPath, "Title", "Caption", "private", false, false), credentials,
+            new Progress<double>(), CancellationToken.None));
+
+        Assert.True(error.NeedsReconnect);
+        Assert.Equal(YouTubePublisher.SignedOut, error.Message);
+        // The message must reach the screen whole: CleanError cuts at words like "token".
+        Assert.Equal(YouTubePublisher.SignedOut, PlatformConnectionService.CleanError(error.Message));
+        Assert.Equal(1, handler.CallCount);
+    }
+
+    [Fact]
+    public async Task AnyOtherRefreshFailureIsNotMistakenForAnEndedSignIn()
+    {
+        var handler = new SequenceHandler([
+            _ => Task.FromResult(Response(HttpStatusCode.InternalServerError, "{\"error\":\"backend_error\"}"))
+        ]);
+        var publisher = new YouTubePublisher(new SingleClientFactory(handler), Options.Create(new PublishingApiOptions()));
+        var credentials = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["clientId"] = "client", ["accessToken"] = "old", ["refreshToken"] = "refresh",
+            ["expiresAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O")
+        };
+
+        var error = await Assert.ThrowsAsync<PublishingApiException>(() => publisher.PublishAsync(
+            new(Guid.NewGuid(), _videoPath, "Title", "Caption", "private", false, false), credentials,
+            new Progress<double>(), CancellationToken.None));
+
+        Assert.False(error.NeedsReconnect);
+    }
+
+    [Fact]
     public async Task InstagramPreparesThenWaitsUntilSeparateFinalPublishCall()
     {
         var handler = new SequenceHandler([

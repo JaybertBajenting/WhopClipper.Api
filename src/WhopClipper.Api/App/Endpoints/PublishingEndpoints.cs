@@ -57,47 +57,57 @@ public static class PublishingEndpoints
 
         publishing.MapGet("/connections", async (PlatformConnectionService service, CancellationToken ct) =>
             Results.Ok(await service.GetAllAsync(ct)));
-        publishing.MapGet("/connections/{platform}", async (PlatformKind platform,
+        // connectionId names one page of a platform that can have several (YouTube). Left out, it is the first.
+        publishing.MapGet("/connections/{platform}", async (PlatformKind platform, Guid? connectionId,
             PlatformConnectionService service, CancellationToken ct) =>
             PlatformPublishingCatalog.IsPublishingPlatform(platform)
-                ? Results.Ok(await service.GetAsync(platform, ct))
+                ? Results.Ok(await service.GetAsync(platform, connectionId, ct))
                 : Results.NotFound());
-        publishing.MapPut("/connections/{platform}", async (PlatformKind platform,
+        publishing.MapPut("/connections/{platform}", async (PlatformKind platform, Guid? connectionId,
             SavePlatformConnectionRequest request, HttpContext context, LocalPublishingRequestGuard guard,
             PlatformConnectionService service, CancellationToken ct) =>
         {
             if (!guard.IsValid(context)) return Forbidden();
-            var result = await service.SaveAsync(platform, request, ct);
+            var result = await service.SaveAsync(platform, connectionId, request, ct);
             return result.Errors is not null ? Results.ValidationProblem(result.Errors) : Results.Ok(result.Connection);
         });
-        publishing.MapDelete("/connections/{platform}", async (PlatformKind platform, HttpContext context,
+        publishing.MapDelete("/connections/{platform}", async (PlatformKind platform, Guid? connectionId, HttpContext context,
             LocalPublishingRequestGuard guard, PlatformConnectionService service, CancellationToken ct) =>
         {
             if (!guard.IsValid(context)) return Forbidden();
-            return await service.DeleteAsync(platform, ct) ? Results.NoContent() : Results.NotFound();
+            var (found, blocked) = await service.DeleteAsync(platform, connectionId, ct);
+            if (blocked is not null) return Results.Problem(title: "This page is still in use", detail: blocked, statusCode: StatusCodes.Status409Conflict);
+            return found ? Results.NoContent() : Results.NotFound();
         });
-        publishing.MapPost("/connections/{platform}/validate", async (PlatformKind platform, HttpContext context,
+        publishing.MapPost("/connections/{platform}/validate", async (PlatformKind platform, Guid? connectionId, HttpContext context,
             LocalPublishingRequestGuard guard, PlatformConnectionService service, CancellationToken ct) =>
         {
             if (!guard.IsValid(context)) return Forbidden();
             if (!PlatformPublishingCatalog.IsPublishingPlatform(platform)) return Results.NotFound();
-            return Results.Ok(await service.VerifyAsync(platform, ct));
+            return Results.Ok(await service.VerifyAsync(platform, connectionId, ct));
         });
-        publishing.MapPost("/connections/YouTubeShorts/oauth/start", async (HttpContext context,
+        publishing.MapPost("/connections/YouTubeShorts/pages", async (AddYouTubePageRequest request, HttpContext context,
+            LocalPublishingRequestGuard guard, PlatformConnectionService service, CancellationToken ct) =>
+        {
+            if (!guard.IsValid(context)) return Forbidden();
+            var result = await service.AddYouTubePageAsync(request.AccountId, request.CopyClientFrom, ct);
+            return result.Errors is not null ? Results.ValidationProblem(result.Errors) : Results.Ok(result.Connection);
+        });
+        publishing.MapPost("/connections/YouTubeShorts/oauth/start", async (Guid? connectionId, HttpContext context,
             LocalPublishingRequestGuard guard, YouTubeOAuthService oauth, CancellationToken ct) =>
         {
             if (!guard.IsValid(context)) return Forbidden();
             var port = context.Connection.LocalPort;
             if (port is < 1 or > 65535) return Results.Problem("The local callback port is invalid.", statusCode: 500);
             var redirectUri = $"http://127.0.0.1:{port}/api/publishing/oauth/youtube/callback";
-            try { return Results.Ok(await oauth.StartAsync(redirectUri, ct)); }
+            try { return Results.Ok(await oauth.StartAsync(redirectUri, connectionId, ct)); }
             catch (Exception ex) when (ex is InvalidOperationException or PublishingApiException)
             {
                 return SafeProblem(ex.Message, StatusCodes.Status400BadRequest);
             }
         });
         publishing.MapGet("/oauth/youtube/callback", async (string? code, string? state, string? error,
-            YouTubeOAuthService oauth, CancellationToken ct) =>
+            YouTubeOAuthService oauth, YouTubeScheduleService schedule, CancellationToken ct) =>
         {
             if (!string.IsNullOrWhiteSpace(error))
                 return OAuthPage(false, "Google authorization was cancelled or denied. Return to Whop Clipper and try again.", 400);
@@ -106,7 +116,13 @@ public static class PublishingEndpoints
             try
             {
                 await oauth.CompleteAsync(code, state, ct);
+                await schedule.RetryWaitingAsync(ct);
                 return OAuthPage(true, "YouTube authorization was saved securely. You can close this tab and return to Whop Clipper.", 200);
+            }
+            catch (YouTubePageAlreadyConnectedException ex)
+            {
+                // The channel name comes from YouTube, so it is encoded before it goes into the page.
+                return OAuthPage(false, System.Net.WebUtility.HtmlEncode(ex.Message), 409);
             }
             catch (Exception ex) when (ex is InvalidOperationException or PublishingApiException)
             {

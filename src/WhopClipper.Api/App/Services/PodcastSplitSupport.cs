@@ -226,7 +226,7 @@ public static class StoryParser
     /// <param name="words">The episode transcript. When given, each piece is moved onto the words it quotes
     /// and a dangling lead-in before a splice is dropped (<see cref="SpliceSnapper"/>).</param>
     public static IReadOnlyList<CondensedStory> ParseStories(JsonElement root, double? episodeSeconds,
-        IReadOnlyList<TranscriptWord>? words = null)
+        IReadOnlyList<TranscriptWord>? words = null, double minimumSeconds = MinimumSeconds)
     {
         var result = new List<CondensedStory>();
         if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("stories", out var stories) ||
@@ -247,7 +247,7 @@ public static class StoryParser
             var merged = ordered is null ? Merge(pieces) : SpliceSnapper.TrimDanglingEnds(Merge(pieces), ordered);
             if (merged.Count == 0) continue;
             var seconds = merged.Sum(x => x.End - x.Start);
-            if (seconds is < MinimumSeconds or > MaximumSeconds) continue;
+            if (seconds < minimumSeconds || seconds > MaximumSeconds) continue;
             if (merged[^1].End - merged[0].Start > MaximumSpanSeconds) continue;
 
             var score = TryNumber(item, "score", out var value) ? Math.Clamp(value, 0, 1) : 0;

@@ -25,12 +25,18 @@ public interface IPlatformPublisher
 public sealed class PublishingApiException(string safeMessage, HttpStatusCode? statusCode = null) : Exception(safeMessage)
 {
     public HttpStatusCode? StatusCode { get; } = statusCode;
+
+    /// <summary>The platform ended the sign-in before anything was sent; signing in again fixes it.</summary>
+    public bool NeedsReconnect { get; init; }
 }
 
 public sealed class YouTubePublisher(IHttpClientFactory clients, IOptions<PublishingApiOptions> options)
     : IPlatformPublisher, IPlatformConnectionVerifier
 {
     public PlatformKind Platform => PlatformKind.YouTubeShorts;
+
+    // Worded without "token" or "authorization": CleanError cuts a message off at those words.
+    public const string SignedOut = "Google signed this app out of YouTube. Click Connect YouTube under Publishing, Connections to sign in again.";
 
     public async Task<PlatformPublishResult> PublishAsync(PlatformPublishRequest request,
         Dictionary<string, string> credentials, IProgress<double> progress, CancellationToken cancellationToken)
@@ -124,6 +130,31 @@ public sealed class YouTubePublisher(IHttpClientFactory clients, IOptions<Publis
         if (!response.IsSuccessStatusCode) throw await SafeFailureAsync("YouTube could not move the scheduled video", response, cancellationToken);
     }
 
+    /// <summary>
+    /// The channel a sign-in really uploads to. The handle typed in the app is only a label; this is what
+    /// YouTube says. Null when it cannot be read, as with the upload-only permission.
+    /// </summary>
+    public async Task<(string Id, string Title)?> ReadChannelAsync(Dictionary<string, string> credentials, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var token = await GetValidAccessTokenAsync(credentials, cancellationToken);
+            using var request = new HttpRequestMessage(HttpMethod.Get, QueryHelpers.AddQueryString(
+                $"{options.Value.YouTubeApiEndpoint.TrimEnd('/')}/channels", new Dictionary<string, string?> { ["part"] = "snippet", ["mine"] = "true" }));
+            request.Headers.Authorization = new("Bearer", token);
+            using var response = await clients.CreateClient("PublishingExternal").SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode) return null;
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+            if (!json.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array || items.GetArrayLength() == 0)
+                return null;
+            var id = items[0].TryGetProperty("id", out var idNode) ? idNode.GetString() : null;
+            var title = items[0].TryGetProperty("snippet", out var snippet) && snippet.TryGetProperty("title", out var titleNode)
+                ? titleNode.GetString() : null;
+            return string.IsNullOrWhiteSpace(id) ? null : (id, string.IsNullOrWhiteSpace(title) ? id : title);
+        }
+        catch (Exception ex) when (ex is PublishingApiException or HttpRequestException or JsonException) { return null; }
+    }
+
     /// <summary>Deletes an uploaded video. A video already gone counts as deleted.</summary>
     public async Task DeleteVideoAsync(string videoId, Dictionary<string, string> credentials, CancellationToken cancellationToken)
     {
@@ -155,7 +186,7 @@ public sealed class YouTubePublisher(IHttpClientFactory clients, IOptions<Publis
              expires > DateTimeOffset.UtcNow.AddMinutes(1))) return access;
         if (!credentials.TryGetValue("refreshToken", out var refresh) || string.IsNullOrWhiteSpace(refresh) ||
             !credentials.TryGetValue("clientId", out var clientId) || string.IsNullOrWhiteSpace(clientId))
-            throw new PublishingApiException("YouTube authorization expired; reconnect YouTube.");
+            throw new PublishingApiException(SignedOut) { NeedsReconnect = true };
         var form = new Dictionary<string, string>
         {
             ["client_id"] = clientId, ["refresh_token"] = refresh, ["grant_type"] = "refresh_token"
@@ -163,7 +194,14 @@ public sealed class YouTubePublisher(IHttpClientFactory clients, IOptions<Publis
         if (credentials.TryGetValue("clientSecret", out var secret) && !string.IsNullOrWhiteSpace(secret)) form["client_secret"] = secret;
         using var response = await clients.CreateClient("PublishingExternal").PostAsync(options.Value.GoogleTokenEndpoint,
             new FormUrlEncodedContent(form), cancellationToken);
-        if (!response.IsSuccessStatusCode) throw await SafeFailureAsync("YouTube OAuth token refresh failed", response, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            var failure = await SafeFailureAsync("YouTube OAuth token refresh failed", response, cancellationToken);
+            // Google answers invalid_grant once a sign-in has ended: a project in Testing is signed out
+            // seven days after consent, and access can be removed from the Google account at any time.
+            throw failure.Message.Contains("invalid_grant", StringComparison.Ordinal)
+                ? new PublishingApiException(SignedOut, failure.StatusCode) { NeedsReconnect = true } : failure;
+        }
         using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
         access = json.RootElement.TryGetProperty("access_token", out var node) ? node.GetString() : null;
         if (string.IsNullOrWhiteSpace(access)) throw new PublishingApiException("YouTube OAuth returned no access token.");
@@ -369,8 +407,11 @@ internal sealed class ProgressStreamContent : HttpContent
     protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult(_stream);
 }
 
+/// <summary>The sign-in was for a channel that another page already posts to. Its message is safe to show.</summary>
+public sealed class YouTubePageAlreadyConnectedException(string message) : Exception(message);
+
 public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<PublishingApiOptions> options,
-    YouTubeOAuthStateStore states, PlatformConnectionService connections)
+    YouTubeOAuthStateStore states, PlatformConnectionService connections, YouTubePublisher publisher)
 {
     public const string UploadScope = "https://www.googleapis.com/auth/youtube.upload";
     public const string ManageScope = "https://www.googleapis.com/auth/youtube";
@@ -379,16 +420,20 @@ public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<Pub
     public static bool CanManageSchedule(IEnumerable<string> grantedScopes) =>
         grantedScopes.Contains(ManageScope, StringComparer.Ordinal);
 
-    public async Task<OAuthStartResponse> StartAsync(string redirectUri, CancellationToken cancellationToken)
+    public Task<OAuthStartResponse> StartAsync(string redirectUri, CancellationToken cancellationToken) =>
+        StartAsync(redirectUri, null, cancellationToken);
+
+    /// <param name="connectionId">The YouTube page being signed in. Null is the first page.</param>
+    public async Task<OAuthStartResponse> StartAsync(string redirectUri, Guid? connectionId, CancellationToken cancellationToken)
     {
         if (!Uri.TryCreate(redirectUri, UriKind.Absolute, out var callback) || callback.Scheme != Uri.UriSchemeHttp ||
             callback.Host != "127.0.0.1" || callback.Port is < 1 or > 65535 ||
             callback.AbsolutePath != "/api/publishing/oauth/youtube/callback")
             throw new InvalidOperationException("The YouTube OAuth callback must use the app's 127.0.0.1 loopback address.");
-        var credentials = await connections.GetCredentialsAsync(PlatformKind.YouTubeShorts, cancellationToken);
+        var credentials = await connections.GetCredentialsAsync(PlatformKind.YouTubeShorts, connectionId, cancellationToken);
         if (credentials is null || !credentials.TryGetValue("clientId", out var clientId) || string.IsNullOrWhiteSpace(clientId))
             throw new InvalidOperationException("Save the Google Desktop OAuth client ID before connecting YouTube.");
-        var state = states.Create(redirectUri);
+        var state = states.Create(redirectUri, connectionId);
         var url = QueryHelpers.AddQueryString(options.Value.GoogleAuthorizationEndpoint, new Dictionary<string, string?>
         {
             ["client_id"] = clientId, ["redirect_uri"] = redirectUri, ["response_type"] = "code",
@@ -404,7 +449,7 @@ public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<Pub
     public async Task CompleteAsync(string code, string stateValue, CancellationToken cancellationToken)
     {
         var state = states.Consume(stateValue) ?? throw new InvalidOperationException("OAuth state is invalid, expired, or already used.");
-        var credentials = await connections.GetCredentialsAsync(PlatformKind.YouTubeShorts, cancellationToken)
+        var credentials = await connections.GetCredentialsAsync(PlatformKind.YouTubeShorts, state.ConnectionId, cancellationToken)
             ?? throw new InvalidOperationException("YouTube OAuth configuration was removed.");
         if (!credentials.TryGetValue("clientId", out var clientId)) throw new InvalidOperationException("YouTube client ID is missing.");
         var form = new Dictionary<string, string>
@@ -430,7 +475,37 @@ public sealed class YouTubeOAuthService(IHttpClientFactory clients, IOptions<Pub
             .Any(x => x is UploadScope or ManageScope))
             throw new PublishingApiException("Google did not grant the required YouTube upload scope.");
         credentials["grantedScopes"] = string.IsNullOrWhiteSpace(grantedScopes) ? UploadScope : grantedScopes;
-        await connections.SaveCredentialSetAsync(PlatformKind.YouTubeShorts, credentials, expires, cancellationToken);
-        _ = await connections.VerifyAsync(PlatformKind.YouTubeShorts, cancellationToken);
+        await RememberChannelAsync(credentials, state.ConnectionId, cancellationToken);
+        await connections.SaveCredentialSetAsync(PlatformKind.YouTubeShorts, state.ConnectionId, credentials, expires, cancellationToken);
+        _ = await connections.VerifyAsync(PlatformKind.YouTubeShorts, state.ConnectionId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Records which channel this sign-in really is, and refuses it when another page already posts
+    /// there. Google's own screen picks the channel, so a wrong pick would otherwise send one page's
+    /// clips to another page's channel without a sign of it in the app.
+    /// </summary>
+    private async Task RememberChannelAsync(Dictionary<string, string> credentials, Guid? connectionId, CancellationToken cancellationToken)
+    {
+        if (await publisher.ReadChannelAsync(credentials, cancellationToken) is not { } channel) return;
+        var pages = await connections.YouTubePagesAsync(cancellationToken);
+        var self = connectionId ?? pages.FirstOrDefault()?.Id;
+        foreach (var page in pages.Where(x => x.Id != self))
+        {
+            // A page connected before channels were recorded: look its channel up now, once.
+            if (!page.Credentials.TryGetValue("channelId", out var known) || string.IsNullOrWhiteSpace(known))
+            {
+                if (await publisher.ReadChannelAsync(page.Credentials, cancellationToken) is not { } theirs) continue;
+                page.Credentials["channelId"] = known = theirs.Id;
+                page.Credentials["channelTitle"] = theirs.Title;
+                await connections.SaveCredentialSetAsync(PlatformKind.YouTubeShorts, page.Id, page.Credentials, page.TokenExpiresAt, cancellationToken);
+            }
+            if (string.Equals(known, channel.Id, StringComparison.Ordinal))
+                throw new YouTubePageAlreadyConnectedException(
+                    $"That sign-in is for the channel \"{channel.Title}\", which is already connected as the page {page.Label}. " +
+                    "Click Connect YouTube again and pick the other channel on Google's screen.");
+        }
+        credentials["channelId"] = channel.Id;
+        credentials["channelTitle"] = channel.Title;
     }
 }

@@ -15,6 +15,10 @@ public sealed record FfmpegNarratedMark(double X, double Y, double Size);
 /// <summary>A sound effect laid over the mix: a file already at its playing level, and when it starts.</summary>
 public sealed record FfmpegNarratedSound(string Path, double AtSeconds, double Volume = 1.0);
 
+/// <summary>A silent shot laid over the moment's picture while the moment's sound carries on.</summary>
+/// <param name="AtSeconds">When it starts on the clip's clock.</param>
+public sealed record FfmpegNarratedCutaway(string Path, double InSeconds, double AtSeconds, double DurationSeconds, double FocusX);
+
 /// <summary>
 /// A narrated-luxury render: montage shots under the narration, then the payoff pieces with their own sound. The
 /// arrow points at <see cref="ArrowTarget"/> on the first shot while the window opens; the skull covers
@@ -26,7 +30,7 @@ public sealed record FfmpegNarratedSpec(IReadOnlyList<FfmpegNarratedShot> Shots,
     FfmpegNarratedImage? Skull = null, FfmpegNarratedMark? SkullTarget = null, string? MusicPath = null,
     double MusicStartSeconds = 0, double MusicVolume = 0.4, double VoiceVolume = 1.0, bool NormalizeAudio = true,
     int EncoderThreads = 0, double FreezeSeconds = FfmpegArgumentBuilder.NarratedFreezeSeconds, double? MusicDropVolume = null,
-    IReadOnlyList<FfmpegNarratedSound>? Sounds = null);
+    IReadOnlyList<FfmpegNarratedSound>? Sounds = null, IReadOnlyList<FfmpegNarratedCutaway>? Cutaways = null);
 
 public static partial class FfmpegArgumentBuilder
 {
@@ -94,6 +98,10 @@ public static partial class FfmpegArgumentBuilder
         var sounds = (spec.Sounds ?? []).Where(x => x.AtSeconds < total).ToList();
         var firstSoundInput = next;
         foreach (var sound in sounds) args.AddRange(["-i", sound.Path]);
+        var cutaways = spec.Cutaways ?? [];
+        var firstCutawayInput = firstSoundInput + sounds.Count;
+        foreach (var cutaway in cutaways)
+            args.AddRange(["-ss", N(cutaway.InSeconds), "-t", N(cutaway.DurationSeconds + 0.5), "-i", cutaway.Path]);
 
         // The window grows while the first shot plays: P runs 0 to 1 over the intro with a gentle ease-out, and the
         // picture's scale K runs from "whole frame across 1080" to "1080 tall filling 1148". Written for both scale
@@ -134,7 +142,24 @@ public static partial class FfmpegArgumentBuilder
         }
         graph.Add($"{joined}concat=n={spec.Shots.Count}:v=1:a=0[pic]");
 
-        var picture = $"[pic]tpad=stop_mode=clone:stop_duration={N(spec.FreezeSeconds)},hue=s=0:enable='gte(t\\,{N(speech)})'";
+        // Cutaways cover the window for a beat while the moment's sound plays on underneath. Each is put on the
+        // clip's clock and laid over the joined picture; before it starts and once it has ended the overlay passes
+        // the moment through untouched. Captions, the title and the skull are drawn afterwards, so they stay on top.
+        var joinedPicture = "pic";
+        for (var index = 0; index < cutaways.Count; index++)
+        {
+            var cutaway = cutaways[index];
+            var length = N(cutaway.DurationSeconds);
+            graph.Add($"[{firstCutawayInput + index}:v]{normalise},crop={NarratedVisibleWidth}:1080:{NarratedCropX(cutaway.FocusX)}:0," +
+                      $"scale={SplitWidth}:{NarratedWindowHeight},setsar=1,fps={fps},{grade}," +
+                      $"tpad=stop_mode=clone:stop_duration={length},trim=duration={length}," +
+                      $"setpts=PTS-STARTPTS+{N(cutaway.AtSeconds)}/TB[cut{index}]");
+            graph.Add($"[{joinedPicture}][cut{index}]overlay=x=0:y={NarratedWindowTop}:eof_action=pass:" +
+                      $"enable='between(t\\,{N(cutaway.AtSeconds)}\\,{N(cutaway.AtSeconds + cutaway.DurationSeconds)})'[cutpic{index}]");
+            joinedPicture = $"cutpic{index}";
+        }
+
+        var picture = $"[{joinedPicture}]tpad=stop_mode=clone:stop_duration={N(spec.FreezeSeconds)},hue=s=0:enable='gte(t\\,{N(speech)})'";
         if (!string.IsNullOrWhiteSpace(spec.SubtitlePath)) picture += $",subtitles='{EscapeFilterPath(spec.SubtitlePath)}'";
         graph.Add($"{picture}[captioned]");
 
@@ -245,5 +270,12 @@ public static partial class FfmpegArgumentBuilder
         if (spec.Sounds is { } sounds && (sounds.Count > 8 || sounds.Any(x => string.IsNullOrWhiteSpace(x.Path) || !double.IsFinite(x.AtSeconds)
                 || x.AtSeconds < 0 || x.Volume is < 0 or > 4)))
             throw new ArgumentOutOfRangeException(nameof(spec), "A clip takes up to 8 sound effects, each with a file, a start and a volume of 0-4.");
+        // A cutaway covers the moment only: the narrator's montage has its own shots, and the clip ends on the
+        // speaker's own last frame, which the freeze and the skull need.
+        var speech = spec.NarrationSeconds + spec.Shots.Where(x => x.Payoff).Sum(x => x.DurationSeconds);
+        if (spec.Cutaways is { } cutaways && (cutaways.Count > 8 || cutaways.Any(x => string.IsNullOrWhiteSpace(x.Path) || x.InSeconds < 0 ||
+                !double.IsFinite(x.AtSeconds) || !double.IsFinite(x.DurationSeconds) || x.DurationSeconds <= 0.05 ||
+                x.AtSeconds < spec.NarrationSeconds || x.AtSeconds + x.DurationSeconds > speech + 0.001)))
+            throw new ArgumentOutOfRangeException(nameof(spec), "A clip takes up to 8 cutaways, each a file and a stretch inside the moment.");
     }
 }

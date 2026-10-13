@@ -51,6 +51,8 @@ public sealed class Campaign
     public string? BrandingJson { get; set; }
     /// <summary>Serialized <c>CampaignEditStyleDto</c>: which edit the campaign's clips get. Null is the streamer style.</summary>
     public string? EditStyleJson { get; set; }
+    /// <summary>The YouTube page this campaign's clips go to. Null means the only connected page.</summary>
+    public Guid? YouTubeConnectionId { get; set; }
     public CampaignStatus Status { get; set; } = CampaignStatus.Draft;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -356,8 +358,10 @@ public sealed class PublishJob
     public Guid? EditPlanId { get; set; }
     /// <summary>The daily slot at which YouTube makes the video public. Null for an immediate upload.</summary>
     public DateTimeOffset? ScheduledPublishAt { get; set; }
-    /// <summary>A queued scheduled upload waits until this time (its slot is near, or the quota reset).</summary>
+    /// <summary>A queued scheduled upload waits until this time (a daily limit, or a reconnect).</summary>
     public DateTimeOffset? NextAttemptAt { get; set; }
     /// <summary>The go-public time the phone notification is currently scheduled for, if any.</summary>
     public DateTimeOffset? NotificationScheduledFor { get; set; }
+    /// <summary>The page (platform connection) this attempt uploads to. Null means the platform's only one.</summary>
+    public Guid? ConnectionId { get; set; }
 }
